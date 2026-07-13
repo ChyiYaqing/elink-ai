@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "generated_at": 1783933200,
+  "usage_fetched_at": 1783933140,
+  "claude": {
+    "status": "working",
+    "tokens_today": 4868001,
+    "five_hour_pct": 43.0,
+    "five_hour_reset_min": 87,
+    "seven_day_pct": 68.0,
+    "seven_day_reset_min": 4320,
+    "needs_input": false,
+    "error": null
+  },
+  "codex": {
+    "status": "idle",
+    "tokens_today": 61471,
+    "primary_pct": 12.0,
+    "primary_reset_min": 144,
+    "weekly_pct": 22.0,
+    "weekly_reset_min": 8729,
+    "needs_input": true,
+    "error": null
+  }
+}

@@ -1,0 +1,22 @@
+[agent]
+# Mac running ElinkAIBridge. This can also be changed from the menu bar.
+bridge_url = "http://192.168.1.20:8765"
+listen_host = "0.0.0.0"
+listen_port = 8766
+poll_interval_s = 2.0
+request_timeout_s = 3.0
+stale_after_s = 90
+
+[display]
+# Use "mock" during development or "waveshare_5in83_v2" on the Raspberry Pi.
+driver = "waveshare_5in83_v2"
+output_path = "/var/lib/elink-ai/last-frame.png"
+state_path = "/var/lib/elink-ai/state.json"
+font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+orientation = 0
+
+[refresh]
+min_interval_s = 30
+coalesce_s = 2
+full_every = 20
+full_interval_s = 21600

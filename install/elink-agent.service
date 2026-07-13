@@ -1,0 +1,23 @@
+[Unit]
+Description=Elink AI e-paper dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/elink-ai
+ExecStart=/opt/elink-ai/.venv/bin/elink-agent --config /etc/elink-ai/config.toml
+Restart=on-failure
+RestartSec=10
+KillSignal=SIGINT
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/elink-ai
+
+[Install]
+WantedBy=multi-user.target
