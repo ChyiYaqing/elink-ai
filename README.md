@@ -13,6 +13,10 @@ It has two deliberately separate processes:
 
 OAuth tokens and raw session logs never leave the Mac.
 
+## Dashboard preview
+
+![Claude Code and Codex usage dashboard on the e-paper display](docs/images/dashboard-preview.png)
+
 ## Current scope
 
 - Claude and Codex side-by-side dashboard
