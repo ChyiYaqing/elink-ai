@@ -33,10 +33,12 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         menu.delegate = self
         claude.isEnabled = false; codex.isEnabled = false; device.isEnabled = false
         menu.addItem(claude); menu.addItem(codex); menu.addItem(.separator()); menu.addItem(device)
-        menu.addItem(action("自动查找屏幕", #selector(pair)))
+        menu.addItem(action("自动查找并配对屏幕", #selector(pair)))
         menu.addItem(action("设置屏幕地址…", #selector(setAddress)))
+        menu.addItem(action("打开设备状态", #selector(openDeviceStatus)))
         let modes = NSMenu()
-        for (title, mode) in [("Claude + Codex", "dashboard"), ("仅 Claude", "claude"), ("仅 Codex", "codex")] {
+        for (title, mode) in [("双栏：Claude + Codex", "dashboard"),
+                              ("仅 Claude", "claude"), ("仅 Codex", "codex")] {
             let value = action(title, #selector(setMode(_:))); value.representedObject = mode
             modeItems[mode] = value; modes.addItem(value)
         }
@@ -45,7 +47,8 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         menu.addItem(action("智能刷新", #selector(smartRefresh)))
         menu.addItem(action("完整刷新", #selector(fullRefresh)))
         menu.addItem(action("把本机设为数据桥接", #selector(pointHere)))
-        menu.addItem(.separator()); menu.addItem(action("刷新用量", #selector(refreshAll), key: "r"))
+        menu.addItem(action("显示桥接服务地址", #selector(showBridgeAddress)))
+        menu.addItem(.separator()); menu.addItem(action("刷新全部状态", #selector(refreshAll), key: "r"))
         menu.addItem(NSMenuItem(title: "退出", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
     }
 
@@ -53,13 +56,28 @@ final class MenuBarController: NSObject, NSMenuDelegate {
 
     @objc private func refreshAll() { usage.refresh(); refreshUsage(); refreshDevice() }
     private func refreshUsage() {
-        claude.title = line("Claude", usage.claude)
-        codex.title = line("Codex", usage.codex)
+        claude.title = Self.usageLine("Claude", usage.claude)
+        codex.title = Self.usageLine("Codex", usage.codex)
     }
-    private func line(_ name: String, _ usage: ProviderUsage) -> String {
-        let primary = usage.primary.percent.map { "5h \(Int($0))%" } ?? "5h —"
-        let weekly = usage.weekly.percent.map { "周 \(Int($0))%" } ?? "周 —"
+    static func usageLine(_ name: String, _ usage: ProviderUsage) -> String {
+        if let error = usage.error, usage.primary.percent == nil, usage.weekly.percent == nil {
+            return "\(name)：\(error)"
+        }
+        let primary = window("5h", usage.primary)
+        let weekly = window("周", usage.weekly)
         return "\(name)　\(primary)　\(weekly)"
+    }
+    private static func window(_ label: String, _ usage: UsageWindow) -> String {
+        guard let percent = usage.percent else { return "\(label) —" }
+        let reset = usage.resetMinutes.map { " · \(formatMinutes($0))" } ?? ""
+        return "\(label) \(Int(percent))%\(reset)"
+    }
+    static func formatMinutes(_ minutes: Int) -> String {
+        if minutes >= 24 * 60 {
+            return "\(minutes / (24 * 60))d \(minutes % (24 * 60) / 60)h"
+        }
+        if minutes >= 60 { return "\(minutes / 60)h \(minutes % 60)m" }
+        return "\(max(0, minutes))m"
     }
     private func refreshDevice() {
         guard !DeviceClient.host.isEmpty else { device.title = "屏幕：未设置"; return }
@@ -69,9 +87,19 @@ final class MenuBarController: NSObject, NSMenuDelegate {
             switch result {
             case let .success(info):
                 let state = info.stale ? "数据陈旧" : "在线"
-                self.device.title = "屏幕：\(state) · \(info.mode) · \(info.refreshKind)"
+                let mode = ["dashboard": "双栏", "claude": "Claude", "codex": "Codex"][info.mode] ?? info.mode
+                let age = info.lastFetchAge.map { " · \(PreviewPopoverController.formatAge($0))前更新" } ?? ""
+                self.device.title = "屏幕：\(state) · \(mode)\(age)"
                 self.modeItems.forEach { $0.value.state = $0.key == info.mode ? .on : .off }
-            case .failure: self.device.title = "屏幕：无法连接 \(DeviceClient.host)"
+            case .failure:
+                self.device.title = "屏幕：无法连接 \(DeviceClient.host)"
+                self.modeItems.values.forEach { $0.state = .off }
+                let seen = DeviceClient.lastSeenIP
+                if !seen.isEmpty, !DeviceClient.host.contains(seen) {
+                    DeviceClient.verify("\(seen):8766") { valid in
+                        if valid { DeviceClient.host = "\(seen):8766"; self.refreshDevice() }
+                    }
+                }
             }
         }
     }
@@ -90,7 +118,14 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         input.stringValue = DeviceClient.host; alert.accessoryView = input
         alert.addButton(withTitle: "保存"); alert.addButton(withTitle: "取消")
         NSApp.activate(ignoringOtherApps: true)
-        if alert.runModal() == .alertFirstButtonReturn { DeviceClient.host = input.stringValue; refreshDevice() }
+        if alert.runModal() == .alertFirstButtonReturn {
+            DeviceClient.host = DeviceClient.normalizedHost(input.stringValue)
+            refreshDevice()
+        }
+    }
+    @objc private func openDeviceStatus() {
+        guard let base = DeviceClient.baseURL else { setAddress(); return }
+        NSWorkspace.shared.open(base.appendingPathComponent("v1/device"))
     }
     @objc private func setMode(_ sender: NSMenuItem) {
         guard let mode = sender.representedObject as? String else { return }
@@ -104,7 +139,15 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     }
     @objc private func pointHere() {
         guard let ip = DeviceClient.localIPv4() else { Self.alert("设置失败", "无法取得本机局域网地址"); return }
-        DeviceClient.setBridge("http://\(ip):\(port)") { [weak self] error in self?.finish(error) }
+        let url = "http://\(ip):\(port)"
+        DeviceClient.setBridge(url) { [weak self] error in
+            self?.finish(error)
+            if error == nil { Self.alert("桥接已设置", "设备将从 \(url)/v1/status 拉取数据。") }
+        }
+    }
+    @objc private func showBridgeAddress() {
+        let ip = DeviceClient.localIPv4() ?? "<本机局域网 IP>"
+        Self.alert("桥接服务地址", "http://\(ip):\(port)/v1/status\n\n设备地址：\(DeviceClient.host.isEmpty ? "未设置" : DeviceClient.host)")
     }
     private func finish(_ error: Error?) { if let error { Self.alert("操作失败", error.localizedDescription) } }
     private func action(_ title: String, _ selector: Selector, key: String = "") -> NSMenuItem {

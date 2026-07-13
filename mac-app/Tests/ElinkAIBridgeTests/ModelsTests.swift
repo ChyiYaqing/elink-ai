@@ -16,6 +16,39 @@ final class ModelsTests: XCTestCase {
         XCTAssertThrowsError(try DeviceInfo(json: ["device_type": "esp8266"]))
     }
 
+    func testParsesDetailedDeviceState() throws {
+        let info = try DeviceInfo(json: [
+            "device_type": "elink-agent",
+            "bridge_url": "http://192.168.1.2:8765",
+            "mode": "codex",
+            "stale": false,
+            "last_fetch_age_s": 3,
+            "last_refresh_age_s": 42,
+            "last_refresh_kind": "partial",
+        ])
+
+        XCTAssertEqual(info.lastFetchAge, 3)
+        XCTAssertEqual(info.lastRefreshAge, 42)
+        XCTAssertEqual(PreviewPopoverController.segment(for: info.mode), 2)
+        XCTAssertTrue(PreviewPopoverController.deviceSummary(info).contains("42秒前送屏"))
+    }
+
+    func testNormalizesDeviceHost() {
+        XCTAssertEqual(DeviceClient.normalizedHost(" https://192.168.1.50:8766/ "),
+                       "192.168.1.50:8766")
+    }
+
+    func testUsageMenuIncludesResetTimes() {
+        let usage = ProviderUsage(
+            primary: UsageWindow(percent: 4, resetMinutes: 127),
+            weekly: UsageWindow(percent: 45, resetMinutes: 3 * 24 * 60 + 15 * 60)
+        )
+
+        let line = MenuBarController.usageLine("Claude", usage)
+        XCTAssertTrue(line.contains("5h 4% · 2h 7m"))
+        XCTAssertTrue(line.contains("周 45% · 3d 15h"))
+    }
+
     func testParsesClaudeStatuslineCache() throws {
         let now = Date().timeIntervalSince1970
         let json: [String: Any] = [
@@ -65,5 +98,28 @@ final class ModelsTests: XCTestCase {
         let windows = UsageFetcher.codexWindows(limits)
         XCTAssertEqual(windows.primary.percent, 13)
         XCTAssertEqual(windows.weekly.percent, 42)
+    }
+
+    func testClassifiesCodexLogWindowByDuration() {
+        let limits: [String: Any] = [
+            "primary": [
+                "used_percent": 18,
+                "window_minutes": 7 * 24 * 60,
+                "resets_at": Date().timeIntervalSince1970 + 60 * 60,
+            ],
+        ]
+
+        let windows = UsageFetcher.codexLogWindows(limits)
+        XCTAssertNil(windows.primary.percent)
+        XCTAssertEqual(windows.weekly.percent, 18)
+    }
+
+    func testKeepsLastGoodWeeklyOnlyUsageAfterError() {
+        let old = ProviderUsage(weekly: UsageWindow(percent: 18, resetMinutes: 60))
+        let failed = ProviderUsage(error: "temporary error")
+
+        let result = UsageFetcher.keepLastGood(old: old, new: failed)
+        XCTAssertEqual(result.weekly.percent, 18)
+        XCTAssertEqual(result.error, "temporary error")
     }
 }

@@ -25,7 +25,8 @@ OAuth tokens and raw session logs never leave the Mac.
 - attention border for permission requests
 - smart, partial, periodic full, and manual full refresh
 - stale/offline display, last-frame preview, and persistent device settings
-- menu-bar device discovery, page switching, refresh, and preview
+- menu-bar device discovery, DHCP/bridge self-healing, and detailed quota/reset status
+- exact last-frame preview with page switching and smart/full refresh controls
 
 The LCD-specific pet animation, music, and network graphs from `esp8266-ai`
 are intentionally excluded because they conflict with e-paper refresh limits.
@@ -61,8 +62,9 @@ swift test
 swift run ElinkAIBridge
 ```
 
-The app runs only in the menu bar. Right-click controls the Pi; left-click
-opens the exact PNG last sent to the display. Verify the bridge with:
+The app runs only in the menu bar. Right-click shows detailed quota/reset and
+device controls. Left-click opens the exact PNG last sent to the display, with
+page switching plus smart/full refresh controls. Verify the bridge with:
 
 ```bash
 curl -s http://localhost:8765/v1/status | python3 -m json.tool

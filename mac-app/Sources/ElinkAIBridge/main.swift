@@ -19,8 +19,11 @@ let server = HTTPServer(port: port, get: [
 ])
 server.onRequest = { path, ip in
     guard path == "/v1/status", !["127.0.0.1", "::1", ""].contains(ip) else { return }
-    DeviceClient.lastSeenIP = ip
+    DeviceClient.recordDevicePoll(ip: ip)
     if DeviceClient.host.isEmpty { DeviceClient.host = "\(ip):8766" }
+}
+Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { _ in
+    DeviceClient.healPairingIfNeeded(port: port)
 }
 do { try server.start() }
 catch {

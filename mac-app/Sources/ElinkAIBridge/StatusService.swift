@@ -104,6 +104,8 @@ final class StatusService {
         let marker = String(format: "/%04d/%02d/%02d/", components.year ?? 0,
                             components.month ?? 0, components.day ?? 0)
         var tokens = 0
+        var latestRateLimits: [String: Any]?
+        var latestRateLimitsTimestamp = ""
         for file in files where file.path.contains(marker) {
             guard let text = try? String(contentsOf: file, encoding: .utf8) else { continue }
             var sessionMaximum = 0
@@ -114,10 +116,23 @@ final class StatusService {
                       let info = payload["info"] as? [String: Any],
                       let total = info["total_token_usage"] as? [String: Any] else { continue }
                 sessionMaximum = max(sessionMaximum, (total["total_tokens"] as? NSNumber)?.intValue ?? 0)
+                if let limits = payload["rate_limits"] as? [String: Any] {
+                    let timestamp = object["timestamp"] as? String ?? ""
+                    if timestamp >= latestRateLimitsTimestamp {
+                        latestRateLimitsTimestamp = timestamp
+                        latestRateLimits = limits
+                    }
+                }
             }
             tokens += sessionMaximum
         }
-        return AgentStatus(state: state(latest), tokensToday: tokens)
+        let windows = latestRateLimits.map(UsageFetcher.codexLogWindows)
+        return AgentStatus(
+            state: state(latest),
+            tokensToday: tokens,
+            primary: windows?.primary ?? UsageWindow(),
+            weekly: windows?.weekly ?? UsageWindow()
+        )
     }
 
     private func jsonlFiles(_ root: URL) -> [URL] {

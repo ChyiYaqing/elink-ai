@@ -32,12 +32,13 @@ final class HTTPServer {
     }
 
     private func receive(_ connection: NWConnection, accumulated: Data) {
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, complete, _ in
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, complete, error in
             guard let self else { return }
             var buffer = accumulated
             if let data { buffer.append(data) }
             guard let boundary = buffer.range(of: Data("\r\n\r\n".utf8)) else {
-                if complete { connection.cancel() } else { self.receive(connection, accumulated: buffer) }
+                if complete || error != nil { connection.cancel() }
+                else { self.receive(connection, accumulated: buffer) }
                 return
             }
             let header = String(decoding: buffer[..<boundary.lowerBound], as: UTF8.self)
@@ -48,9 +49,12 @@ final class HTTPServer {
             let path = rawPath.split(separator: "?").first.map(String.init) ?? rawPath
             let length = lines.first(where: { $0.lowercased().hasPrefix("content-length:") })
                 .flatMap { Int($0.split(separator: ":").last?.trimmingCharacters(in: .whitespaces) ?? "") } ?? 0
+            guard length <= 1_000_000 else { connection.cancel(); return }
             let available = buffer.count - boundary.upperBound
             if method == "POST", available < length {
-                self.receive(connection, accumulated: buffer); return
+                if complete || error != nil { connection.cancel() }
+                else { self.receive(connection, accumulated: buffer) }
+                return
             }
             let end = min(buffer.count, boundary.upperBound + length)
             let body = buffer.subdata(in: boundary.upperBound..<end)
@@ -61,7 +65,7 @@ final class HTTPServer {
     private func respond(_ connection: NWConnection, method: String, path: String, body: Data) {
         if case let .hostPort(host, _) = connection.endpoint {
             let ip = String(host.debugDescription.split(separator: "%").first ?? "")
-            onRequest?(path, ip)
+            if !ip.isEmpty { onRequest?(path, ip) }
         }
         let result: (Int, String, Data)
         if method == "GET", let route = getRoutes[path] {

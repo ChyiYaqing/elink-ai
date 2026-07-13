@@ -32,14 +32,16 @@ final class UsageFetcher {
                 self.storedClaude = Self.keepLastGood(old: self.storedClaude, new: claude)
                 self.storedCodex = Self.keepLastGood(old: self.storedCodex, new: codex)
                 self.fetching = false
-                self.nextAllowed = Date().addingTimeInterval(claude.error?.contains("429") == true ? 300 : 60)
+                let rateLimited = claude.error?.contains("429") == true || codex.error?.contains("429") == true
+                self.nextAllowed = Date().addingTimeInterval(rateLimited ? 300 : 60)
             }
             DispatchQueue.main.async { self.onUpdate?() }
         }
     }
 
-    private static func keepLastGood(old: ProviderUsage, new: ProviderUsage) -> ProviderUsage {
-        guard new.primary.percent == nil, new.weekly.percent == nil, old.primary.percent != nil else { return new }
+    static func keepLastGood(old: ProviderUsage, new: ProviderUsage) -> ProviderUsage {
+        let hadGoodValue = old.primary.percent != nil || old.weekly.percent != nil
+        guard new.primary.percent == nil, new.weekly.percent == nil, hadGoodValue else { return new }
         var retained = old
         retained.error = new.error
         return retained
@@ -112,7 +114,13 @@ final class UsageFetcher {
         guard let (data, status) = Self.request(request) else {
             return ProviderUsage(error: "Codex 用量请求失败")
         }
-        guard (200...299).contains(status) else { return ProviderUsage(error: "Codex 用量 HTTP \(status)") }
+        guard (200...299).contains(status) else {
+            let error = status == 401 || status == 403
+                ? "Codex 凭据过期，请运行 codex 重新登录"
+                : status == 429 ? "Codex 用量 HTTP 429，稍后自动重试"
+                : "Codex 用量 HTTP \(status)"
+            return ProviderUsage(error: error)
+        }
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let limits = json["rate_limit"] as? [String: Any] else {
             return ProviderUsage(error: "Codex 用量响应解析失败")
@@ -146,6 +154,20 @@ final class UsageFetcher {
             }
         }
         return (primary, weekly)
+    }
+
+    static func codexLogWindows(_ limits: [String: Any]) -> (primary: UsageWindow, weekly: UsageWindow) {
+        var converted = [String: Any]()
+        for (source, target) in [("primary", "primary_window"), ("secondary", "secondary_window")] {
+            guard let value = limits[source] as? [String: Any] else { continue }
+            var window = value
+            if let minutes = (value["window_minutes"] as? NSNumber)?.intValue {
+                window["limit_window_seconds"] = minutes * 60
+            }
+            if let reset = value["resets_at"] { window["reset_at"] = reset }
+            converted[target] = window
+        }
+        return codexWindows(converted)
     }
 
     private static func claudeToken() -> String? {

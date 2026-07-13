@@ -60,6 +60,7 @@ struct DeviceInfo {
     let bridgeURL: String
     let mode: String
     let stale: Bool
+    let lastFetchAge: Int?
     let lastRefreshAge: Int?
     let refreshKind: String
     let error: String?
@@ -72,6 +73,7 @@ struct DeviceInfo {
         bridgeURL = json["bridge_url"] as? String ?? ""
         mode = json["mode"] as? String ?? "dashboard"
         stale = json["stale"] as? Bool ?? true
+        lastFetchAge = (json["last_fetch_age_s"] as? NSNumber)?.intValue
         lastRefreshAge = (json["last_refresh_age_s"] as? NSNumber)?.intValue
         refreshKind = json["last_refresh_kind"] as? String ?? "none"
         error = json["error"] as? String

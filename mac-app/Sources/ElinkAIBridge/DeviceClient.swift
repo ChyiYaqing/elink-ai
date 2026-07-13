@@ -4,6 +4,10 @@ import Darwin
 final class DeviceClient {
     private static let hostKey = "elink_device_host"
     private static let seenKey = "elink_device_last_seen"
+    private static let pairingLock = NSLock()
+    private static var lastDevicePoll = Date.distantPast
+    private static var healing = false
+    private static var lastHealAttempt = Date.distantPast
 
     static var host: String {
         get { UserDefaults.standard.string(forKey: hostKey) ?? "" }
@@ -17,6 +21,13 @@ final class DeviceClient {
         let value = host.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty else { return nil }
         return URL(string: value.hasPrefix("http") ? value : "http://\(value)")
+    }
+
+    static func recordDevicePoll(ip: String) {
+        pairingLock.holding {
+            lastDevicePoll = Date()
+            lastSeenIP = ip
+        }
     }
 
     static func fetchInfo(completion: @escaping (Result<DeviceInfo, Error>) -> Void) {
@@ -48,7 +59,8 @@ final class DeviceClient {
     }
 
     static func verify(_ candidate: String, completion: @escaping (Bool) -> Void) {
-        guard let url = URL(string: "http://\(candidate)/v1/device") else { completion(false); return }
+        guard let base = candidateURL(candidate) else { completion(false); return }
+        let url = base.appendingPathComponent("v1/device")
         var request = URLRequest(url: url); request.timeoutInterval = 1.5
         URLSession.shared.dataTask(with: request) { data, _, _ in
             let valid = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
@@ -61,7 +73,8 @@ final class DeviceClient {
                          completion: @escaping (String?) -> Void) {
         var candidates = [String]()
         if !lastSeenIP.isEmpty { candidates.append("\(lastSeenIP):8766") }
-        if !host.isEmpty, !candidates.contains(host) { candidates.append(host) }
+        let configured = normalizedHost(host)
+        if !configured.isEmpty, !candidates.contains(configured) { candidates.append(configured) }
         func next() {
             guard !candidates.isEmpty else { scanSubnet(progress: progress, completion: completion); return }
             let candidate = candidates.removeFirst()
@@ -84,6 +97,7 @@ final class DeviceClient {
             for number in 1...254 {
                 limit.wait(); group.enter()
                 let candidate = "\(prefix).\(number):8766"
+                if candidate == "\(local):8766" { limit.signal(); group.leave(); continue }
                 guard let url = URL(string: "http://\(candidate)/v1/device") else {
                     limit.signal(); group.leave(); continue
                 }
@@ -100,6 +114,56 @@ final class DeviceClient {
                 completion(found)
             }
         }
+    }
+
+    static func healPairingIfNeeded(port: UInt16) {
+        let shouldHeal = pairingLock.holding { () -> Bool in
+            guard Date().timeIntervalSince(lastDevicePoll) > 180,
+                  !healing,
+                  Date().timeIntervalSince(lastHealAttempt) > 300 else { return false }
+            healing = true
+            lastHealAttempt = Date()
+            return true
+        }
+        guard shouldHeal else { return }
+
+        autoPair(progress: { _ in }) { found in
+            guard found != nil else { finishHealing(); return }
+            fetchInfo { result in
+                guard case let .success(info) = result,
+                      let local = localIPv4() else { finishHealing(); return }
+                let desired = "http://\(local):\(port)"
+                guard info.bridgeURL != desired, info.stale || info.bridgeURL.isEmpty else {
+                    finishHealing(); return
+                }
+                setBridge(desired) { error in
+                    if let error {
+                        FileHandle.standardError.write(Data(
+                            "[pair] bridge self-heal failed: \(error.localizedDescription)\n".utf8
+                        ))
+                    }
+                    finishHealing()
+                }
+            }
+        }
+    }
+
+    static func normalizedHost(_ value: String) -> String {
+        var result = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if result.hasPrefix("http://") { result.removeFirst("http://".count) }
+        if result.hasPrefix("https://") { result.removeFirst("https://".count) }
+        while result.hasSuffix("/") { result.removeLast() }
+        return result
+    }
+
+    private static func candidateURL(_ candidate: String) -> URL? {
+        let value = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return nil }
+        return URL(string: value.hasPrefix("http") ? value : "http://\(value)")
+    }
+
+    private static func finishHealing() {
+        pairingLock.holding { healing = false }
     }
 
     static func localIPv4() -> String? {
