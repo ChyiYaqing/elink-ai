@@ -105,6 +105,19 @@ final class ModelsTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(usage.weekly.resetMinutes), 3 * 24 * 60, accuracy: 1)
     }
 
+    func testExpiredWindowShowsDashInsteadOfZeroMinutes() throws {
+        let json: [String: Any] = [
+            "rate_limits": [
+                "five_hour": ["used_percentage": 2, "resets_at": Date().timeIntervalSince1970 - 60],
+                "seven_day": ["used_percentage": 45, "resets_at": Date().timeIntervalSince1970 + 3 * 24 * 60 * 60],
+            ],
+        ]
+
+        let usage = try XCTUnwrap(UsageFetcher.claudeStatuslineUsage(json, fetchedAt: Date()))
+        XCTAssertNil(usage.primary.resetMinutes)
+        XCTAssertTrue(MenuBarController.usageLine("Claude", usage).contains("5h 2% · —"))
+    }
+
     func testClassifiesSevenDayCodexPrimaryWindowAsWeekly() {
         let limits: [String: Any] = [
             "primary_window": [

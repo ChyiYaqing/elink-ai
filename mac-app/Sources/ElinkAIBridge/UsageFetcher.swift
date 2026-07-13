@@ -96,10 +96,13 @@ final class UsageFetcher {
         guard let object = value as? [String: Any] else { return UsageWindow() }
         let percent = (object["used_percentage"] as? NSNumber)?.doubleValue
         let reset = (object["resets_at"] as? NSNumber)?.doubleValue
-        return UsageWindow(
-            percent: percent,
-            resetMinutes: reset.map { max(0, Int(($0 - Date().timeIntervalSince1970) / 60)) }
-        )
+        return UsageWindow(percent: percent, resetMinutes: reset.flatMap(Self.remainingMinutes))
+    }
+
+    /// 窗口已过期（resets_at <= now）时返回 nil，显示端渲染为 "—"。
+    private static func remainingMinutes(untilEpoch epoch: Double) -> Int? {
+        let seconds = epoch - Date().timeIntervalSince1970
+        return seconds > 0 ? Int(seconds / 60) : nil
     }
 
     private func fetchCodex() -> ProviderUsage {
@@ -216,14 +219,15 @@ final class UsageFetcher {
         guard let object = value as? [String: Any] else { return UsageWindow() }
         let percent = (object["utilization"] as? NSNumber)?.doubleValue
         let reset = (object["resets_at"] as? String).flatMap(Self.isoDate)
-        return UsageWindow(percent: percent, resetMinutes: reset.map { max(0, Int($0.timeIntervalSinceNow / 60)) })
+        return UsageWindow(percent: percent,
+                           resetMinutes: reset.flatMap { Self.remainingMinutes(untilEpoch: $0.timeIntervalSince1970) })
     }
 
     private static func epochWindow(_ value: Any?) -> UsageWindow {
         guard let object = value as? [String: Any] else { return UsageWindow() }
         let percent = (object["used_percent"] as? NSNumber)?.doubleValue
         let reset = (object["reset_at"] as? NSNumber)?.doubleValue
-        return UsageWindow(percent: percent, resetMinutes: reset.map { max(0, Int(($0 - Date().timeIntervalSince1970) / 60)) })
+        return UsageWindow(percent: percent, resetMinutes: reset.flatMap(Self.remainingMinutes))
     }
 
     private static func isoDate(_ value: String) -> Date? {

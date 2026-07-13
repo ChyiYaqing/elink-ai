@@ -69,7 +69,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     }
     private static func window(_ label: String, _ usage: UsageWindow) -> String {
         guard let percent = usage.percent else { return "\(label) —" }
-        let reset = usage.resetMinutes.map { " · \(formatMinutes($0))" } ?? ""
+        let reset = " · \(usage.resetMinutes.map(formatMinutes) ?? "—")"
         return "\(label) \(Int(percent))%\(reset)"
     }
     static func formatMinutes(_ minutes: Int) -> String {
