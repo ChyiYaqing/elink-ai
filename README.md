@@ -15,7 +15,7 @@ OAuth tokens and raw session logs never leave the Mac.
 
 ## Dashboard preview
 
-![Claude Code and Codex usage dashboard on the e-paper display](docs/images/dashboard-preview.png)
+![Bold Claude and Codex dashboard with per-model TODAY token usage](docs/images/dashboard-preview.png)
 
 ## Current scope
 
