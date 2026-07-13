@@ -6,7 +6,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/opt/elink-ai
+RuntimeDirectory=elink-ai
+WorkingDirectory=/run/elink-ai
 ExecStart=/opt/elink-ai/.venv/bin/elink-agent --config /etc/elink-ai/config.toml
 Restart=on-failure
 RestartSec=10
