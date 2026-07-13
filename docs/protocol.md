@@ -7,7 +7,9 @@ The Mac bridge listens on TCP 8765 and the Raspberry Pi agent listens on TCP
 
 `GET /v1/status` returns `schema_version`, epoch timestamps, and `claude` and
 `codex` objects. Unknown percentages and reset times are JSON `null`, never
-zero. See `fixtures/status-v1.json` for the complete shape.
+zero. Each provider may also include `model_usage_today`, sorted by descending
+token count, as objects containing `model` and `tokens`. See
+`fixtures/status-v1.json` for the complete shape.
 
 `POST /v1/event` accepts:
 

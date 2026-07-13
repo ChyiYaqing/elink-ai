@@ -21,7 +21,7 @@ OAuth tokens and raw session logs never leave the Mac.
 
 - Claude and Codex side-by-side dashboard
 - 5-hour and weekly usage/reset time
-- today's token count and working/idle/offline state
+- today's total and per-model token count, plus working/idle/offline state
 - attention border for permission requests
 - smart, partial, periodic full, and manual full refresh
 - stale/offline display, last-frame preview, and persistent device settings

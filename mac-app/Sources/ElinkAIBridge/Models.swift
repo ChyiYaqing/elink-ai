@@ -12,9 +12,15 @@ struct ProviderUsage {
     var fetchedAt: Date?
 }
 
+struct ModelUsage: Equatable {
+    var model: String
+    var tokens: Int
+}
+
 struct AgentStatus {
     var state = "offline"
     var tokensToday = 0
+    var modelUsageToday: [ModelUsage] = []
     var primary = UsageWindow()
     var weekly = UsageWindow()
     var needsInput = false
@@ -33,6 +39,9 @@ struct BridgeSnapshot {
             var result: [String: Any] = [
                 "status": value.state,
                 "tokens_today": value.tokensToday,
+                "model_usage_today": value.modelUsageToday.map {
+                    ["model": $0.model, "tokens": $0.tokens]
+                },
                 "needs_input": value.needsInput,
                 "error": nullable(value.error),
             ]

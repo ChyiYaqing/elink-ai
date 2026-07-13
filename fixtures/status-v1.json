@@ -5,6 +5,10 @@
   "claude": {
     "status": "working",
     "tokens_today": 4868001,
+    "model_usage_today": [
+      {"model": "claude-sonnet-4-5", "tokens": 3211000},
+      {"model": "claude-opus-4-1", "tokens": 1657001}
+    ],
     "five_hour_pct": 43.0,
     "five_hour_reset_min": 87,
     "seven_day_pct": 68.0,
@@ -15,6 +19,10 @@
   "codex": {
     "status": "idle",
     "tokens_today": 61471,
+    "model_usage_today": [
+      {"model": "gpt-5.6-terra", "tokens": 42100},
+      {"model": "gpt-5.6-luna", "tokens": 19371}
+    ],
     "primary_pct": 12.0,
     "primary_reset_min": 144,
     "weekly_pct": 22.0,

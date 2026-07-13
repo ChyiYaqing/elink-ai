@@ -1,15 +1,20 @@
 from PIL import Image, ImageDraw
 
-from elink_agent.models import ProviderStatus, StatusSnapshot
+from elink_agent.models import ModelUsage, ProviderStatus, StatusSnapshot
 from elink_agent.renderer import DashboardRenderer
 
 
 def test_renderer_outputs_one_bit_648_by_480():
     snapshot = StatusSnapshot(
         claude=ProviderStatus(status="working", primary_pct=51, weekly_pct=20,
-                              primary_reset_min=90, tokens_today=1_250_000),
+                              primary_reset_min=90, tokens_today=1_250_000,
+                              model_usage_today=[
+                                  ModelUsage("claude-sonnet", 1_000_000),
+                                  ModelUsage("claude-opus", 250_000),
+                              ]),
         codex=ProviderStatus(status="idle", primary_pct=None, weekly_pct=4,
-                             needs_input=True),
+                             needs_input=True, tokens_today=42_000,
+                             model_usage_today=[ModelUsage("gpt-5.6-terra", 42_000)]),
     )
     image = DashboardRenderer().render(snapshot)
     assert image.size == (648, 480)
@@ -32,3 +37,8 @@ def test_dual_panel_percentage_fits_before_usage_label():
                               max_width=140, bold=True)
 
     assert draw.textbbox((0, 0), percentage, font=font)[2] <= 140
+
+
+def test_model_labels_drop_redundant_provider_prefix():
+    assert DashboardRenderer._model_label("claude-sonnet-4", "Claude") == "sonnet-4"
+    assert DashboardRenderer._model_label("gpt-5.6-terra", "Codex") == "5.6-terra"

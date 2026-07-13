@@ -76,13 +76,34 @@ class DashboardRenderer:
         draw.text((x0 + 16, weekly_y + 52), self._reset(provider.weekly_reset_min),
                   font=self._font(14), fill=0)
 
-        token_y = y1 - 58
-        draw.line((x0 + 16, token_y - 10, x1 - 16, token_y - 10), fill=0, width=1)
-        draw.text((x0 + 16, token_y), "TODAY", font=self._font(15, bold=True), fill=0)
+        token_y = y1 - 108
+        draw.line((x0 + 16, token_y, x1 - 16, token_y), fill=0, width=1)
+        draw.text((x0 + 16, token_y + 8), "TODAY", font=self._font(15, bold=True), fill=0)
         token = self._compact(provider.tokens_today)
-        tf = self._font(25, bold=True)
+        tf = self._font(22, bold=True)
         tw = draw.textbbox((0, 0), token, font=tf)[2]
-        draw.text((x1 - 16 - tw, token_y - 5), token, font=tf, fill=0)
+        draw.text((x1 - 16 - tw, token_y + 3), token, font=tf, fill=0)
+        self._model_usage(draw, x0 + 16, token_y + 34, x1 - 16, y1 - 7,
+                          provider.model_usage_today, name)
+
+    def _model_usage(self, draw: ImageDraw.ImageDraw, x0: int, y0: int, x1: int, y1: int,
+                     usage: list, provider_name: str) -> None:
+        if not usage:
+            return
+        row_height = max(7, min(18, (y1 - y0) // len(usage)))
+        font_size = max(7, min(12, row_height - 2))
+        font = self._font(font_size, bold=True)
+        value_font = self._font(font_size, bold=True)
+        for index, item in enumerate(usage):
+            y = y0 + index * row_height
+            if y >= y1:
+                break
+            value = self._compact(item.tokens)
+            value_width = draw.textbbox((0, 0), value, font=value_font)[2]
+            label = self._model_label(item.model, provider_name)
+            label = self._truncate(draw, label, font, max(12, x1 - x0 - value_width - 8))
+            draw.text((x0, y), label, font=font, fill=0)
+            draw.text((x1 - value_width, y), value, font=value_font, fill=0)
 
     @staticmethod
     def _progress(draw: ImageDraw.ImageDraw, x0: int, y0: int, x1: int,
@@ -114,7 +135,27 @@ class DashboardRenderer:
             return f"{value / 1_000:.1f}K"
         return str(value)
 
-    def _font(self, size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    @staticmethod
+    def _model_label(model: str, provider_name: str) -> str:
+        value = model.strip()
+        prefixes = ["claude-"] if provider_name.lower() == "claude" else ["gpt-", "openai-"]
+        lowered = value.lower()
+        for prefix in prefixes:
+            if lowered.startswith(prefix):
+                value = value[len(prefix):]
+                break
+        return value or "unknown"
+
+    @staticmethod
+    def _truncate(draw: ImageDraw.ImageDraw, text: str, font, max_width: int) -> str:
+        if draw.textbbox((0, 0), text, font=font)[2] <= max_width:
+            return text
+        suffix = "…"
+        while text and draw.textbbox((0, 0), text + suffix, font=font)[2] > max_width:
+            text = text[:-1]
+        return text + suffix
+
+    def _font(self, size: int, bold: bool = True) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
         path = self.font_path
         if bold and path.endswith("DejaVuSans.ttf"):
             bold_path = path.replace("DejaVuSans.ttf", "DejaVuSans-Bold.ttf")
@@ -127,7 +168,7 @@ class DashboardRenderer:
 
     def _fit_font(self, draw: ImageDraw.ImageDraw, text: str, *, preferred: int,
                   minimum: int, max_width: int,
-                  bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+                  bold: bool = True) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
         for size in range(preferred, minimum - 1, -2):
             font = self._font(size, bold=bold)
             if draw.textbbox((0, 0), text, font=font)[2] <= max_width:

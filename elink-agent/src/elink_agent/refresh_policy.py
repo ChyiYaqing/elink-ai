@@ -64,6 +64,7 @@ class RefreshPolicy:
         return {
             "status": value.status,
             "tokens_today": value.tokens_today,
+            "model_usage_today": [(item.model, item.tokens) for item in value.model_usage_today],
             "primary_pct": None if value.primary_pct is None else int(value.primary_pct),
             "primary_reset": None if value.primary_reset_min is None else value.primary_reset_min // 5,
             "weekly_pct": None if value.weekly_pct is None else int(value.weekly_pct),

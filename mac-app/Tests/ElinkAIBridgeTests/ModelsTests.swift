@@ -6,10 +6,50 @@ final class ModelsTests: XCTestCase {
         var snapshot = BridgeSnapshot()
         snapshot.claude.state = "working"
         snapshot.claude.primary.percent = 42
+        snapshot.claude.modelUsageToday = [ModelUsage(model: "claude-sonnet", tokens: 1200)]
         let object = try XCTUnwrap(JSONSerialization.jsonObject(with: snapshot.jsonData()) as? [String: Any])
         XCTAssertEqual(object["schema_version"] as? Int, 1)
         let claude = try XCTUnwrap(object["claude"] as? [String: Any])
         XCTAssertEqual(claude["five_hour_pct"] as? Double, 42)
+        let models = try XCTUnwrap(claude["model_usage_today"] as? [[String: Any]])
+        XCTAssertEqual(models.first?["model"] as? String, "claude-sonnet")
+        XCTAssertEqual(models.first?["tokens"] as? Int, 1200)
+    }
+
+    func testClaudeUsageIsDeduplicatedAndGroupedByModel() {
+        let first = #"{"timestamp":"1970-01-01T00:20:00.000Z","uuid":"one","message":{"id":"msg-1","model":"claude-a","usage":{"input_tokens":10,"output_tokens":2,"cache_creation_input_tokens":3,"cache_read_input_tokens":5}}}"#
+        let duplicate = #"{"timestamp":"1970-01-01T00:20:01.000Z","uuid":"two","message":{"id":"msg-1","model":"claude-a","usage":{"input_tokens":10,"output_tokens":2,"cache_creation_input_tokens":3,"cache_read_input_tokens":5}}}"#
+        let second = #"{"timestamp":"1970-01-01T00:20:02.000Z","uuid":"three","message":{"id":"msg-2","model":"claude-b","usage":{"input_tokens":7,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#
+
+        let usage = StatusService.claudeModelUsage(
+            lines: [first, duplicate, second],
+            start: Date(timeIntervalSince1970: 0),
+            end: Date(timeIntervalSince1970: 5_000)
+        )
+
+        XCTAssertEqual(usage, [
+            ModelUsage(model: "claude-a", tokens: 20),
+            ModelUsage(model: "claude-b", tokens: 7),
+        ])
+    }
+
+    func testCodexUsageFollowsModelChangesAndSkipsDuplicateCounts() {
+        let modelA = #"{"timestamp":"1970-01-01T00:20:00.000Z","type":"turn_context","payload":{"model":"gpt-a"}}"#
+        let countA = #"{"timestamp":"1970-01-01T00:20:01.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":10},"last_token_usage":{"total_tokens":10}}}}"#
+        let duplicate = #"{"timestamp":"1970-01-01T00:20:02.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":10},"last_token_usage":{"total_tokens":10}}}}"#
+        let modelB = #"{"timestamp":"1970-01-01T00:20:03.000Z","type":"turn_context","payload":{"model":"gpt-b"}}"#
+        let countB = #"{"timestamp":"1970-01-01T00:20:04.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":30},"last_token_usage":{"total_tokens":20}}}}"#
+
+        let usage = StatusService.codexModelUsage(
+            sessions: [[modelA, countA, duplicate, modelB, countB]],
+            start: Date(timeIntervalSince1970: 0),
+            end: Date(timeIntervalSince1970: 5_000)
+        )
+
+        XCTAssertEqual(usage, [
+            ModelUsage(model: "gpt-b", tokens: 20),
+            ModelUsage(model: "gpt-a", tokens: 10),
+        ])
     }
 
     func testRejectsOldDeviceShape() {
