@@ -46,22 +46,58 @@ final class UsageFetcher {
     }
 
     private func fetchClaude() -> ProviderUsage {
-        guard let token = Self.claudeToken() else { return ProviderUsage(error: "未找到 Claude 登录凭据") }
+        guard let token = Self.claudeToken() else {
+            return Self.cachedClaudeUsage()
+                ?? ProviderUsage(error: "未找到 Claude 登录凭据或可用的状态栏缓存")
+        }
         var request = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
         request.timeoutInterval = 20
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         guard let (data, status) = Self.request(request) else {
-            return ProviderUsage(error: "Claude 用量请求失败")
+            return Self.cachedClaudeUsage() ?? ProviderUsage(error: "Claude 用量请求失败")
         }
-        guard status == 200 else { return ProviderUsage(error: "Claude 用量 HTTP \(status)") }
+        guard status == 200 else {
+            return Self.cachedClaudeUsage() ?? ProviderUsage(error: "Claude 用量 HTTP \(status)")
+        }
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return ProviderUsage(error: "Claude 用量响应解析失败")
+            return Self.cachedClaudeUsage() ?? ProviderUsage(error: "Claude 用量响应解析失败")
         }
         let primary = Self.isoWindow(json["five_hour"])
         let weekly = Self.isoWindow(json["seven_day"])
         return ProviderUsage(primary: primary, weekly: weekly, fetchedAt: Date())
+    }
+
+    private static func cachedClaudeUsage(now: Date = Date()) -> ProviderUsage? {
+        let file = URL(fileURLWithPath: ("~/.cache/statusline/last.json" as NSString).expandingTildeInPath)
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: file.path),
+              let modified = attributes[.modificationDate] as? Date,
+              now.timeIntervalSince(modified) >= 0,
+              now.timeIntervalSince(modified) <= 6 * 60 * 60,
+              let data = FileManager.default.contents(atPath: file.path),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        return claudeStatuslineUsage(json, fetchedAt: modified)
+    }
+
+    static func claudeStatuslineUsage(_ json: [String: Any], fetchedAt: Date) -> ProviderUsage? {
+        guard let limits = json["rate_limits"] as? [String: Any] else { return nil }
+        let primary = statuslineWindow(limits["five_hour"])
+        let weekly = statuslineWindow(limits["seven_day"])
+        guard primary.percent != nil || weekly.percent != nil else { return nil }
+        return ProviderUsage(primary: primary, weekly: weekly, fetchedAt: fetchedAt)
+    }
+
+    private static func statuslineWindow(_ value: Any?) -> UsageWindow {
+        guard let object = value as? [String: Any] else { return UsageWindow() }
+        let percent = (object["used_percentage"] as? NSNumber)?.doubleValue
+        let reset = (object["resets_at"] as? NSNumber)?.doubleValue
+        return UsageWindow(
+            percent: percent,
+            resetMinutes: reset.map { max(0, Int(($0 - Date().timeIntervalSince1970) / 60)) }
+        )
     }
 
     private func fetchCodex() -> ProviderUsage {
@@ -81,11 +117,35 @@ final class UsageFetcher {
               let limits = json["rate_limit"] as? [String: Any] else {
             return ProviderUsage(error: "Codex 用量响应解析失败")
         }
+        let windows = Self.codexWindows(limits)
         return ProviderUsage(
-            primary: Self.epochWindow(limits["primary_window"]),
-            weekly: Self.epochWindow(limits["secondary_window"]),
+            primary: windows.primary,
+            weekly: windows.weekly,
             fetchedAt: Date()
         )
+    }
+
+    static func codexWindows(_ limits: [String: Any]) -> (primary: UsageWindow, weekly: UsageWindow) {
+        var primary = UsageWindow()
+        var weekly = UsageWindow()
+        let values = [limits["primary_window"], limits["secondary_window"]]
+
+        for (index, value) in values.enumerated() {
+            guard let object = value as? [String: Any] else { continue }
+            let window = epochWindow(object)
+            if let seconds = (object["limit_window_seconds"] as? NSNumber)?.intValue {
+                if seconds >= 6 * 24 * 60 * 60 {
+                    weekly = window
+                } else {
+                    primary = window
+                }
+            } else if index == 0 {
+                primary = window
+            } else {
+                weekly = window
+            }
+        }
+        return (primary, weekly)
     }
 
     private static func claudeToken() -> String? {

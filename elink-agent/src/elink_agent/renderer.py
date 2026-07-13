@@ -54,9 +54,11 @@ class DashboardRenderer:
         draw.text((x1 - 16 - sw, y0 + 20), status, font=status_font, fill=0)
 
         pct = "—" if provider.primary_pct is None else f"{int(provider.primary_pct)}%"
-        pct_font = self._font(92 if large else 66, bold=True)
-        draw.text((x0 + 16, y0 + 58), pct, font=pct_font, fill=0)
         label_x = x0 + (250 if large else 168)
+        pct_font = self._fit_font(draw, pct, preferred=92 if large else 66,
+                                  minimum=54 if large else 42,
+                                  max_width=label_x - (x0 + 16) - 12, bold=True)
+        draw.text((x0 + 16, y0 + 58), pct, font=pct_font, fill=0)
         draw.text((label_x, y0 + 75), "5 HOUR", font=self._font(18, bold=True), fill=0)
         draw.text((label_x, y0 + 102), self._reset(provider.primary_reset_min),
                   font=self._font(15), fill=0)
@@ -122,6 +124,15 @@ class DashboardRenderer:
             return ImageFont.truetype(path, size=size)
         except (OSError, ValueError):
             return ImageFont.load_default(size=size)
+
+    def _fit_font(self, draw: ImageDraw.ImageDraw, text: str, *, preferred: int,
+                  minimum: int, max_width: int,
+                  bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+        for size in range(preferred, minimum - 1, -2):
+            font = self._font(size, bold=bold)
+            if draw.textbbox((0, 0), text, font=font)[2] <= max_width:
+                return font
+        return self._font(minimum, bold=bold)
 
     @staticmethod
     def _find_font(configured: str) -> str:
