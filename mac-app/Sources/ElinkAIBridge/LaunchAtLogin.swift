@@ -1,7 +1,8 @@
 import Foundation
 
 enum AppInfo {
-    static let version = "0.1.2"
+    static let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+        ?? "0.1.3"
     static let repoURL = URL(string: "https://github.com/ChyiYaqing/elink-ai")!
     static let logPath = "/tmp/elink-ai-bridge.log"
 }

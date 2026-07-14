@@ -6,6 +6,7 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
     private let model = PanelModel()
     private let status: StatusService
     private let usage: UsageFetcher
+    private let updater = UpdateChecker()
     private let port: UInt16
     private var pollTimer: Timer?
     private var clickMonitor: Any?
@@ -80,7 +81,7 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
             }
             NSWorkspace.shared.open(base.appendingPathComponent("v1/device"))
         }
-        let hosting = NSHostingController(rootView: UsagePanelView(model: model))
+        let hosting = NSHostingController(rootView: UsagePanelView(model: model, updater: updater))
         hosting.sizingOptions = .preferredContentSize
         popover.contentViewController = hosting
         popover.behavior = .transient
@@ -93,6 +94,7 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
         model.bridgeAddress = "http://\(DeviceClient.localIPv4() ?? "127.0.0.1"):\(port)/v1/status"
         model.settingsMessage = nil
         model.launchAtLogin = LaunchAtLogin.isEnabled()
+        updater.checkAutomaticallyIfNeeded()
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         // .accessory 应用弹出时未被激活，transient 不会因外部点击自动关闭，需手动监听
         NSApp.activate(ignoringOtherApps: true)

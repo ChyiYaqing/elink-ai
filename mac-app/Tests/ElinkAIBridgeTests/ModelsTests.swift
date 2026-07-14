@@ -351,6 +351,51 @@ final class ModelsTests: XCTestCase {
         XCTAssertFalse(LaunchAtLogin.isEnabled(at: path))
     }
 
+    func testUpdateCheckerComparesSemanticVersions() {
+        XCTAssertTrue(UpdateChecker.isVersion("0.1.10", newerThan: "0.1.9"))
+        XCTAssertTrue(UpdateChecker.isVersion("v1.0.0", newerThan: "0.9.99"))
+        XCTAssertTrue(UpdateChecker.isVersion("1.0.0-beta.2", newerThan: "1.0.0-beta.1"))
+        XCTAssertTrue(UpdateChecker.isVersion("1.0.0", newerThan: "1.0.0-rc.1"))
+        XCTAssertFalse(UpdateChecker.isVersion("1.0.0-beta.1", newerThan: "1.0.0"))
+        XCTAssertFalse(UpdateChecker.isVersion("0.1.3", newerThan: "0.1.3"))
+    }
+
+    func testUpdateCheckerSelectsStableOrPrereleaseChannel() throws {
+        let releases = try JSONDecoder().decode([GitHubRelease].self, from: Data(#"""
+        [
+          {"tag_name":"v9.0.0","draft":true,"prerelease":false,
+           "html_url":"https://example.com/draft","assets":[]},
+          {"tag_name":"v0.2.0-beta.1","draft":false,"prerelease":true,
+           "html_url":"https://example.com/beta","assets":[]},
+          {"tag_name":"v0.1.10","draft":false,"prerelease":false,
+           "html_url":"https://example.com/stable","assets":[]},
+          {"tag_name":"v0.1.9","draft":false,"prerelease":false,
+           "html_url":"https://example.com/old","assets":[]}
+        ]
+        """#.utf8))
+
+        XCTAssertEqual(UpdateChecker.newestRelease(
+            in: releases, includesPrereleases: false)?.version, "0.1.10")
+        XCTAssertEqual(UpdateChecker.newestRelease(
+            in: releases, includesPrereleases: true)?.version, "0.2.0-beta.1")
+    }
+
+    func testUpdateCheckerUsesVersionedDMGAsset() throws {
+        let release = try JSONDecoder().decode(GitHubRelease.self, from: Data(#"""
+        {
+          "tag_name":"v0.1.3","draft":false,"prerelease":false,
+          "html_url":"https://github.com/ChyiYaqing/elink-ai/releases/tag/v0.1.3",
+          "assets":[
+            {"name":"another.dmg","browser_download_url":"https://example.com/another.dmg"},
+            {"name":"elink-ai-v0.1.3.dmg","browser_download_url":"https://example.com/elink-ai-v0.1.3.dmg"}
+          ]
+        }
+        """#.utf8))
+
+        XCTAssertEqual(release.dmgURL?.absoluteString,
+                       "https://example.com/elink-ai-v0.1.3.dmg")
+    }
+
     func testKeepsLastGoodWeeklyOnlyUsageAfterError() {
         let old = ProviderUsage(weekly: UsageWindow(percent: 18, resetMinutes: 60))
         let failed = ProviderUsage(error: "temporary error")

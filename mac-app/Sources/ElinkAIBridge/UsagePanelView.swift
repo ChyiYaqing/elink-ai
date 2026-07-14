@@ -29,7 +29,9 @@ final class PanelModel: ObservableObject {
 
 struct UsagePanelView: View {
     @ObservedObject var model: PanelModel
+    @ObservedObject var updater: UpdateChecker
     @Environment(\.colorScheme) private var scheme
+    @State private var updatesExpanded = false
 
     var body: some View {
         let theme = PanelTheme(scheme)
@@ -192,6 +194,7 @@ struct UsagePanelView: View {
                     deviceSettings(theme)
                     launchSettings(theme)
                     logSettings(theme)
+                    updateSettings(theme)
                     aboutSettings(theme)
                     if let message = model.settingsMessage {
                         Text(message)
@@ -294,6 +297,127 @@ struct UsagePanelView: View {
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
         .glassCard(theme)
+    }
+
+    private func updateSettings(_ theme: PanelTheme) -> some View {
+        DisclosureGroup(isExpanded: $updatesExpanded) {
+            VStack(alignment: .leading, spacing: 9) {
+                UpdateCheckButton(checking: updater.isChecking, theme: theme) {
+                    updater.check()
+                }
+                .disabled(updater.isChecking)
+
+                HStack(alignment: .firstTextBaseline, spacing: 5) {
+                    if updater.isChecking {
+                        ProgressView()
+                            .controlSize(.small)
+                            .scaleEffect(0.7)
+                            .frame(width: 10, height: 10)
+                    } else {
+                        Image(systemName: updateStatusIcon)
+                            .font(.system(size: 8, weight: .semibold))
+                    }
+                    Text(updateStatusText)
+                        .font(.system(size: 9, weight: .semibold))
+                        .lineLimit(2)
+                    Spacer(minLength: 0)
+                }
+                .foregroundStyle(updateStatusColor(theme))
+
+                if updater.state == .updateAvailable {
+                    WideButton(title: "下载 v\(updater.latestVersion ?? "最新版") DMG",
+                               icon: "arrow.down.to.line.compact", theme: theme) {
+                        updater.openAvailableUpdate()
+                    }
+                }
+
+                if let lastCheckedAt = updater.lastCheckedAt {
+                    HStack(spacing: 4) {
+                        Image(systemName: "clock.fill").font(.system(size: 8))
+                        Text("上次检查：\(lastCheckedAt.formatted(date: .abbreviated, time: .shortened))")
+                            .font(.system(size: 9, weight: .medium))
+                    }
+                    .foregroundStyle(theme.textTertiary)
+                }
+
+                Divider().opacity(0.4)
+
+                updateToggle(
+                    title: "自动检查更新",
+                    subtitle: "打开菜单时定期检查 GitHub Releases",
+                    isOn: Binding(
+                        get: { updater.automaticallyChecks },
+                        set: { updater.setAutomaticallyChecks($0) }
+                    ),
+                    theme: theme
+                )
+                updateToggle(
+                    title: "包含测试版本",
+                    subtitle: "同时检查 GitHub prerelease 版本",
+                    isOn: Binding(
+                        get: { updater.includesPrereleases },
+                        set: { updater.setIncludesPrereleases($0) }
+                    ),
+                    theme: theme
+                )
+            }
+            .padding(.top, 9)
+        } label: {
+            settingsHeader(theme, icon: "arrow.down.circle.fill", color: theme.statusHealthy,
+                           title: "软件更新", subtitle: "当前版本 \(updater.currentVersion)")
+                .contentShape(Rectangle())
+        }
+        .tint(theme.textTertiary)
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .glassCard(theme)
+    }
+
+    private func updateToggle(title: String, subtitle: String,
+                              isOn: Binding<Bool>, theme: PanelTheme) -> some View {
+        HStack(spacing: 8) {
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title)
+                    .font(.system(size: 10, weight: .semibold, design: .rounded))
+                    .foregroundStyle(theme.textPrimary)
+                Text(subtitle)
+                    .font(.system(size: 8, weight: .medium))
+                    .foregroundStyle(theme.textTertiary)
+            }
+            Spacer()
+            Toggle("", isOn: isOn)
+                .toggleStyle(.switch)
+                .tint(theme.statusHealthy)
+                .scaleEffect(0.78)
+                .labelsHidden()
+        }
+    }
+
+    private var updateStatusText: String {
+        if updater.isChecking { return "正在检查 GitHub Releases…" }
+        switch updater.state {
+        case .idle: return "尚未检查更新"
+        case .upToDate: return "已是最新版"
+        case .updateAvailable: return "发现新版本 v\(updater.latestVersion ?? "")"
+        case let .failed(message): return "检查失败：\(message)"
+        }
+    }
+
+    private var updateStatusIcon: String {
+        switch updater.state {
+        case .idle: return "clock.fill"
+        case .upToDate: return "checkmark.circle.fill"
+        case .updateAvailable: return "arrow.down.circle.fill"
+        case .failed: return "exclamationmark.triangle.fill"
+        }
+    }
+
+    private func updateStatusColor(_ theme: PanelTheme) -> Color {
+        switch updater.state {
+        case .upToDate, .updateAvailable: return theme.statusHealthy
+        case .failed: return theme.statusWarning
+        case .idle: return theme.textTertiary
+        }
     }
 
     private func settingsHeader(_ theme: PanelTheme, icon: String, color: Color,
@@ -566,6 +690,50 @@ private struct WideButton: View {
                                         : AnyShapeStyle(theme.glassBackground))
             )
             .overlay(Capsule().stroke(theme.glassBorder, lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+        .animation(.easeOut(duration: 0.15), value: hovering)
+        .onHover { hovering = $0 }
+    }
+}
+
+private struct UpdateCheckButton: View {
+    let checking: Bool
+    let theme: PanelTheme
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                if checking {
+                    ProgressView()
+                        .controlSize(.small)
+                        .scaleEffect(0.7)
+                        .frame(width: 12, height: 12)
+                        .tint(.white)
+                } else {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 10, weight: .semibold))
+                }
+                Text(checking ? "正在检查…" : "检查更新")
+                    .font(.system(size: 11, weight: .semibold, design: .rounded))
+            }
+            .foregroundStyle(.white)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 8)
+            .background(
+                Capsule().fill(
+                    LinearGradient(
+                        colors: hovering
+                            ? [theme.statusHealthy.opacity(0.88), theme.statusHealthy]
+                            : [theme.statusHealthy, theme.statusHealthy.opacity(0.82)],
+                        startPoint: .leading,
+                        endPoint: .trailing
+                    )
+                )
+            )
+            .scaleEffect(hovering && !checking ? 1.008 : 1)
         }
         .buttonStyle(.plain)
         .animation(.easeOut(duration: 0.15), value: hovering)
