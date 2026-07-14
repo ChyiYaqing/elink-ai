@@ -33,7 +33,7 @@ catch {
 
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
-let menu = MenuBarController(usage: usage, port: port)
+let menu = MenuBarController(usage: usage, status: status, port: port)
 _ = menu
 usage.start()
 app.run()

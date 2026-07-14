@@ -167,6 +167,28 @@ final class ModelsTests: XCTestCase {
         XCTAssertEqual(windows.weekly.percent, 18)
     }
 
+    func testUsageLevelThresholdsFollowRemainingPercent() {
+        XCTAssertEqual(UsageLevel.level(usedPercent: 10), .healthy)
+        XCTAssertEqual(UsageLevel.level(usedPercent: 50), .healthy)
+        XCTAssertEqual(UsageLevel.level(usedPercent: 51), .warning)
+        XCTAssertEqual(UsageLevel.level(usedPercent: 80), .warning)
+        XCTAssertEqual(UsageLevel.level(usedPercent: 81), .critical)
+        XCTAssertEqual(UsageLevel.level(usedPercent: 100), .critical)
+    }
+
+    func testStatusTitleShowsColoredPercent() {
+        let title = MenuBarController.statusTitle(percent: 42)
+        XCTAssertEqual(title.string, "42%")
+        let color = title.attribute(.foregroundColor, at: 0, effectiveRange: nil) as? NSColor
+        XCTAssertEqual(color, .systemGreen)
+    }
+
+    func testFormatsTokenCounts() {
+        XCTAssertEqual(UsageFormat.tokens(999), "999")
+        XCTAssertEqual(UsageFormat.tokens(1_500), "1.5K")
+        XCTAssertEqual(UsageFormat.tokens(2_340_000), "2.3M")
+    }
+
     func testKeepsLastGoodWeeklyOnlyUsageAfterError() {
         let old = ProviderUsage(weekly: UsageWindow(percent: 18, resetMinutes: 60))
         let failed = ProviderUsage(error: "temporary error")

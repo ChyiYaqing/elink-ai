@@ -1,9 +1,9 @@
 import AppKit
 
 final class MenuBarController: NSObject, NSMenuDelegate {
-    private let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+    private let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let menu = NSMenu()
-    private let preview = PreviewPopoverController()
+    private let preview: PreviewPopoverController
     private let usage: UsageFetcher
     private let port: UInt16
     private let claude = NSMenuItem(title: "Claude …", action: nil, keyEquivalent: "")
@@ -11,8 +11,9 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     private let device = NSMenuItem(title: "屏幕：未设置", action: nil, keyEquivalent: "")
     private var modeItems = [String: NSMenuItem]()
 
-    init(usage: UsageFetcher, port: UInt16) {
+    init(usage: UsageFetcher, status: StatusService, port: UInt16) {
         self.usage = usage; self.port = port
+        self.preview = PreviewPopoverController(status: status, usage: usage)
         super.init(); build()
         if let button = item.button {
             button.image = NSImage(systemSymbolName: "gauge.with.dots.needle.67percent", accessibilityDescription: "Elink AI")
@@ -58,6 +59,29 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     private func refreshUsage() {
         claude.title = Self.usageLine("Claude", usage.claude)
         codex.title = Self.usageLine("Codex", usage.codex)
+        refreshStatusButton()
+    }
+    private func refreshStatusButton() {
+        guard let button = item.button else { return }
+        if let percent = usage.claude.primary.percent {
+            button.imagePosition = .imageLeft
+            button.attributedTitle = Self.statusTitle(percent: percent)
+        } else {
+            button.imagePosition = .imageOnly
+            button.attributedTitle = NSAttributedString()
+        }
+    }
+    static func statusTitle(percent: Double) -> NSAttributedString {
+        let color: NSColor
+        switch UsageLevel.level(usedPercent: percent) {
+        case .healthy: color = .systemGreen
+        case .warning: color = .systemOrange
+        case .critical: color = .systemRed
+        }
+        return NSAttributedString(string: "\(Int(percent))%", attributes: [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .semibold),
+            .foregroundColor: color,
+        ])
     }
     static func usageLine(_ name: String, _ usage: ProviderUsage) -> String {
         if let error = usage.error, usage.primary.percent == nil, usage.weekly.percent == nil {
