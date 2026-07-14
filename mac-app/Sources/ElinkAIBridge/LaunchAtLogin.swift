@@ -1,7 +1,7 @@
 import Foundation
 
 enum AppInfo {
-    static let version = "0.1.1"
+    static let version = "0.1.2"
     static let repoURL = URL(string: "https://github.com/ChyiYaqing/elink-ai")!
     static let logPath = "/tmp/elink-ai-bridge.log"
 }

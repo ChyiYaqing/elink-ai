@@ -1,0 +1,44 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Test macOS app
+        run: swift test
+        working-directory: mac-app
+
+      - name: Build DMG
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          APP_VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Info.plist)
+          if [ "$VERSION" != "$APP_VERSION" ]; then
+            echo "Tag version $VERSION does not match app version $APP_VERSION" >&2
+            exit 1
+          fi
+          RELEASE_VERSION="$VERSION" sh build-dmg.sh
+        working-directory: mac-app
+
+      - name: Publish DMG
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          DMG="mac-app/.build/elink-ai-${GITHUB_REF_NAME}.dmg"
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "$DMG" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "$DMG" \
+              --verify-tag \
+              --generate-notes \
+              --title "$GITHUB_REF_NAME"
+          fi
