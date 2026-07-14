@@ -17,6 +17,13 @@ OAuth tokens and raw session logs never leave the Mac.
 
 ![Bold Claude and Codex dashboard with per-model TODAY token usage](docs/images/dashboard-preview.png)
 
+## macOS menu-bar app
+
+<p>
+  <img src="docs/images/mac-app-main.png" alt="Menu-bar panel with Claude and Codex usage cards, pixel mascots, and live e-paper preview" width="390">
+  <img src="docs/images/mac-app-settings.png" alt="In-panel settings page with device pairing, launch at login, logs, and about" width="390">
+</p>
+
 ## Current scope
 
 - Claude and Codex side-by-side dashboard
@@ -62,9 +69,12 @@ swift test
 swift run ElinkAIBridge
 ```
 
-The app runs only in the menu bar. Right-click shows detailed quota/reset and
-device controls. Left-click opens the exact PNG last sent to the display, with
-page switching plus smart/full refresh controls. Verify the bridge with:
+The app runs only in the menu bar, showing a color-coded Claude usage
+percentage next to the icon. Left-click opens a panel with Claude and Codex
+usage cards (5-hour/weekly windows, reset countdowns, per-model tokens), the
+exact PNG last sent to the display with page switching and smart/full refresh
+controls, and a settings page for device pairing, launch at login, logs, and
+about. Right-click shows a compact quota/status menu. Verify the bridge with:
 
 ```bash
 curl -s http://localhost:8765/v1/status | python3 -m json.tool
