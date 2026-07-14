@@ -1,4 +1,5 @@
 import XCTest
+import SQLite3
 @testable import ElinkAIBridge
 
 final class ModelsTests: XCTestCase {
@@ -71,6 +72,66 @@ final class ModelsTests: XCTestCase {
         XCTAssertEqual(store.usage(provider: "codex", since: "2026-01-01"), [
             DailyModelUsage(day: "2026-07-14", provider: "codex", model: "gpt-a", tokens: 7),
         ])
+    }
+
+    func testUsageStoreMigratesExistingDatabaseAndMaintainsTimestamps() throws {
+        let path = NSTemporaryDirectory() + "elink-usage-migration-\(UUID().uuidString).db"
+        defer { try? FileManager.default.removeItem(atPath: path) }
+
+        var legacyDB: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(path, &legacyDB), SQLITE_OK)
+        let legacySchema = """
+        CREATE TABLE daily_model_usage (
+            day TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL,
+            tokens INTEGER NOT NULL,
+            PRIMARY KEY (day, provider, model)
+        );
+        INSERT INTO daily_model_usage VALUES ('2026-07-14', 'claude', 'claude-a', 10);
+        """
+        XCTAssertEqual(sqlite3_exec(legacyDB, legacySchema, nil, nil, nil), SQLITE_OK)
+        sqlite3_close(legacyDB)
+
+        let store = UsageStore(path: path)
+        XCTAssertEqual(store.usage(provider: "claude", since: "2026-01-01"), [
+            DailyModelUsage(day: "2026-07-14", provider: "claude", model: "claude-a", tokens: 10),
+        ])
+
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(path, &db), SQLITE_OK)
+        defer { sqlite3_close(db) }
+
+        var columnsStatement: OpaquePointer?
+        XCTAssertEqual(sqlite3_prepare_v2(db, "PRAGMA table_info(daily_model_usage)", -1,
+                                         &columnsStatement, nil), SQLITE_OK)
+        var columns = Set<String>()
+        while sqlite3_step(columnsStatement) == SQLITE_ROW,
+              let name = sqlite3_column_text(columnsStatement, 1) {
+            columns.insert(String(cString: name))
+        }
+        sqlite3_finalize(columnsStatement)
+        XCTAssertTrue(columns.isSuperset(of: ["created_at", "updated_at"]))
+
+        let oldTimestamp = "2000-01-01 00:00:00"
+        let setOldTimestamps = """
+        UPDATE daily_model_usage
+        SET created_at = '\(oldTimestamp)', updated_at = '\(oldTimestamp)'
+        """
+        XCTAssertEqual(sqlite3_exec(db, setOldTimestamps, nil, nil, nil), SQLITE_OK)
+
+        store.record(day: "2026-07-14", provider: "claude", models: ["claude-a": 25])
+
+        var rowStatement: OpaquePointer?
+        let rowSQL = "SELECT tokens, created_at, updated_at FROM daily_model_usage"
+        XCTAssertEqual(sqlite3_prepare_v2(db, rowSQL, -1, &rowStatement, nil), SQLITE_OK)
+        XCTAssertEqual(sqlite3_step(rowStatement), SQLITE_ROW)
+        XCTAssertEqual(sqlite3_column_int64(rowStatement, 0), 25)
+        let createdAt = try XCTUnwrap(sqlite3_column_text(rowStatement, 1))
+        let updatedAt = try XCTUnwrap(sqlite3_column_text(rowStatement, 2))
+        XCTAssertEqual(String(cString: createdAt), oldTimestamp)
+        XCTAssertNotEqual(String(cString: updatedAt), oldTimestamp)
+        sqlite3_finalize(rowStatement)
     }
 
     func testStatsBucketsCoverRangeAndAggregateYearByMonth() {

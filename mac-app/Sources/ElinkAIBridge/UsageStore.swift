@@ -38,11 +38,15 @@ final class UsageStore {
                 provider TEXT NOT NULL,
                 model TEXT NOT NULL,
                 tokens INTEGER NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (day, provider, model)
             )
             """
             if sqlite3_exec(db, create, nil, nil, nil) != SQLITE_OK {
                 Log.info("usage db create table failed")
+            } else if !Self.columns(in: db).isSuperset(of: ["created_at", "updated_at"]) {
+                Self.migrateTimestamps(in: db)
             }
         }
     }
@@ -55,7 +59,13 @@ final class UsageStore {
         guard !rows.isEmpty else { return }
         queue.sync {
             guard db != nil else { return }
-            let sql = "INSERT OR REPLACE INTO daily_model_usage (day, provider, model, tokens) VALUES (?, ?, ?, ?)"
+            let sql = """
+            INSERT INTO daily_model_usage (day, provider, model, tokens)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(day, provider, model) DO UPDATE SET
+                tokens = excluded.tokens,
+                updated_at = CURRENT_TIMESTAMP
+            """
             var statement: OpaquePointer?
             guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return }
             defer { sqlite3_finalize(statement) }
@@ -94,6 +104,44 @@ final class UsageStore {
                 ))
             }
             return result
+        }
+    }
+
+    private static func columns(in db: OpaquePointer?) -> Set<String> {
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "PRAGMA table_info(daily_model_usage)", -1, &statement, nil) == SQLITE_OK else {
+            return []
+        }
+        defer { sqlite3_finalize(statement) }
+        var result = Set<String>()
+        while sqlite3_step(statement) == SQLITE_ROW,
+              let name = sqlite3_column_text(statement, 1) {
+            result.insert(String(cString: name))
+        }
+        return result
+    }
+
+    private static func migrateTimestamps(in db: OpaquePointer?) {
+        let sql = """
+        BEGIN IMMEDIATE;
+        CREATE TABLE daily_model_usage_v2 (
+            day TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL,
+            tokens INTEGER NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (day, provider, model)
+        );
+        INSERT INTO daily_model_usage_v2 (day, provider, model, tokens)
+        SELECT day, provider, model, tokens FROM daily_model_usage;
+        DROP TABLE daily_model_usage;
+        ALTER TABLE daily_model_usage_v2 RENAME TO daily_model_usage;
+        COMMIT;
+        """
+        if sqlite3_exec(db, sql, nil, nil, nil) != SQLITE_OK {
+            sqlite3_exec(db, "ROLLBACK", nil, nil, nil)
+            Log.info("usage db timestamp migration failed")
         }
     }
 }
