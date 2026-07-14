@@ -6,6 +6,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
+from . import __version__
 from .service import AgentService
 
 logger = logging.getLogger(__name__)
@@ -30,7 +31,7 @@ class AgentHTTPServer:
     @staticmethod
     def _handler(service: AgentService):
         class Handler(BaseHTTPRequestHandler):
-            server_version = "elink-agent/0.1"
+            server_version = f"elink-agent/{__version__}"
 
             def do_GET(self) -> None:
                 path = urlsplit(self.path).path

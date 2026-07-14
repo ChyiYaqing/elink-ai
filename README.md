@@ -15,7 +15,9 @@ OAuth tokens and raw session logs never leave the Mac.
 
 ## Dashboard preview
 
-![Bold Claude and Codex dashboard with per-model TODAY token usage](docs/images/dashboard-preview.png)
+<p>
+  <img src="docs/images/dashboard-preview.png" alt="Bold Claude and Codex dashboard with per-model TODAY token usage" width="390">
+</p>
 
 ## macOS menu-bar app
 

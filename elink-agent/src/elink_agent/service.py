@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from . import __version__
 from .bridge_client import BridgeClient
 from .config import AgentConfig
 from .display.base import Display
@@ -103,7 +104,7 @@ class AgentService:
             return {
                 "schema_version": 1,
                 "device_type": "elink-agent",
-                "version": "0.1.0",
+                "version": __version__,
                 "resolution": [self.display.width, self.display.height],
                 "bridge_url": self.config.bridge_url,
                 "mode": self.runtime.mode,
