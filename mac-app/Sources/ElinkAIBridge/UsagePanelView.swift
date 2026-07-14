@@ -220,6 +220,7 @@ struct UsagePanelView: View {
                     do {
                         try LaunchAtLogin.setEnabled(enabled)
                         model.launchAtLogin = enabled
+                        Log.info("launch at login \(enabled ? "enabled" : "disabled")")
                     } catch {
                         model.settingsMessage = "设置开机自启动失败：\(error.localizedDescription)"
                     }

@@ -14,19 +14,28 @@ let server = HTTPServer(port: port, get: [
             return Data("{\"ok\":false}".utf8)
         }
         status.recordEvent(agent: agent, event: event, message: object["message"] as? String)
+        if ["Notification", "SessionStart", "SessionEnd", "Stop"].contains(event) {
+            Log.info("hook \(agent): \(event)")
+        }
         return Data("{\"ok\":true}".utf8)
     },
 ])
 server.onRequest = { path, ip in
     guard path == "/v1/status", !["127.0.0.1", "::1", ""].contains(ip) else { return }
     DeviceClient.recordDevicePoll(ip: ip)
-    if DeviceClient.host.isEmpty { DeviceClient.host = "\(ip):8766" }
+    if DeviceClient.host.isEmpty {
+        DeviceClient.host = "\(ip):8766"
+        Log.info("device discovered at \(ip):8766")
+    }
 }
 Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { _ in
     DeviceClient.healPairingIfNeeded(port: port)
 }
-do { try server.start() }
-catch {
+do {
+    try server.start()
+    Log.info("bridge v\(AppInfo.version) started on port \(port)")
+} catch {
+    Log.info("server start failed: \(error.localizedDescription)")
     let alert = NSAlert(); alert.messageText = "Elink AI Bridge 无法启动"
     alert.informativeText = "端口 \(port) 绑定失败：\(error.localizedDescription)"; alert.runModal()
 }

@@ -6,6 +6,7 @@ final class UsageFetcher {
     private var storedCodex = ProviderUsage()
     private var fetching = false
     private var nextAllowed = Date.distantPast
+    private var lastLogSummary = ""
     private var timer: Timer?
     var onUpdate: (() -> Void)?
 
@@ -34,9 +35,20 @@ final class UsageFetcher {
                 self.fetching = false
                 let rateLimited = claude.error?.contains("429") == true || codex.error?.contains("429") == true
                 self.nextAllowed = Date().addingTimeInterval(rateLimited ? 300 : 60)
+                let summary = "usage claude=\(Self.describe(claude)) codex=\(Self.describe(codex))"
+                if summary != self.lastLogSummary {
+                    self.lastLogSummary = summary
+                    Log.info(summary)
+                }
             }
             DispatchQueue.main.async { self.onUpdate?() }
         }
+    }
+
+    private static func describe(_ usage: ProviderUsage) -> String {
+        if let percent = usage.primary.percent { return "\(Int(percent))%" }
+        if let percent = usage.weekly.percent { return "weekly \(Int(percent))%" }
+        return usage.error ?? "n/a"
     }
 
     static func keepLastGood(old: ProviderUsage, new: ProviderUsage) -> ProviderUsage {

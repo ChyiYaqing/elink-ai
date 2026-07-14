@@ -19,9 +19,11 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
         self.port = port
         super.init()
         model.onSetMode = { [weak self] mode in
+            Log.info("device mode -> \(mode)")
             self?.performAction("正在切换页面…") { DeviceClient.setMode(mode, completion: $0) }
         }
         model.onDeviceRefresh = { [weak self] kind in
+            Log.info("device refresh (\(kind))")
             self?.performAction(kind == "smart" ? "正在请求智能刷新…" : "正在请求完整刷新…") {
                 DeviceClient.refresh(kind, completion: $0)
             }
@@ -32,6 +34,7 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
         }
         model.onSaveHost = { [weak self] host in
             DeviceClient.host = DeviceClient.normalizedHost(host)
+            Log.info("device host set to \(DeviceClient.host)")
             self?.model.deviceHost = DeviceClient.host
             self?.model.settingsMessage = "地址已保存"
             self?.reload()
@@ -44,6 +47,7 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
             }) { [weak self] found in
                 self?.model.busy = false
                 self?.model.deviceHost = DeviceClient.host
+                Log.info(found.map { "pair success: \($0)" } ?? "pair failed: no device found")
                 self?.model.settingsMessage = found.map { "配对成功：\($0)" }
                     ?? "未找到屏幕，请确认树莓派与 Mac 在同一局域网"
                 self?.reload()
@@ -57,6 +61,8 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
             }
             let url = "http://\(ip):\(self.port)"
             DeviceClient.setBridge(url) { [weak self] error in
+                Log.info(error.map { "set bridge failed: \($0.localizedDescription)" }
+                    ?? "bridge set to \(url)")
                 self?.model.settingsMessage = error.map { "设置失败：\($0.localizedDescription)" }
                     ?? "桥接已设置，设备将从 \(url)/v1/status 拉取数据"
             }
@@ -173,6 +179,7 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
             self.actionInFlight = false
             self.model.busy = false
             if let error {
+                Log.info("device action failed: \(error.localizedDescription)")
                 self.model.deviceSummary = "操作失败 · \(error.localizedDescription)"
             } else {
                 self.model.deviceSummary = "请求已发送，等待设备完成送屏…"
