@@ -10,10 +10,19 @@ final class PanelModel: ObservableObject {
     @Published var deviceHealthy = false
     @Published var mode = "dashboard"
     @Published var busy = false
+    @Published var showSettings = false
+    @Published var launchAtLogin = false
+    @Published var deviceHost = ""
+    @Published var bridgeAddress = ""
+    @Published var settingsMessage: String?
 
     var onSetMode: ((String) -> Void)?
     var onDeviceRefresh: ((String) -> Void)?
     var onRefreshAll: (() -> Void)?
+    var onSaveHost: ((String) -> Void)?
+    var onAutoPair: (() -> Void)?
+    var onPointHere: (() -> Void)?
+    var onOpenDeviceStatus: (() -> Void)?
 }
 
 struct UsagePanelView: View {
@@ -24,15 +33,26 @@ struct UsagePanelView: View {
         let theme = PanelTheme(scheme)
         VStack(spacing: 12) {
             header(theme)
-            HStack(alignment: .top, spacing: 10) {
-                ProviderCard(name: "Claude", pet: PixelPet.claude,
-                             accent: PanelTheme.claudeColor(dark: theme.dark),
-                             status: model.claude, theme: theme)
-                ProviderCard(name: "Codex", pet: PixelPet.codex,
-                             accent: PanelTheme.codexColor(dark: theme.dark),
-                             status: model.codex, theme: theme)
+            // 设置页作为覆盖层，保持面板尺寸稳定，避免弹窗因高度突变而跳位
+            ZStack(alignment: .top) {
+                VStack(spacing: 12) {
+                    HStack(alignment: .top, spacing: 10) {
+                        ProviderCard(name: "Claude", pet: PixelPet.claude,
+                                     accent: PanelTheme.claudeColor(dark: theme.dark),
+                                     status: model.claude, theme: theme)
+                        ProviderCard(name: "Codex", pet: PixelPet.codex,
+                                     accent: PanelTheme.codexColor(dark: theme.dark),
+                                     status: model.codex, theme: theme)
+                    }
+                    deviceCard(theme)
+                }
+                .opacity(model.showSettings ? 0 : 1)
+                .allowsHitTesting(!model.showSettings)
+                if model.showSettings {
+                    settingsCard(theme)
+                        .transition(.opacity)
+                }
             }
-            deviceCard(theme)
             footer(theme)
         }
         .padding(16)
@@ -125,16 +145,186 @@ struct UsagePanelView: View {
         .glassCard(theme)
     }
 
+    private func settingsCard(_ theme: PanelTheme) -> some View {
+        VStack(spacing: 10) {
+            ZStack {
+                Text("设置")
+                    .font(.system(size: 14, weight: .bold, design: .rounded))
+                    .foregroundStyle(theme.textPrimary)
+                HStack {
+                    PillButton(title: "返回", icon: "chevron.left", theme: theme) {
+                        withAnimation(.easeOut(duration: 0.2)) { model.showSettings = false }
+                    }
+                    Spacer()
+                }
+            }
+            ScrollView(.vertical, showsIndicators: false) {
+                VStack(spacing: 10) {
+                    deviceSettings(theme)
+                    launchSettings(theme)
+                    logSettings(theme)
+                    aboutSettings(theme)
+                    if let message = model.settingsMessage {
+                        Text(message)
+                            .font(.system(size: 9, weight: .medium))
+                            .foregroundStyle(theme.statusWarning)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+    }
+
+    private func deviceSettings(_ theme: PanelTheme) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            settingsHeader(theme, icon: "display", color: Color(red: 0.35, green: 0.60, blue: 0.95),
+                           title: "屏幕连接", subtitle: "树莓派电子纸的地址与配对")
+            HStack(spacing: 8) {
+                TextField("例如 192.168.1.50:8766", text: $model.deviceHost)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 11, design: .monospaced))
+                PillButton(title: "保存", icon: "checkmark", theme: theme) {
+                    model.onSaveHost?(model.deviceHost)
+                }
+            }
+            HStack(spacing: 8) {
+                PillButton(title: "自动配对屏幕", icon: "antenna.radiowaves.left.and.right", theme: theme) {
+                    model.onAutoPair?()
+                }
+                PillButton(title: "设为数据桥接", icon: "point.3.connected.trianglepath.dotted", theme: theme) {
+                    model.onPointHere?()
+                }
+                PillButton(title: "设备状态页", icon: "safari", theme: theme) {
+                    model.onOpenDeviceStatus?()
+                }
+            }
+            .disabled(model.busy)
+            Text("桥接服务：\(model.bridgeAddress)")
+                .font(.system(size: 9, weight: .medium, design: .monospaced))
+                .foregroundStyle(theme.textTertiary)
+                .textSelection(.enabled)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .glassCard(theme)
+    }
+
+    private func launchSettings(_ theme: PanelTheme) -> some View {
+        HStack(spacing: 8) {
+            settingsHeader(theme, icon: "power", color: theme.statusHealthy,
+                           title: "开机自启动", subtitle: "登录 macOS 时自动启动 Elink AI")
+            Toggle("", isOn: Binding(
+                get: { model.launchAtLogin },
+                set: { enabled in
+                    do {
+                        try LaunchAtLogin.setEnabled(enabled)
+                        model.launchAtLogin = enabled
+                    } catch {
+                        model.settingsMessage = "设置开机自启动失败：\(error.localizedDescription)"
+                    }
+                }
+            ))
+            .toggleStyle(.switch)
+            .labelsHidden()
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .glassCard(theme)
+    }
+
+    private func logSettings(_ theme: PanelTheme) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            settingsHeader(theme, icon: "doc.text.fill", color: Color(red: 0.55, green: 0.52, blue: 0.62),
+                           title: "日志", subtitle: "查看桥接应用运行日志")
+            WideButton(title: "打开日志文件", icon: "doc.text", theme: theme) {
+                if FileManager.default.fileExists(atPath: AppInfo.logPath) {
+                    NSWorkspace.shared.open(URL(fileURLWithPath: AppInfo.logPath))
+                } else {
+                    model.settingsMessage = "暂无日志文件（以开机自启动方式运行后生成于 \(AppInfo.logPath)）"
+                }
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .glassCard(theme)
+    }
+
+    private func aboutSettings(_ theme: PanelTheme) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            settingsHeader(theme, icon: "info.circle.fill", color: theme.statusCritical,
+                           title: "关于", subtitle: "版本 \(AppInfo.version)")
+            WideButton(title: "在 GitHub 查看", icon: "link", theme: theme) {
+                NSWorkspace.shared.open(AppInfo.repoURL)
+            }
+            Text("在 GitHub 反馈问题或参与贡献")
+                .font(.system(size: 9, weight: .medium))
+                .foregroundStyle(theme.textTertiary)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .glassCard(theme)
+    }
+
+    private func settingsHeader(_ theme: PanelTheme, icon: String, color: Color,
+                                title: String, subtitle: String) -> some View {
+        HStack(spacing: 8) {
+            ZStack {
+                Circle().fill(color)
+                Image(systemName: icon)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.white)
+            }
+            .frame(width: 26, height: 26)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title)
+                    .font(.system(size: 12, weight: .bold, design: .rounded))
+                    .foregroundStyle(theme.textPrimary)
+                Text(subtitle)
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(theme.textTertiary)
+            }
+            Spacer()
+        }
+    }
+
     private func footer(_ theme: PanelTheme) -> some View {
-        HStack {
+        HStack(spacing: 8) {
             Text("localhost:8765/v1/status")
                 .font(.system(size: 9, weight: .medium, design: .monospaced))
                 .foregroundStyle(theme.textTertiary)
             Spacer()
-            PillButton(title: "退出", icon: "power", theme: theme) {
+            CircleIconButton(icon: model.showSettings ? "xmark" : "gearshape.fill", theme: theme) {
+                withAnimation(.easeOut(duration: 0.2)) { model.showSettings.toggle() }
+            }
+            CircleIconButton(icon: "power", theme: theme) {
                 NSApp.terminate(nil)
             }
         }
+    }
+}
+
+private struct CircleIconButton: View {
+    let icon: String
+    let theme: PanelTheme
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(hovering ? Color.white : theme.textSecondary)
+                .frame(width: 28, height: 28)
+                .background(
+                    Circle().fill(hovering ? AnyShapeStyle(theme.accentGradient)
+                                           : AnyShapeStyle(theme.glassBackground))
+                )
+                .overlay(Circle().stroke(theme.glassBorder, lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+        .animation(.easeOut(duration: 0.15), value: hovering)
+        .onHover { hovering = $0 }
     }
 }
 
@@ -306,6 +496,34 @@ private struct PillButton: View {
             .foregroundStyle(hovering ? Color.white : theme.textSecondary)
             .padding(.horizontal, 10)
             .padding(.vertical, 5)
+            .background(
+                Capsule().fill(hovering ? AnyShapeStyle(theme.accentGradient)
+                                        : AnyShapeStyle(theme.glassBackground))
+            )
+            .overlay(Capsule().stroke(theme.glassBorder, lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+        .animation(.easeOut(duration: 0.15), value: hovering)
+        .onHover { hovering = $0 }
+    }
+}
+
+private struct WideButton: View {
+    let title: String
+    let icon: String
+    let theme: PanelTheme
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 5) {
+                Image(systemName: icon).font(.system(size: 10, weight: .semibold))
+                Text(title).font(.system(size: 11, weight: .semibold, design: .rounded))
+            }
+            .foregroundStyle(hovering ? Color.white : theme.textSecondary)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 7)
             .background(
                 Capsule().fill(hovering ? AnyShapeStyle(theme.accentGradient)
                                         : AnyShapeStyle(theme.glassBackground))

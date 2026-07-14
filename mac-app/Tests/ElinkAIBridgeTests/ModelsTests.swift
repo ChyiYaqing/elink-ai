@@ -189,6 +189,25 @@ final class ModelsTests: XCTestCase {
         XCTAssertEqual(UsageFormat.tokens(2_340_000), "2.3M")
     }
 
+    func testLaunchAtLoginWritesAndRemovesPlist() throws {
+        let path = NSTemporaryDirectory() + "elink-test-\(UUID().uuidString)/launch.plist"
+        defer { try? FileManager.default.removeItem(atPath: (path as NSString).deletingLastPathComponent) }
+
+        XCTAssertFalse(LaunchAtLogin.isEnabled(at: path))
+        try LaunchAtLogin.setEnabled(true, at: path)
+        XCTAssertTrue(LaunchAtLogin.isEnabled(at: path))
+
+        let data = try Data(contentsOf: URL(fileURLWithPath: path))
+        let plist = try XCTUnwrap(
+            try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any])
+        XCTAssertEqual(plist["Label"] as? String, "local.elink-ai-bridge")
+        XCTAssertEqual(plist["RunAtLoad"] as? Bool, true)
+        XCTAssertFalse((plist["ProgramArguments"] as? [String] ?? []).isEmpty)
+
+        try LaunchAtLogin.setEnabled(false, at: path)
+        XCTAssertFalse(LaunchAtLogin.isEnabled(at: path))
+    }
+
     func testKeepsLastGoodWeeklyOnlyUsageAfterError() {
         let old = ProviderUsage(weekly: UsageWindow(percent: 18, resetMinutes: 60))
         let failed = ProviderUsage(error: "temporary error")

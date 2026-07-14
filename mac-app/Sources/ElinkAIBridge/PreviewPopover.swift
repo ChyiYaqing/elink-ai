@@ -6,15 +6,17 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
     private let model = PanelModel()
     private let status: StatusService
     private let usage: UsageFetcher
+    private let port: UInt16
     private var pollTimer: Timer?
     private var clickMonitor: Any?
     private var loadingPreview = false
     private var loadingSnapshot = false
     private var actionInFlight = false
 
-    init(status: StatusService, usage: UsageFetcher) {
+    init(status: StatusService, usage: UsageFetcher, port: UInt16) {
         self.status = status
         self.usage = usage
+        self.port = port
         super.init()
         model.onSetMode = { [weak self] mode in
             self?.performAction("正在切换页面…") { DeviceClient.setMode(mode, completion: $0) }
@@ -28,6 +30,44 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
             self?.usage.refresh()
             self?.reload()
         }
+        model.onSaveHost = { [weak self] host in
+            DeviceClient.host = DeviceClient.normalizedHost(host)
+            self?.model.deviceHost = DeviceClient.host
+            self?.model.settingsMessage = "地址已保存"
+            self?.reload()
+        }
+        model.onAutoPair = { [weak self] in
+            self?.model.busy = true
+            self?.model.settingsMessage = "正在查找屏幕…"
+            DeviceClient.autoPair(progress: { [weak self] text in
+                self?.model.settingsMessage = text
+            }) { [weak self] found in
+                self?.model.busy = false
+                self?.model.deviceHost = DeviceClient.host
+                self?.model.settingsMessage = found.map { "配对成功：\($0)" }
+                    ?? "未找到屏幕，请确认树莓派与 Mac 在同一局域网"
+                self?.reload()
+            }
+        }
+        model.onPointHere = { [weak self] in
+            guard let self else { return }
+            guard let ip = DeviceClient.localIPv4() else {
+                self.model.settingsMessage = "无法取得本机局域网地址"
+                return
+            }
+            let url = "http://\(ip):\(self.port)"
+            DeviceClient.setBridge(url) { [weak self] error in
+                self?.model.settingsMessage = error.map { "设置失败：\($0.localizedDescription)" }
+                    ?? "桥接已设置，设备将从 \(url)/v1/status 拉取数据"
+            }
+        }
+        model.onOpenDeviceStatus = { [weak self] in
+            guard let base = DeviceClient.baseURL else {
+                self?.model.settingsMessage = "请先设置屏幕地址"
+                return
+            }
+            NSWorkspace.shared.open(base.appendingPathComponent("v1/device"))
+        }
         let hosting = NSHostingController(rootView: UsagePanelView(model: model))
         hosting.sizingOptions = .preferredContentSize
         popover.contentViewController = hosting
@@ -37,6 +77,10 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
 
     func toggle(relativeTo button: NSStatusBarButton) {
         if popover.isShown { popover.performClose(nil); return }
+        model.deviceHost = DeviceClient.host
+        model.bridgeAddress = "http://\(DeviceClient.localIPv4() ?? "127.0.0.1"):\(port)/v1/status"
+        model.settingsMessage = nil
+        model.launchAtLogin = LaunchAtLogin.isEnabled()
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         // .accessory 应用弹出时未被激活，transient 不会因外部点击自动关闭，需手动监听
         NSApp.activate(ignoringOtherApps: true)
