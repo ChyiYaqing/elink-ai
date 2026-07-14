@@ -37,9 +37,16 @@ final class StatusService {
             value.generatedAt = Date()
             value.claude = overlay(value.claude, provider: "claude", usage: usage.claude)
             value.codex = overlay(value.codex, provider: "codex", usage: usage.codex)
-            value.usageFetchedAt = [usage.claude.fetchedAt, usage.codex.fetchedAt].compactMap { $0 }.min()
+            value.usageFetchedAt = Self.latestUsageFetchedAt(
+                claude: usage.claude.fetchedAt,
+                codex: usage.codex.fetchedAt
+            )
             return value
         }
+    }
+
+    static func latestUsageFetchedAt(claude: Date?, codex: Date?) -> Date? {
+        [claude, codex].compactMap { $0 }.max()
     }
 
     func recordEvent(agent: String, event: String, message: String?) {

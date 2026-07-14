@@ -17,6 +17,14 @@ final class ModelsTests: XCTestCase {
         XCTAssertEqual(models.first?["tokens"] as? Int, 1200)
     }
 
+    func testSnapshotUsesLatestProviderUsageUpdate() {
+        let old = Date(timeIntervalSince1970: 100)
+        let latest = Date(timeIntervalSince1970: 200)
+        XCTAssertEqual(StatusService.latestUsageFetchedAt(claude: old, codex: latest), latest)
+        XCTAssertEqual(StatusService.latestUsageFetchedAt(claude: latest, codex: nil), latest)
+        XCTAssertNil(StatusService.latestUsageFetchedAt(claude: nil, codex: nil))
+    }
+
     func testClaudeUsageIsDeduplicatedAndGroupedByDayAndModel() {
         let first = #"{"timestamp":"1970-01-01T00:20:00.000Z","uuid":"one","message":{"id":"msg-1","model":"claude-a","usage":{"input_tokens":10,"output_tokens":2,"cache_creation_input_tokens":3,"cache_read_input_tokens":5}}}"#
         let duplicate = #"{"timestamp":"1970-01-01T00:20:01.000Z","uuid":"two","message":{"id":"msg-1","model":"claude-a","usage":{"input_tokens":10,"output_tokens":2,"cache_creation_input_tokens":3,"cache_read_input_tokens":5}}}"#
@@ -294,6 +302,27 @@ final class ModelsTests: XCTestCase {
         XCTAssertEqual(color, .systemGreen)
         XCTAssertEqual(MenuBarController.statusColor(percent: 51), .systemOrange)
         XCTAssertEqual(MenuBarController.statusColor(percent: 81), .systemRed)
+    }
+
+    func testMenuBarUsesLargestProviderWeeklyUsage() {
+        let claude = ProviderUsage(
+            primary: UsageWindow(percent: 99),
+            weekly: UsageWindow(percent: 47)
+        )
+        let codex = ProviderUsage(weekly: UsageWindow(percent: 68))
+        XCTAssertEqual(MenuBarController.menuBarWeeklyPercent(claude: claude, codex: codex), 68)
+        XCTAssertEqual(MenuBarController.menuBarWeeklyPercent(
+            claude: claude,
+            codex: ProviderUsage()
+        ), 47)
+        XCTAssertNil(MenuBarController.menuBarWeeklyPercent(
+            claude: ProviderUsage(),
+            codex: ProviderUsage()
+        ))
+    }
+
+    func testMenuBarUsesDedicatedLogoInDevelopmentBuild() {
+        XCTAssertNotNil(AppLogo.menuBarImage)
     }
 
     func testFormatsTokenCounts() {

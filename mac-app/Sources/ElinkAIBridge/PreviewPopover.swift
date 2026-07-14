@@ -29,8 +29,14 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
             }
         }
         model.onRefreshAll = { [weak self] in
-            self?.usage.refresh()
-            self?.reload()
+            guard let self, !self.model.refreshingUsage else { return }
+            self.model.refreshingUsage = true
+            self.model.updatedText = "正在刷新用量…"
+            self.usage.refresh(force: true) { [weak self] in
+                guard let self else { return }
+                self.model.refreshingUsage = false
+                self.reload()
+            }
         }
         model.onSaveHost = { [weak self] host in
             DeviceClient.host = DeviceClient.normalizedHost(host)

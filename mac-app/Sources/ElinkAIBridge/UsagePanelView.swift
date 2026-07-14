@@ -10,6 +10,7 @@ final class PanelModel: ObservableObject {
     @Published var deviceHealthy = false
     @Published var mode = "dashboard"
     @Published var busy = false
+    @Published var refreshingUsage = false
     @Published var showSettings = false
     @Published var statsProvider: String?
     @Published var launchAtLogin = false
@@ -90,9 +91,11 @@ struct UsagePanelView: View {
                     .foregroundStyle(theme.textTertiary)
             }
             Spacer()
-            PillButton(title: "刷新", icon: "arrow.clockwise", theme: theme) {
+            PillButton(title: model.refreshingUsage ? "刷新中" : "刷新",
+                       icon: "arrow.clockwise", theme: theme) {
                 model.onRefreshAll?()
             }
+            .disabled(model.refreshingUsage)
         }
     }
 
@@ -424,7 +427,7 @@ private struct ProviderCard: View {
                         .font(.system(size: 9, weight: .medium))
                 }
                 .foregroundStyle(theme.textSecondary)
-                ForEach(status.modelUsageToday.prefix(2), id: \.model) { usage in
+                ForEach(status.modelUsageToday, id: \.model) { usage in
                     HStack {
                         Text(usage.model)
                             .font(.system(size: 8, weight: .medium))

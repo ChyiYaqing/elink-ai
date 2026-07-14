@@ -17,7 +17,9 @@ final class MenuBarController: NSObject {
         usage.onUpdate = { [weak self] in self?.refreshUsage() }
     }
 
-    private static let menuBarSourceImage = AppLogo.image
+    // Menubar 只能使用专用资源；AppLogo.image 的系统应用图标回退在裸可执行文件下
+    // 会变成 Finder/文件夹样式。
+    private static let menuBarSourceImage = AppLogo.menuBarImage
 
     private static func menuBarImage(percent: Double?) -> NSImage? {
         let fallback = NSImage(
@@ -62,15 +64,18 @@ final class MenuBarController: NSObject {
     }
     private func refreshStatusButton() {
         guard let button = item.button else { return }
-        if let percent = usage.claude.primary.percent {
-            button.image = Self.menuBarImage(percent: percent)
+        let percent = Self.menuBarWeeklyPercent(claude: usage.claude, codex: usage.codex)
+        button.image = Self.menuBarImage(percent: percent)
+        if let percent {
             button.imagePosition = .imageLeft
             button.attributedTitle = Self.statusTitle(percent: percent)
         } else {
-            button.image = Self.menuBarImage(percent: nil)
             button.imagePosition = .imageOnly
             button.attributedTitle = NSAttributedString()
         }
+    }
+    static func menuBarWeeklyPercent(claude: ProviderUsage, codex: ProviderUsage) -> Double? {
+        [claude.weekly.percent, codex.weekly.percent].compactMap { $0 }.max()
     }
     static func statusColor(percent: Double) -> NSColor {
         switch UsageLevel.level(usedPercent: percent) {

@@ -8,6 +8,7 @@ final class UsageFetcher {
     private var nextAllowed = Date.distantPast
     private var lastLogSummary = ""
     private var timer: Timer?
+    private var refreshCompletions: [() -> Void] = []
     var onUpdate: (() -> Void)?
 
     var claude: ProviderUsage { lock.holding { storedClaude } }
@@ -18,18 +19,30 @@ final class UsageFetcher {
         timer = Timer.scheduledTimer(withTimeInterval: 120, repeats: true) { [weak self] _ in self?.refresh() }
     }
 
-    func refresh() {
+    func refresh(force: Bool = false, completion: (() -> Void)? = nil) {
+        var completeWithoutRefresh = false
         let shouldStart = lock.holding { () -> Bool in
-            guard !fetching, Date() >= nextAllowed else { return false }
+            if fetching {
+                if let completion { refreshCompletions.append(completion) }
+                return false
+            }
+            guard force || Date() >= nextAllowed else {
+                completeWithoutRefresh = completion != nil
+                return false
+            }
+            if let completion { refreshCompletions.append(completion) }
             fetching = true
             return true
+        }
+        if completeWithoutRefresh {
+            DispatchQueue.main.async { completion?() }
         }
         guard shouldStart else { return }
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
             let claude = self.fetchClaude()
             let codex = self.fetchCodex()
-            self.lock.holding {
+            let completions = self.lock.holding { () -> [() -> Void] in
                 self.storedClaude = Self.keepLastGood(old: self.storedClaude, new: claude)
                 self.storedCodex = Self.keepLastGood(old: self.storedCodex, new: codex)
                 self.fetching = false
@@ -40,8 +53,14 @@ final class UsageFetcher {
                     self.lastLogSummary = summary
                     Log.info(summary)
                 }
+                let values = self.refreshCompletions
+                self.refreshCompletions.removeAll()
+                return values
             }
-            DispatchQueue.main.async { self.onUpdate?() }
+            DispatchQueue.main.async {
+                self.onUpdate?()
+                completions.forEach { $0() }
+            }
         }
     }
 
