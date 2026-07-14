@@ -14,11 +14,51 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         self.preview = PreviewPopoverController(status: status, usage: usage, port: port)
         super.init(); build()
         if let button = item.button {
-            button.image = NSImage(systemSymbolName: "gauge.with.dots.needle.67percent", accessibilityDescription: "Elink AI")
+            button.image = Self.menuBarImage(percent: nil)
             button.target = self; button.action = #selector(clicked)
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
         usage.onUpdate = { [weak self] in self?.refreshUsage() }
+    }
+
+    private static let menuBarSourceImage: NSImage? = {
+        guard let url = Bundle.main.url(forResource: "elink-ai-menubar", withExtension: "png") else {
+            return nil
+        }
+        return NSImage(contentsOf: url)
+    }()
+
+    private static func menuBarImage(percent: Double?) -> NSImage? {
+        let fallback = NSImage(
+            systemSymbolName: "gauge.with.dots.needle.67percent",
+            accessibilityDescription: "Elink AI"
+        )
+        guard let source = menuBarSourceImage else {
+            return fallback
+        }
+
+        let size = NSSize(width: 18, height: 18)
+        let image = NSImage(size: size, flipped: false) { rect in
+            guard let context = NSGraphicsContext.current else { return false }
+            context.imageInterpolation = .high
+
+            NSGraphicsContext.saveGraphicsState()
+            let shape = NSBezierPath(roundedRect: rect, xRadius: 3.6, yRadius: 3.6)
+            shape.addClip()
+            if let percent {
+                Self.statusColor(percent: percent).setFill()
+                rect.fill()
+                source.draw(in: rect, from: .zero, operation: .multiply, fraction: 1)
+            } else {
+                source.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 1)
+            }
+            NSGraphicsContext.restoreGraphicsState()
+            return true
+        }
+        image.size = NSSize(width: 18, height: 18)
+        image.isTemplate = false
+        image.accessibilityDescription = "Elink AI"
+        return image
     }
 
     @objc private func clicked() {
@@ -47,23 +87,26 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     private func refreshStatusButton() {
         guard let button = item.button else { return }
         if let percent = usage.claude.primary.percent {
+            button.image = Self.menuBarImage(percent: percent)
             button.imagePosition = .imageLeft
             button.attributedTitle = Self.statusTitle(percent: percent)
         } else {
+            button.image = Self.menuBarImage(percent: nil)
             button.imagePosition = .imageOnly
             button.attributedTitle = NSAttributedString()
         }
     }
-    static func statusTitle(percent: Double) -> NSAttributedString {
-        let color: NSColor
+    static func statusColor(percent: Double) -> NSColor {
         switch UsageLevel.level(usedPercent: percent) {
-        case .healthy: color = .systemGreen
-        case .warning: color = .systemOrange
-        case .critical: color = .systemRed
+        case .healthy: return .systemGreen
+        case .warning: return .systemOrange
+        case .critical: return .systemRed
         }
+    }
+    static func statusTitle(percent: Double) -> NSAttributedString {
         return NSAttributedString(string: "\(Int(percent))%", attributes: [
             .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .semibold),
-            .foregroundColor: color,
+            .foregroundColor: statusColor(percent: percent),
         ])
     }
     static func usageLine(_ name: String, _ usage: ProviderUsage) -> String {

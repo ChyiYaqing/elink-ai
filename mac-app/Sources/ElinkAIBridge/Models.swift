@@ -3,6 +3,15 @@ import Foundation
 struct UsageWindow {
     var percent: Double?
     var resetMinutes: Int?
+    var resetAt: Date?
+
+    func discardingIfExpired(at now: Date = Date()) -> UsageWindow {
+        guard let resetAt, resetAt <= now else { return self }
+        var value = self
+        value.percent = nil
+        value.resetMinutes = nil
+        return value
+    }
 }
 
 struct ProviderUsage {

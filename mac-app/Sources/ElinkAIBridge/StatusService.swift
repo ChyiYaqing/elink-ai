@@ -28,7 +28,7 @@ final class StatusService {
             value.generatedAt = Date()
             value.claude = overlay(value.claude, provider: "claude", usage: usage.claude)
             value.codex = overlay(value.codex, provider: "codex", usage: usage.codex)
-            value.usageFetchedAt = [usage.claude.fetchedAt, usage.codex.fetchedAt].compactMap { $0 }.max()
+            value.usageFetchedAt = [usage.claude.fetchedAt, usage.codex.fetchedAt].compactMap { $0 }.min()
             return value
         }
     }

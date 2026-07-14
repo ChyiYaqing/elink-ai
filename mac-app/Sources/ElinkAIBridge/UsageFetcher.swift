@@ -52,9 +52,19 @@ final class UsageFetcher {
     }
 
     static func keepLastGood(old: ProviderUsage, new: ProviderUsage) -> ProviderUsage {
-        let hadGoodValue = old.primary.percent != nil || old.weekly.percent != nil
-        guard new.primary.percent == nil, new.weekly.percent == nil, hadGoodValue else { return new }
+        let now = Date()
+        var current = new
+        current.primary = current.primary.discardingIfExpired(at: now)
+        current.weekly = current.weekly.discardingIfExpired(at: now)
+        let previousPrimary = old.primary.discardingIfExpired(at: now)
+        let previousWeekly = old.weekly.discardingIfExpired(at: now)
+        let hadGoodValue = previousPrimary.percent != nil || previousWeekly.percent != nil
+        guard current.primary.percent == nil, current.weekly.percent == nil, hadGoodValue else {
+            return current
+        }
         var retained = old
+        retained.primary = previousPrimary
+        retained.weekly = previousWeekly
         retained.error = new.error
         return retained
     }
@@ -107,8 +117,14 @@ final class UsageFetcher {
     private static func statuslineWindow(_ value: Any?) -> UsageWindow {
         guard let object = value as? [String: Any] else { return UsageWindow() }
         let percent = (object["used_percentage"] as? NSNumber)?.doubleValue
-        let reset = (object["resets_at"] as? NSNumber)?.doubleValue
-        return UsageWindow(percent: percent, resetMinutes: reset.flatMap(Self.remainingMinutes))
+        let resetAt = (object["resets_at"] as? NSNumber).map {
+            Date(timeIntervalSince1970: $0.doubleValue)
+        }
+        return UsageWindow(
+            percent: percent,
+            resetMinutes: resetAt.flatMap { Self.remainingMinutes(untilEpoch: $0.timeIntervalSince1970) },
+            resetAt: resetAt
+        ).discardingIfExpired()
     }
 
     /// 窗口已过期（resets_at <= now）时返回 nil，显示端渲染为 "—"。
@@ -230,16 +246,25 @@ final class UsageFetcher {
     private static func isoWindow(_ value: Any?) -> UsageWindow {
         guard let object = value as? [String: Any] else { return UsageWindow() }
         let percent = (object["utilization"] as? NSNumber)?.doubleValue
-        let reset = (object["resets_at"] as? String).flatMap(Self.isoDate)
-        return UsageWindow(percent: percent,
-                           resetMinutes: reset.flatMap { Self.remainingMinutes(untilEpoch: $0.timeIntervalSince1970) })
+        let resetAt = (object["resets_at"] as? String).flatMap(Self.isoDate)
+        return UsageWindow(
+            percent: percent,
+            resetMinutes: resetAt.flatMap { Self.remainingMinutes(untilEpoch: $0.timeIntervalSince1970) },
+            resetAt: resetAt
+        ).discardingIfExpired()
     }
 
     private static func epochWindow(_ value: Any?) -> UsageWindow {
         guard let object = value as? [String: Any] else { return UsageWindow() }
         let percent = (object["used_percent"] as? NSNumber)?.doubleValue
-        let reset = (object["reset_at"] as? NSNumber)?.doubleValue
-        return UsageWindow(percent: percent, resetMinutes: reset.flatMap(Self.remainingMinutes))
+        let resetAt = (object["reset_at"] as? NSNumber).map {
+            Date(timeIntervalSince1970: $0.doubleValue)
+        }
+        return UsageWindow(
+            percent: percent,
+            resetMinutes: resetAt.flatMap { Self.remainingMinutes(untilEpoch: $0.timeIntervalSince1970) },
+            resetAt: resetAt
+        ).discardingIfExpired()
     }
 
     private static func isoDate(_ value: String) -> Date? {

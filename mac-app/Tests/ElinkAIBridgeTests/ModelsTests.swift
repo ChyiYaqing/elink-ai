@@ -114,8 +114,9 @@ final class ModelsTests: XCTestCase {
         ]
 
         let usage = try XCTUnwrap(UsageFetcher.claudeStatuslineUsage(json, fetchedAt: Date()))
+        XCTAssertNil(usage.primary.percent)
         XCTAssertNil(usage.primary.resetMinutes)
-        XCTAssertTrue(MenuBarController.usageLine("Claude", usage).contains("5h 2% · —"))
+        XCTAssertTrue(MenuBarController.usageLine("Claude", usage).contains("5h —"))
     }
 
     func testClassifiesSevenDayCodexPrimaryWindowAsWeekly() {
@@ -181,6 +182,8 @@ final class ModelsTests: XCTestCase {
         XCTAssertEqual(title.string, "42%")
         let color = title.attribute(.foregroundColor, at: 0, effectiveRange: nil) as? NSColor
         XCTAssertEqual(color, .systemGreen)
+        XCTAssertEqual(MenuBarController.statusColor(percent: 51), .systemOrange)
+        XCTAssertEqual(MenuBarController.statusColor(percent: 81), .systemRed)
     }
 
     func testFormatsTokenCounts() {
@@ -214,6 +217,28 @@ final class ModelsTests: XCTestCase {
 
         let result = UsageFetcher.keepLastGood(old: old, new: failed)
         XCTAssertEqual(result.weekly.percent, 18)
+        XCTAssertEqual(result.error, "temporary error")
+    }
+
+    func testDoesNotKeepExpiredUsageAfterError() {
+        let old = ProviderUsage(
+            primary: UsageWindow(
+                percent: 70,
+                resetMinutes: nil,
+                resetAt: Date(timeIntervalSinceNow: -60)
+            ),
+            weekly: UsageWindow(
+                percent: 52,
+                resetMinutes: 60,
+                resetAt: Date(timeIntervalSinceNow: 60 * 60)
+            )
+        )
+        let failed = ProviderUsage(error: "temporary error")
+
+        let result = UsageFetcher.keepLastGood(old: old, new: failed)
+
+        XCTAssertNil(result.primary.percent)
+        XCTAssertEqual(result.weekly.percent, 52)
         XCTAssertEqual(result.error, "temporary error")
     }
 }
