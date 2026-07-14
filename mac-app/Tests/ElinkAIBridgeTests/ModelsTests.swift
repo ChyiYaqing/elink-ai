@@ -16,20 +16,22 @@ final class ModelsTests: XCTestCase {
         XCTAssertEqual(models.first?["tokens"] as? Int, 1200)
     }
 
-    func testClaudeUsageIsDeduplicatedAndGroupedByModel() {
+    func testClaudeUsageIsDeduplicatedAndGroupedByDayAndModel() {
         let first = #"{"timestamp":"1970-01-01T00:20:00.000Z","uuid":"one","message":{"id":"msg-1","model":"claude-a","usage":{"input_tokens":10,"output_tokens":2,"cache_creation_input_tokens":3,"cache_read_input_tokens":5}}}"#
         let duplicate = #"{"timestamp":"1970-01-01T00:20:01.000Z","uuid":"two","message":{"id":"msg-1","model":"claude-a","usage":{"input_tokens":10,"output_tokens":2,"cache_creation_input_tokens":3,"cache_read_input_tokens":5}}}"#
         let second = #"{"timestamp":"1970-01-01T00:20:02.000Z","uuid":"three","message":{"id":"msg-2","model":"claude-b","usage":{"input_tokens":7,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#
+        let nextDay = #"{"timestamp":"1970-01-03T00:20:00.000Z","uuid":"four","message":{"id":"msg-3","model":"claude-a","usage":{"input_tokens":4,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#
 
-        let usage = StatusService.claudeModelUsage(
-            lines: [first, duplicate, second],
-            start: Date(timeIntervalSince1970: 0),
-            end: Date(timeIntervalSince1970: 5_000)
-        )
+        let accumulator = StatusService.ClaudeUsageAccumulator()
+        accumulator.add(lines: [first, duplicate, second])
+        // 会话续写会把同一消息复制到另一个文件，跨文件也要去重
+        accumulator.add(lines: [duplicate, nextDay])
 
-        XCTAssertEqual(usage, [
-            ModelUsage(model: "claude-a", tokens: 20),
-            ModelUsage(model: "claude-b", tokens: 7),
+        let dayOne = StatusService.dayKey(Date(timeIntervalSince1970: 1_200))
+        let dayTwo = StatusService.dayKey(Date(timeIntervalSince1970: 2 * 86_400 + 1_200))
+        XCTAssertEqual(accumulator.dailyTotals(), [
+            dayOne: ["claude-a": 20, "claude-b": 7],
+            dayTwo: ["claude-a": 4],
         ])
     }
 
@@ -39,17 +41,64 @@ final class ModelsTests: XCTestCase {
         let duplicate = #"{"timestamp":"1970-01-01T00:20:02.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":10},"last_token_usage":{"total_tokens":10}}}}"#
         let modelB = #"{"timestamp":"1970-01-01T00:20:03.000Z","type":"turn_context","payload":{"model":"gpt-b"}}"#
         let countB = #"{"timestamp":"1970-01-01T00:20:04.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":30},"last_token_usage":{"total_tokens":20}}}}"#
+        let countNextDay = #"{"timestamp":"1970-01-03T00:20:00.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":45},"last_token_usage":{"total_tokens":15}}}}"#
 
-        let usage = StatusService.codexModelUsage(
-            sessions: [[modelA, countA, duplicate, modelB, countB]],
-            start: Date(timeIntervalSince1970: 0),
-            end: Date(timeIntervalSince1970: 5_000)
-        )
+        let daily = StatusService.codexDailyUsage(
+            lines: [modelA, countA, duplicate, modelB, countB, countNextDay])
 
-        XCTAssertEqual(usage, [
-            ModelUsage(model: "gpt-b", tokens: 20),
-            ModelUsage(model: "gpt-a", tokens: 10),
+        let dayOne = StatusService.dayKey(Date(timeIntervalSince1970: 1_200))
+        let dayTwo = StatusService.dayKey(Date(timeIntervalSince1970: 2 * 86_400 + 1_200))
+        XCTAssertEqual(daily, [
+            dayOne: ["gpt-a": 10, "gpt-b": 20],
+            dayTwo: ["gpt-b": 15],
         ])
+    }
+
+    func testUsageStoreUpsertsAndQueriesByProviderAndDay() {
+        let path = NSTemporaryDirectory() + "elink-usage-\(UUID().uuidString).db"
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let store = UsageStore(path: path)
+
+        store.record(day: "2026-07-13", provider: "claude", models: ["claude-a": 100, "claude-b": 50])
+        store.record(day: "2026-07-14", provider: "claude", models: ["claude-a": 10, "empty": 0])
+        store.record(day: "2026-07-14", provider: "codex", models: ["gpt-a": 7])
+        store.record(day: "2026-07-14", provider: "claude", models: ["claude-a": 25])
+
+        XCTAssertEqual(store.usage(provider: "claude", since: "2026-07-14"), [
+            DailyModelUsage(day: "2026-07-14", provider: "claude", model: "claude-a", tokens: 25),
+        ])
+        XCTAssertEqual(store.usage(provider: "claude", since: "2026-01-01").count, 3)
+        XCTAssertEqual(store.usage(provider: "codex", since: "2026-01-01"), [
+            DailyModelUsage(day: "2026-07-14", provider: "codex", model: "gpt-a", tokens: 7),
+        ])
+    }
+
+    func testStatsBucketsCoverRangeAndAggregateYearByMonth() {
+        let now = Date()
+        let calendar = Calendar.current
+        let today = StatusService.dayKey(now)
+        let yesterday = StatusService.dayKey(calendar.date(byAdding: .day, value: -1, to: now)!)
+        let rows = [
+            DailyModelUsage(day: today, provider: "claude", model: "claude-a", tokens: 30),
+            DailyModelUsage(day: today, provider: "claude", model: "claude-b", tokens: 10),
+            DailyModelUsage(day: yesterday, provider: "claude", model: "claude-a", tokens: 5),
+        ]
+
+        let week = UsageStats.buckets(rows: rows, range: .week, now: now)
+        XCTAssertEqual(week.count, 7)
+        XCTAssertEqual(week.last?.id, today)
+        XCTAssertEqual(week.last?.models, ["claude-a": 30, "claude-b": 10])
+        XCTAssertEqual(week[5].models, ["claude-a": 5])
+        XCTAssertEqual(UsageStats.modelOrder(week), ["claude-a", "claude-b"])
+
+        let year = UsageStats.buckets(rows: rows, range: .year, now: now)
+        XCTAssertEqual(year.count, 12)
+        XCTAssertEqual(year.last?.id, String(today.prefix(7)))
+        // 昨天可能落在上个月，因此只校验全年总量
+        XCTAssertEqual(year.reduce(0) { $0 + $1.total }, 45)
+
+        XCTAssertEqual(UsageStatsView.percentText(30, of: 40), "75%")
+        XCTAssertEqual(UsageStatsView.percentText(0, of: 0), "0%")
     }
 
     func testRejectsOldDeviceShape() {
@@ -190,6 +239,7 @@ final class ModelsTests: XCTestCase {
         XCTAssertEqual(UsageFormat.tokens(999), "999")
         XCTAssertEqual(UsageFormat.tokens(1_500), "1.5K")
         XCTAssertEqual(UsageFormat.tokens(2_340_000), "2.3M")
+        XCTAssertEqual(UsageFormat.tokens(1_567_600_000), "1.6B")
     }
 
     func testLaunchAtLoginWritesAndRemovesPlist() throws {

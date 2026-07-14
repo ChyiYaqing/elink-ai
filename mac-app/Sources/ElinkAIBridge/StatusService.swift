@@ -7,13 +7,22 @@ final class StatusService {
     }
 
     private let usage: UsageFetcher
+    private let store: UsageStore?
     private let lock = NSLock()
     private var cached: BridgeSnapshot?
     private var cachedAt = Date.distantPast
     private var hooks: [String: HookState] = [:]
     private var needsInput: [String: Date] = [:]
 
-    init(usage: UsageFetcher) { self.usage = usage }
+    private static let claudeRoot = URL(
+        fileURLWithPath: ("~/.claude/projects" as NSString).expandingTildeInPath)
+    private static let codexRoot = URL(
+        fileURLWithPath: ("~/.codex/sessions" as NSString).expandingTildeInPath)
+
+    init(usage: UsageFetcher, store: UsageStore? = nil) {
+        self.usage = usage
+        self.store = store
+    }
 
     func snapshot() -> BridgeSnapshot {
         lock.holding {
@@ -76,17 +85,19 @@ final class StatusService {
     }
 
     private func readClaude() -> AgentStatus {
-        let root = URL(fileURLWithPath: ("~/.claude/projects" as NSString).expandingTildeInPath)
-        let files = jsonlFiles(root)
+        let files = jsonlFiles(Self.claudeRoot)
         let latest = latestModification(files)
         let start = Calendar.current.startOfDay(for: Date())
-        let end = Calendar.current.date(byAdding: .day, value: 1, to: start) ?? Date.distantFuture
-        var lines: [String] = []
+        let accumulator = ClaudeUsageAccumulator()
         for file in files where (modification(file) ?? .distantPast) >= start {
             guard let text = try? String(contentsOf: file, encoding: .utf8) else { continue }
-            lines.append(contentsOf: text.split(separator: "\n").map(String.init))
+            accumulator.add(lines: text.split(separator: "\n").map(String.init))
         }
-        let models = Self.claudeModelUsage(lines: lines, start: start, end: end)
+        // 只回写今日：今天修改过的文件可能包含更早的行，但早前日期的数据在此并不完整
+        let today = Self.dayKey(Date())
+        let totals = accumulator.dailyTotals()[today] ?? [:]
+        store?.record(day: today, provider: "claude", models: totals)
+        let models = Self.sorted(totals)
         return AgentStatus(
             state: state(latest),
             tokensToday: models.reduce(0) { $0 + $1.tokens },
@@ -95,18 +106,16 @@ final class StatusService {
     }
 
     private func readCodex() -> AgentStatus {
-        let root = URL(fileURLWithPath: ("~/.codex/sessions" as NSString).expandingTildeInPath)
-        let files = jsonlFiles(root)
+        let files = jsonlFiles(Self.codexRoot)
         let latest = latestModification(files)
         let start = Calendar.current.startOfDay(for: Date())
-        let end = Calendar.current.date(byAdding: .day, value: 1, to: start) ?? Date.distantFuture
-        var sessions: [[String]] = []
+        var daily: [String: [String: Int]] = [:]
         var latestRateLimits: [String: Any]?
         var latestRateLimitsTimestamp = ""
         for file in files where (modification(file) ?? .distantPast) >= start {
             guard let text = try? String(contentsOf: file, encoding: .utf8) else { continue }
             let lines = text.split(separator: "\n").map(String.init)
-            sessions.append(lines)
+            Self.merge(Self.codexDailyUsage(lines: lines), into: &daily)
             for line in lines where line.contains("\"token_count\"") {
                 guard let data = line.data(using: .utf8),
                       let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -121,7 +130,10 @@ final class StatusService {
                 }
             }
         }
-        let models = Self.codexModelUsage(sessions: sessions, start: start, end: end)
+        let today = Self.dayKey(Date())
+        let totals = daily[today] ?? [:]
+        store?.record(day: today, provider: "codex", models: totals)
+        let models = Self.sorted(totals)
         let windows = latestRateLimits.map(UsageFetcher.codexLogWindows)
         return AgentStatus(
             state: state(latest),
@@ -132,74 +144,118 @@ final class StatusService {
         )
     }
 
-    static func claudeModelUsage(lines: [String], start: Date, end: Date) -> [ModelUsage] {
-        var messages: [String: ModelUsage] = [:]
-        for line in lines where line.contains("\"usage\"") {
-            guard let data = line.data(using: .utf8),
-                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let timestamp = timestamp(object["timestamp"]),
-                  timestamp >= start, timestamp < end,
-                  let message = object["message"] as? [String: Any],
-                  let usage = message["usage"] as? [String: Any] else { continue }
-            let tokens = ["input_tokens", "output_tokens", "cache_creation_input_tokens",
-                          "cache_read_input_tokens"].reduce(0) {
-                $0 + ((usage[$1] as? NSNumber)?.intValue ?? 0)
-            }
-            guard tokens > 0 else { continue }
-            let identifier = (message["id"] as? String) ?? (object["uuid"] as? String) ?? line
-            let model = normalizedModel(message["model"])
-            if tokens > (messages[identifier]?.tokens ?? -1) {
-                messages[identifier] = ModelUsage(model: model, tokens: tokens)
-            }
+    /// 启动时后台回填近一年历史，让统计页首次打开就有周/月/年数据
+    func backfillHistory() {
+        guard let store else { return }
+        let cutoff = Calendar.current.date(
+            byAdding: .day, value: -366, to: Calendar.current.startOfDay(for: Date())) ?? .distantPast
+        let accumulator = ClaudeUsageAccumulator()
+        for file in jsonlFiles(Self.claudeRoot) where (modification(file) ?? .distantPast) >= cutoff {
+            guard let text = try? String(contentsOf: file, encoding: .utf8) else { continue }
+            accumulator.add(lines: text.split(separator: "\n").map(String.init))
         }
-        return aggregate(messages.values)
+        let claudeDaily = accumulator.dailyTotals()
+        for (day, models) in claudeDaily {
+            store.record(day: day, provider: "claude", models: models)
+        }
+        var codexDaily: [String: [String: Int]] = [:]
+        for file in jsonlFiles(Self.codexRoot) where (modification(file) ?? .distantPast) >= cutoff {
+            guard let text = try? String(contentsOf: file, encoding: .utf8) else { continue }
+            Self.merge(Self.codexDailyUsage(lines: text.split(separator: "\n").map(String.init)),
+                       into: &codexDaily)
+        }
+        for (day, models) in codexDaily {
+            store.record(day: day, provider: "codex", models: models)
+        }
+        Log.info("usage backfill: claude \(claudeDaily.count) days, codex \(codexDaily.count) days")
     }
 
-    static func codexModelUsage(sessions: [[String]], start: Date, end: Date) -> [ModelUsage] {
-        var totals: [String: Int] = [:]
-        for lines in sessions {
-            var model = "unknown"
-            var previousTotal: Int?
-            for line in lines {
+    /// Claude 会话行解析：消息按 id 去重（流式更新/会话续写会跨行、跨文件重复），按天聚合
+    final class ClaudeUsageAccumulator {
+        private var messages: [String: (day: String, model: String, tokens: Int)] = [:]
+
+        func add(lines: [String]) {
+            for line in lines where line.contains("\"usage\"") {
                 guard let data = line.data(using: .utf8),
                       let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                      let payload = object["payload"] as? [String: Any] else { continue }
-                if let value = payload["model"] as? String, !value.isEmpty {
-                    model = value
+                      let timestamp = StatusService.timestamp(object["timestamp"]),
+                      let message = object["message"] as? [String: Any],
+                      let usage = message["usage"] as? [String: Any] else { continue }
+                let tokens = ["input_tokens", "output_tokens", "cache_creation_input_tokens",
+                              "cache_read_input_tokens"].reduce(0) {
+                    $0 + ((usage[$1] as? NSNumber)?.intValue ?? 0)
                 }
-                guard payload["type"] as? String == "token_count",
-                      let info = payload["info"] as? [String: Any],
-                      let total = info["total_token_usage"] as? [String: Any],
-                      let cumulative = (total["total_tokens"] as? NSNumber)?.intValue else { continue }
-
-                let last = (info["last_token_usage"] as? [String: Any])
-                    .flatMap { ($0["total_tokens"] as? NSNumber)?.intValue }
-                let delta: Int
-                if let previousTotal, cumulative == previousTotal {
-                    delta = 0
-                } else if let last {
-                    delta = last
-                } else if let previousTotal {
-                    delta = max(0, cumulative - previousTotal)
-                } else {
-                    delta = cumulative
+                guard tokens > 0 else { continue }
+                let identifier = (message["id"] as? String) ?? (object["uuid"] as? String) ?? line
+                if tokens > (messages[identifier]?.tokens ?? -1) {
+                    messages[identifier] = (StatusService.dayKey(timestamp),
+                                            StatusService.normalizedModel(message["model"]), tokens)
                 }
-                previousTotal = cumulative
-
-                guard delta > 0,
-                      let date = timestamp(object["timestamp"]),
-                      date >= start, date < end else { continue }
-                totals[normalizedModel(model), default: 0] += delta
             }
         }
-        return sorted(totals)
+
+        func dailyTotals() -> [String: [String: Int]] {
+            var totals: [String: [String: Int]] = [:]
+            for value in messages.values {
+                totals[value.day, default: [:]][value.model, default: 0] += value.tokens
+            }
+            return totals
+        }
     }
 
-    private static func aggregate(_ usage: Dictionary<String, ModelUsage>.Values) -> [ModelUsage] {
-        var totals: [String: Int] = [:]
-        for value in usage { totals[value.model, default: 0] += value.tokens }
-        return sorted(totals)
+    /// 单个 Codex 会话文件的行 -> 按天/模型的 token 增量
+    static func codexDailyUsage(lines: [String]) -> [String: [String: Int]] {
+        var totals: [String: [String: Int]] = [:]
+        var model = "unknown"
+        var previousTotal: Int?
+        for line in lines {
+            guard let data = line.data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let payload = object["payload"] as? [String: Any] else { continue }
+            if let value = payload["model"] as? String, !value.isEmpty {
+                model = value
+            }
+            guard payload["type"] as? String == "token_count",
+                  let info = payload["info"] as? [String: Any],
+                  let total = info["total_token_usage"] as? [String: Any],
+                  let cumulative = (total["total_tokens"] as? NSNumber)?.intValue else { continue }
+
+            let last = (info["last_token_usage"] as? [String: Any])
+                .flatMap { ($0["total_tokens"] as? NSNumber)?.intValue }
+            let delta: Int
+            if let previousTotal, cumulative == previousTotal {
+                delta = 0
+            } else if let last {
+                delta = last
+            } else if let previousTotal {
+                delta = max(0, cumulative - previousTotal)
+            } else {
+                delta = cumulative
+            }
+            previousTotal = cumulative
+
+            guard delta > 0, let date = timestamp(object["timestamp"]) else { continue }
+            totals[dayKey(date), default: [:]][normalizedModel(model), default: 0] += delta
+        }
+        return totals
     }
+
+    static func merge(_ addition: [String: [String: Int]], into totals: inout [String: [String: Int]]) {
+        for (day, models) in addition {
+            for (model, tokens) in models {
+                totals[day, default: [:]][model, default: 0] += tokens
+            }
+        }
+    }
+
+    static func dayKey(_ date: Date) -> String { dayFormatter.string(from: date) }
+
+    private static let dayFormatter: DateFormatter = {
+        let value = DateFormatter()
+        value.calendar = Calendar(identifier: .gregorian)
+        value.dateFormat = "yyyy-MM-dd"
+        return value
+    }()
 
     private static func sorted(_ totals: [String: Int]) -> [ModelUsage] {
         totals.map { ModelUsage(model: $0.key, tokens: $0.value) }

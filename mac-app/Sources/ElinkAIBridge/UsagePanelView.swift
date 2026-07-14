@@ -11,6 +11,7 @@ final class PanelModel: ObservableObject {
     @Published var mode = "dashboard"
     @Published var busy = false
     @Published var showSettings = false
+    @Published var statsProvider: String?
     @Published var launchAtLogin = false
     @Published var deviceHost = ""
     @Published var bridgeAddress = ""
@@ -39,17 +40,24 @@ struct UsagePanelView: View {
                     HStack(alignment: .top, spacing: 10) {
                         ProviderCard(name: "Claude", pet: PixelPet.claude,
                                      accent: PanelTheme.claudeColor(dark: theme.dark),
-                                     status: model.claude, theme: theme)
+                                     status: model.claude, theme: theme) {
+                            withAnimation(.easeOut(duration: 0.2)) { model.statsProvider = "claude" }
+                        }
                         ProviderCard(name: "Codex", pet: PixelPet.codex,
                                      accent: PanelTheme.codexColor(dark: theme.dark),
-                                     status: model.codex, theme: theme)
+                                     status: model.codex, theme: theme) {
+                            withAnimation(.easeOut(duration: 0.2)) { model.statsProvider = "codex" }
+                        }
                     }
                     deviceCard(theme)
                 }
-                .opacity(model.showSettings ? 0 : 1)
-                .allowsHitTesting(!model.showSettings)
+                .opacity(model.showSettings || model.statsProvider != nil ? 0 : 1)
+                .allowsHitTesting(!model.showSettings && model.statsProvider == nil)
                 if model.showSettings {
                     settingsCard(theme)
+                        .transition(.opacity)
+                } else if let provider = model.statsProvider {
+                    statsCard(provider, theme)
                         .transition(.opacity)
                 }
             }
@@ -142,6 +150,20 @@ struct UsagePanelView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
         .padding(12)
+        .glassCard(theme)
+    }
+
+    private func statsCard(_ provider: String, _ theme: PanelTheme) -> some View {
+        let claude = provider == "claude"
+        return UsageStatsView(
+            provider: provider,
+            title: claude ? "Claude" : "Codex",
+            pet: claude ? PixelPet.claude : PixelPet.codex,
+            accent: claude ? PanelTheme.claudeColor(dark: theme.dark)
+                           : PanelTheme.codexColor(dark: theme.dark),
+            theme: theme,
+            onBack: { withAnimation(.easeOut(duration: 0.2)) { model.statsProvider = nil } }
+        )
         .glassCard(theme)
     }
 
@@ -335,6 +357,7 @@ private struct ProviderCard: View {
     let accent: Color
     let status: AgentStatus
     let theme: PanelTheme
+    let onOpenStats: () -> Void
     @State private var hovering = false
 
     var body: some View {
@@ -346,6 +369,10 @@ private struct ProviderCard: View {
                     .font(.system(size: 12, weight: .semibold, design: .rounded))
                     .foregroundStyle(theme.textPrimary)
                 Spacer()
+                Image(systemName: "chart.bar.xaxis")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(theme.textTertiary)
+                    .opacity(hovering ? 1 : 0)
                 StateBadge(text: stateText, color: stateColor)
             }
             if let percent = status.primary.percent {
@@ -414,6 +441,8 @@ private struct ProviderCard: View {
         .scaleEffect(hovering ? 1.015 : 1.0)
         .animation(.easeOut(duration: 0.15), value: hovering)
         .onHover { hovering = $0 }
+        .contentShape(RoundedRectangle(cornerRadius: 14))
+        .onTapGesture(perform: onOpenStats)
     }
 
     private func resetLine(_ minutes: Int?) -> some View {
@@ -481,7 +510,7 @@ private struct StateBadge: View {
     }
 }
 
-private struct PillButton: View {
+struct PillButton: View {
     let title: String
     let icon: String
     let theme: PanelTheme

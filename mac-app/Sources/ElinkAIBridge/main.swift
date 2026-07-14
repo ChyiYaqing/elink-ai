@@ -2,7 +2,7 @@ import AppKit
 
 let port: UInt16 = 8765
 let usage = UsageFetcher()
-let status = StatusService(usage: usage)
+let status = StatusService(usage: usage, store: UsageStore.shared)
 let server = HTTPServer(port: port, get: [
     "/": { ("application/json", status.snapshot().jsonData()) },
     "/v1/status": { ("application/json", status.snapshot().jsonData()) },
@@ -30,6 +30,11 @@ server.onRequest = { path, ip in
 }
 Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { _ in
     DeviceClient.healPairingIfNeeded(port: port)
+}
+// 回填历史用量到 SQLite；此后每 5 分钟落一次今日数据，即使没有设备轮询也持续记录
+DispatchQueue.global(qos: .utility).async { status.backfillHistory() }
+Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { _ in
+    DispatchQueue.global(qos: .utility).async { _ = status.snapshot() }
 }
 do {
     try server.start()
