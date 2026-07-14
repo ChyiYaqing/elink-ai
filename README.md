@@ -24,6 +24,13 @@ OAuth tokens and raw session logs never leave the Mac.
   <img src="docs/images/mac-app-settings.png" alt="In-panel settings page with device pairing, launch at login, logs, and about" width="390">
 </p>
 
+### Usage statistics
+
+<p>
+  <img src="docs/images/claude-usage-stats.png" alt="Claude token usage statistics with daily stacked bars and per-model breakdown" width="390">
+  <img src="docs/images/codex-usage-stats.png" alt="Codex token usage statistics with daily stacked bars and per-model breakdown" width="390">
+</p>
+
 ## Current scope
 
 - Claude and Codex side-by-side dashboard
@@ -74,7 +81,8 @@ percentage next to the icon. Left-click opens a panel with Claude and Codex
 usage cards (5-hour/weekly windows, reset countdowns, per-model tokens), the
 exact PNG last sent to the display with page switching and smart/full refresh
 controls, and a settings page for device pairing, launch at login, logs, and
-about. Right-click shows a compact quota/status menu. Verify the bridge with:
+about. Settings are available from the gear button at the bottom of the panel.
+Verify the bridge with:
 
 ```bash
 curl -s http://localhost:8765/v1/status | python3 -m json.tool
