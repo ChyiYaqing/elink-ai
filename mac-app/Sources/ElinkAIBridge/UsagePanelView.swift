@@ -70,11 +70,15 @@ struct UsagePanelView: View {
 
     private func header(_ theme: PanelTheme) -> some View {
         HStack(spacing: 10) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 8).fill(theme.accentGradient)
-                Image(systemName: "gauge.with.dots.needle.67percent")
-                    .font(.system(size: 14, weight: .bold))
-                    .foregroundStyle(.white)
+            Group {
+                if let logo = AppLogo.image {
+                    Image(nsImage: logo)
+                        .resizable()
+                        .interpolation(.high)
+                        .aspectRatio(contentMode: .fit)
+                } else {
+                    RoundedRectangle(cornerRadius: 8).fill(theme.accentGradient)
+                }
             }
             .frame(width: 30, height: 30)
             VStack(alignment: .leading, spacing: 1) {

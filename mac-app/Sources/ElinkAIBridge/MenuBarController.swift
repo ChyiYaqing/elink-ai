@@ -21,12 +21,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         usage.onUpdate = { [weak self] in self?.refreshUsage() }
     }
 
-    private static let menuBarSourceImage: NSImage? = {
-        guard let url = Bundle.main.url(forResource: "elink-ai-menubar", withExtension: "png") else {
-            return nil
-        }
-        return NSImage(contentsOf: url)
-    }()
+    private static let menuBarSourceImage = AppLogo.image
 
     private static func menuBarImage(percent: Double?) -> NSImage? {
         let fallback = NSImage(
