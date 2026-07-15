@@ -312,76 +312,93 @@ struct UsagePanelView: View {
     }
 
     private func updateSettings(_ theme: PanelTheme) -> some View {
-        DisclosureGroup(isExpanded: $updatesExpanded) {
-            VStack(alignment: .leading, spacing: 9) {
-                UpdateCheckButton(checking: updater.isChecking, theme: theme) {
-                    Log.user("check for application updates")
-                    updater.check()
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+                withAnimation(.easeOut(duration: 0.2)) {
+                    updatesExpanded.toggle()
                 }
-                .disabled(updater.isChecking)
-
-                HStack(alignment: .firstTextBaseline, spacing: 5) {
-                    if updater.isChecking {
-                        ProgressView()
-                            .controlSize(.small)
-                            .scaleEffect(0.7)
-                            .frame(width: 10, height: 10)
-                    } else {
-                        Image(systemName: updateStatusIcon)
-                            .font(.system(size: 8, weight: .semibold))
-                    }
-                    Text(updateStatusText)
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "chevron.right")
                         .font(.system(size: 9, weight: .semibold))
-                        .lineLimit(2)
-                    Spacer(minLength: 0)
+                        .foregroundStyle(theme.textTertiary)
+                        .rotationEffect(.degrees(updatesExpanded ? 90 : 0))
+                    settingsHeader(theme, icon: "arrow.down.circle.fill", color: theme.statusHealthy,
+                                   title: "软件更新", subtitle: "当前版本 \(updater.currentVersion)")
                 }
-                .foregroundStyle(updateStatusColor(theme))
-
-                if updater.state == .updateAvailable {
-                    WideButton(title: "下载 v\(updater.latestVersion ?? "最新版") DMG",
-                               icon: "arrow.down.to.line.compact", theme: theme) {
-                        updater.openAvailableUpdate()
-                    }
-                }
-
-                if let lastCheckedAt = updater.lastCheckedAt {
-                    HStack(spacing: 4) {
-                        Image(systemName: "clock.fill").font(.system(size: 8))
-                        Text("上次检查：\(lastCheckedAt.formatted(date: .abbreviated, time: .shortened))")
-                            .font(.system(size: 9, weight: .medium))
-                    }
-                    .foregroundStyle(theme.textTertiary)
-                }
-
-                Divider().opacity(0.4)
-
-                updateToggle(
-                    title: "自动检查更新",
-                    subtitle: "打开菜单时定期检查 GitHub Releases",
-                    isOn: Binding(
-                        get: { updater.automaticallyChecks },
-                        set: { updater.setAutomaticallyChecks($0) }
-                    ),
-                    theme: theme
-                )
-                updateToggle(
-                    title: "包含测试版本",
-                    subtitle: "同时检查 GitHub prerelease 版本",
-                    isOn: Binding(
-                        get: { updater.includesPrereleases },
-                        set: { updater.setIncludesPrereleases($0) }
-                    ),
-                    theme: theme
-                )
-            }
-            .padding(.top, 9)
-        } label: {
-            settingsHeader(theme, icon: "arrow.down.circle.fill", color: theme.statusHealthy,
-                           title: "软件更新", subtitle: "当前版本 \(updater.currentVersion)")
+                .padding(12)
+                .frame(maxWidth: .infinity, alignment: .leading)
                 .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if updatesExpanded {
+                VStack(alignment: .leading, spacing: 9) {
+                    UpdateCheckButton(checking: updater.isChecking, theme: theme) {
+                        Log.user("check for application updates")
+                        updater.check()
+                    }
+                    .disabled(updater.isChecking)
+
+                    HStack(alignment: .firstTextBaseline, spacing: 5) {
+                        if updater.isChecking {
+                            ProgressView()
+                                .controlSize(.small)
+                                .scaleEffect(0.7)
+                                .frame(width: 10, height: 10)
+                        } else {
+                            Image(systemName: updateStatusIcon)
+                                .font(.system(size: 8, weight: .semibold))
+                        }
+                        Text(updateStatusText)
+                            .font(.system(size: 9, weight: .semibold))
+                            .lineLimit(2)
+                        Spacer(minLength: 0)
+                    }
+                    .foregroundStyle(updateStatusColor(theme))
+
+                    if updater.state == .updateAvailable {
+                        WideButton(title: "下载 v\(updater.latestVersion ?? "最新版") DMG",
+                                   icon: "arrow.down.to.line.compact", theme: theme) {
+                            updater.openAvailableUpdate()
+                        }
+                    }
+
+                    if let lastCheckedAt = updater.lastCheckedAt {
+                        HStack(spacing: 4) {
+                            Image(systemName: "clock.fill").font(.system(size: 8))
+                            Text("上次检查：\(lastCheckedAt.formatted(date: .abbreviated, time: .shortened))")
+                                .font(.system(size: 9, weight: .medium))
+                        }
+                        .foregroundStyle(theme.textTertiary)
+                    }
+
+                    Divider().opacity(0.4)
+
+                    updateToggle(
+                        title: "自动检查更新",
+                        subtitle: "打开菜单时定期检查 GitHub Releases",
+                        isOn: Binding(
+                            get: { updater.automaticallyChecks },
+                            set: { updater.setAutomaticallyChecks($0) }
+                        ),
+                        theme: theme
+                    )
+                    updateToggle(
+                        title: "包含测试版本",
+                        subtitle: "同时检查 GitHub prerelease 版本",
+                        isOn: Binding(
+                            get: { updater.includesPrereleases },
+                            set: { updater.setIncludesPrereleases($0) }
+                        ),
+                        theme: theme
+                    )
+                }
+                .padding(.horizontal, 12)
+                .padding(.bottom, 12)
+                .transition(.opacity)
+            }
         }
-        .tint(theme.textTertiary)
-        .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
         .glassCard(theme)
     }
