@@ -60,11 +60,10 @@ Requests outside a 60-second clock window or with a replayed nonce are rejected.
 Sync request and response JSON is encrypted with AES-GCM using purpose-specific
 keys derived from the cluster secret.
 
-The cluster secret is stored in macOS Keychain. If Keychain rejects access in a
-non-interactive login session, the bridge persists the same credential under
-its user Application Support directory with `0600` permissions. That fallback
-remains authoritative across restarts and is migrated back to Keychain when it
-becomes available, avoiding an accidental node identity change.
+The node identity and cluster secret are stored in the bridge's local
+`usage.db` SQLite database under the user Application Support directory. The
+directory uses `0700` permissions and the database uses `0600`. Cluster
+credentials are never stored in or read from macOS Keychain.
 
 The first protocol version uses one shared secret for the cluster and does not
 support individual-node revocation. To exclude a previously trusted Mac,

@@ -35,10 +35,11 @@ final class ClusterManager: ObservableObject {
     private let manualPeersKey = "elink_cluster_manual_peers_v2"
 
     init(store: UsageStore, credentials: ClusterCredentials? = nil,
-         credentialStore: ClusterCredentialStore = ClusterCredentialStore()) {
+         credentialStore: ClusterCredentialStore? = nil) {
         self.store = store
-        self.credentialStore = credentialStore
-        self.credentials = credentials ?? credentialStore.loadOrCreate()
+        let resolvedCredentialStore = credentialStore ?? ClusterCredentialStore(store: store)
+        self.credentialStore = resolvedCredentialStore
+        self.credentials = credentials ?? resolvedCredentialStore.loadOrCreate()
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = 5
         configuration.timeoutIntervalForResource = 10
@@ -213,6 +214,7 @@ final class ClusterManager: ObservableObject {
                 updated.timezone = secret.timezone
                 self.store.resetRemoteClusterData(localNodeID: updated.nodeID)
                 UserDefaults.standard.set([base], forKey: self.manualPeersKey)
+                self.stopPairing()
                 DispatchQueue.main.async {
                     self.saveCredentials(updated)
                     self.syncPeer(base)

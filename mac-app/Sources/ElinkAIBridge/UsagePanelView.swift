@@ -37,6 +37,7 @@ struct UsagePanelView: View {
     @State private var clusterAddress = ""
     @State private var clusterCode = ""
     @State private var clusterMessage: String?
+    @State private var showClusterJoin = false
     @State private var showLeaveClusterConfirmation = false
 
     var body: some View {
@@ -357,30 +358,6 @@ struct UsagePanelView: View {
                                 .foregroundStyle(theme.textTertiary)
                         }
 
-                        HStack(spacing: 6) {
-                            TextField("已配对节点地址（VPN 兜底）", text: $clusterAddress)
-                                .textFieldStyle(.roundedBorder)
-                                .font(.system(size: 9, design: .monospaced))
-                            PillButton(title: "连接", icon: "link", theme: theme) {
-                                let address = clusterAddress
-                                clusterMessage = "正在连接 \(address)…"
-                                cluster.addManualEndpoint(address)
-                                cluster.syncAll { error in
-                                    if let error {
-                                        clusterMessage = "连接失败：\(error.localizedDescription)"
-                                    } else {
-                                        clusterMessage = "已连接并完成同步"
-                                        clusterAddress = ""
-                                    }
-                                }
-                            }
-                            .disabled(clusterAddress.isEmpty)
-                        }
-
-                        Text("添加新 Mac：点击“添加 Mac”生成配对码，再到新 Mac 输入本机地址和配对码。")
-                            .font(.system(size: 8, weight: .medium))
-                            .foregroundStyle(theme.textTertiary)
-
                         HStack(spacing: 8) {
                             PillButton(
                                 title: cluster.syncing ? "同步中" : "立即同步",
@@ -404,6 +381,52 @@ struct UsagePanelView: View {
                             }
                         }
 
+                        if cluster.nodes.count <= 1 {
+                            Button(showClusterJoin ? "取消加入其他集群" : "已有配对码？加入另一集群") {
+                                withAnimation(.easeOut(duration: 0.2)) {
+                                    showClusterJoin.toggle()
+                                }
+                                clusterMessage = nil
+                            }
+                            .buttonStyle(.plain)
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundStyle(theme.textSecondary)
+
+                            if showClusterJoin {
+                                Text("本机当前是单节点集群；加入后将替换集群配置，本机历史用量会保留。")
+                                    .font(.system(size: 8, weight: .medium))
+                                    .foregroundStyle(theme.statusWarning)
+                                clusterJoinFields(theme, buttonTitle: "加入另一集群")
+                                    .transition(.opacity)
+                            }
+                        }
+
+                        Divider().opacity(0.4)
+
+                        HStack(spacing: 6) {
+                            TextField("已配对节点地址（VPN 兜底）", text: $clusterAddress)
+                                .textFieldStyle(.roundedBorder)
+                                .font(.system(size: 9, design: .monospaced))
+                            PillButton(title: "连接", icon: "link", theme: theme) {
+                                let address = clusterAddress
+                                clusterMessage = "正在连接 \(address)…"
+                                cluster.addManualEndpoint(address)
+                                cluster.syncAll { error in
+                                    if let error {
+                                        clusterMessage = "连接失败：\(error.localizedDescription)"
+                                    } else {
+                                        clusterMessage = "已连接并完成同步"
+                                        clusterAddress = ""
+                                    }
+                                }
+                            }
+                            .disabled(clusterAddress.isEmpty)
+                        }
+
+                        Text("“连接”仅用于已完成配对的节点；添加新 Mac 请使用“添加 Mac”和配对码。")
+                            .font(.system(size: 8, weight: .medium))
+                            .foregroundStyle(theme.textTertiary)
+
                         Button("离开同步集群") { showLeaveClusterConfirmation = true }
                             .buttonStyle(.plain)
                             .font(.system(size: 9, weight: .semibold))
@@ -416,31 +439,7 @@ struct UsagePanelView: View {
 
                         Divider().opacity(0.4)
 
-                        TextField("另一台 Mac 地址，例如 macbook.local:8765", text: $clusterAddress)
-                            .textFieldStyle(.roundedBorder)
-                            .font(.system(size: 10, design: .monospaced))
-                        TextField("6 位配对码", text: $clusterCode)
-                            .textFieldStyle(.roundedBorder)
-                            .font(.system(size: 10, design: .monospaced))
-                        Text("先在已有集群的 Mac 点击“添加 Mac”，再将它显示的 6 位配对码填到本机。")
-                            .font(.system(size: 8, weight: .medium))
-                            .foregroundStyle(theme.textTertiary)
-                        if let peer = cluster.discoveredPeers.first(where: { $0.pairable }) {
-                            Button("使用已发现的 \(peer.name)") { clusterAddress = peer.endpoint }
-                                .buttonStyle(.plain)
-                                .font(.system(size: 9, weight: .semibold))
-                                .foregroundStyle(theme.textSecondary)
-                        }
-                        WideButton(title: "加入同步集群", icon: "link.badge.plus", theme: theme) {
-                            model.busy = true
-                            clusterMessage = "正在安全配对…"
-                            cluster.joinCluster(endpoint: clusterAddress, code: clusterCode) { error in
-                                model.busy = false
-                                clusterMessage = error.map { "配对失败：\($0.localizedDescription)" }
-                                    ?? "配对成功，正在同步其他 Mac 的历史用量"
-                            }
-                        }
-                        .disabled(model.busy)
+                        clusterJoinFields(theme, buttonTitle: "加入同步集群")
                     }
 
                     if let message = clusterMessage ?? cluster.lastError {
@@ -461,6 +460,62 @@ struct UsagePanelView: View {
             Button("离开", role: .destructive) { cluster.leaveCluster() }
         } message: {
             Text("本机将停止同步；本地采集数据不会删除。重新加入需要新的配对码。")
+        }
+    }
+
+    @ViewBuilder
+    private func clusterJoinFields(_ theme: PanelTheme, buttonTitle: String) -> some View {
+        TextField("集群主机地址，例如 macbook.local:8765", text: $clusterAddress)
+            .textFieldStyle(.roundedBorder)
+            .font(.system(size: 10, design: .monospaced))
+            .onSubmit { joinClusterFromFields() }
+        TextField("6 位配对码（填满后自动加入）", text: $clusterCode)
+            .textFieldStyle(.roundedBorder)
+            .font(.system(size: 10, design: .monospaced))
+            .onSubmit { joinClusterFromFields() }
+            .onChange(of: clusterCode) { value in
+                let digits = String(value.filter(\.isNumber).prefix(6))
+                if digits != value {
+                    clusterCode = digits
+                    return
+                }
+                if digits.count == 6,
+                   !clusterAddress.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    joinClusterFromFields()
+                }
+            }
+        Text("在集群主机点击“添加 Mac”生成配对码；验证码有效期为两分钟。")
+            .font(.system(size: 8, weight: .medium))
+            .foregroundStyle(theme.textTertiary)
+        if let peer = cluster.discoveredPeers.first(where: { $0.pairable }) {
+            Button("使用已发现的 \(peer.name)") {
+                clusterAddress = peer.endpoint
+                if clusterCode.count == 6 { joinClusterFromFields() }
+            }
+            .buttonStyle(.plain)
+            .font(.system(size: 9, weight: .semibold))
+            .foregroundStyle(theme.textSecondary)
+        }
+        WideButton(title: buttonTitle, icon: "link.badge.plus", theme: theme) {
+            joinClusterFromFields()
+        }
+        .disabled(model.busy)
+    }
+
+    private func joinClusterFromFields() {
+        guard !model.busy else { return }
+        model.busy = true
+        clusterMessage = "正在安全配对…"
+        cluster.joinCluster(endpoint: clusterAddress, code: clusterCode) { error in
+            model.busy = false
+            if let error {
+                clusterMessage = "配对失败：\(error.localizedDescription)"
+            } else {
+                clusterMessage = "配对成功，正在同步其他 Mac 的历史用量"
+                showClusterJoin = false
+                clusterAddress = ""
+                clusterCode = ""
+            }
         }
     }
 

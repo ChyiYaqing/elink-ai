@@ -99,15 +99,18 @@ Open Settings → Multi-Mac Sync on the first Mac and create a sync cluster.
 Choose “Add Mac” to show a six-digit code, then enter that code and the first
 Mac's address on another Mac. Bonjour discovers peers on a normal LAN; a manual
 `host:8765` address also works when a VPN does not forward multicast discovery.
+If both Macs accidentally created separate one-node clusters, use “Join Another
+Cluster” on either Mac; entering all six digits submits pairing automatically
+and keeps that Mac's local usage history.
 
 Each Mac keeps the latest per-node daily/model snapshots. The dashboard and
 `/v1/status` return the cluster-wide sum, while quota windows use the freshest
 observation because quota percentages are account-level values and must not be
 added together. Pairing and sync never transfer OAuth credentials or raw logs.
-The cluster secret is kept in Keychain when available. For non-interactive
-LaunchAgent or remote sessions where Keychain access is denied, it falls back
-to `~/Library/Application Support/ElinkAI/cluster-credentials-v2.json` with
-owner-only (`0600`) permissions and migrates back automatically later.
+The node identity and cluster secret are stored in the local
+`~/Library/Application Support/ElinkAI/usage.db` SQLite database. The directory
+uses owner-only (`0700`) permissions and the database uses `0600`; elink-ai does
+not put cluster credentials in macOS Keychain.
 
 Build an ad-hoc-signed menu-bar app bundle with:
 

@@ -6,14 +6,12 @@ enum ClusterCryptoError: LocalizedError {
     case invalidCredentials
     case invalidPayload
     case authenticationFailed
-    case keychain(OSStatus)
 
     var errorDescription: String? {
         switch self {
         case .invalidCredentials: return "集群凭据无效"
         case .invalidPayload: return "同步数据格式无效"
         case .authenticationFailed: return "同步请求认证失败"
-        case let .keychain(status): return "无法访问 Keychain（\(status)）"
         }
     }
 }
@@ -157,36 +155,39 @@ enum ClusterCrypto {
 }
 
 final class ClusterCredentialStore {
-    private let fallbackURL: URL
-    private let keychainRead: () throws -> Data
-    private let keychainWrite: (Data) throws -> Void
+    private let store: UsageStore
+    private let legacyFallbackURL: URL
 
-    static var defaultFallbackURL: URL {
+    static var defaultLegacyFallbackURL: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("ElinkAI", isDirectory: true)
             .appendingPathComponent("cluster-credentials-v2.json")
     }
 
-    init(fallbackURL: URL = ClusterCredentialStore.defaultFallbackURL,
-         keychainRead: (() throws -> Data)? = nil,
-         keychainWrite: ((Data) throws -> Void)? = nil) {
-        self.fallbackURL = fallbackURL
-        self.keychainRead = keychainRead ?? Self.readKeychain
-        self.keychainWrite = keychainWrite ?? Self.writeKeychain
+    init(store: UsageStore,
+         legacyFallbackURL: URL = ClusterCredentialStore.defaultLegacyFallbackURL) {
+        self.store = store
+        self.legacyFallbackURL = legacyFallbackURL
     }
 
     func loadOrCreate() -> ClusterCredentials {
-        // Prefer a fallback created during a non-interactive launch. Otherwise an
-        // older Keychain item could make this Mac change node identity on restart.
-        if let data = try? Data(contentsOf: fallbackURL),
-           let value = try? ClusterCrypto.decoder.decode(ClusterCredentials.self, from: data) {
-            migrateFallbackToKeychain(data)
-            return value
-        }
-        if let data = try? keychainRead(),
+        if let data = store.clusterCredentialsData(),
            let value = try? ClusterCrypto.decoder.decode(ClusterCredentials.self, from: data) {
             return value
         }
+
+        // Migrate only the file fallback used by pre-SQLite builds. Deliberately
+        // never query the old Keychain item, because even reading it can display
+        // an authorization prompt for ad-hoc signed builds.
+        if let data = try? Data(contentsOf: legacyFallbackURL),
+           let value = try? ClusterCrypto.decoder.decode(ClusterCredentials.self, from: data) {
+            if store.saveClusterCredentialsData(data) {
+                try? FileManager.default.removeItem(at: legacyFallbackURL)
+                Log.info("migrated cluster credentials into usage.db", category: "cluster")
+            }
+            return value
+        }
+
         let name = Host.current().localizedName ?? "Mac"
         let value = ClusterCredentials(
             nodeID: UUID().uuidString.lowercased(),
@@ -202,81 +203,9 @@ final class ClusterCredentialStore {
 
     func save(_ value: ClusterCredentials) throws {
         let data = try ClusterCrypto.encoder.encode(value)
-        do {
-            try keychainWrite(data)
-            try? FileManager.default.removeItem(at: fallbackURL)
-        } catch let error as ClusterCryptoError {
-            guard case let .keychain(status) = error else { throw error }
-            try writeFallback(data)
-            Log.warning(
-                "Keychain unavailable (\(status)); cluster credentials saved in protected local storage",
-                category: "cluster"
-            )
+        guard store.saveClusterCredentialsData(data) else {
+            throw BridgeError.message("无法将集群凭据写入 usage.db")
         }
-    }
-
-    private func migrateFallbackToKeychain(_ data: Data) {
-        do {
-            try keychainWrite(data)
-            try FileManager.default.removeItem(at: fallbackURL)
-            Log.info("migrated cluster credentials back to Keychain", category: "cluster")
-        } catch {
-            // Keep the fallback authoritative until Keychain is usable again.
-        }
-    }
-
-    private func writeFallback(_ data: Data) throws {
-        let directory = fallbackURL.deletingLastPathComponent()
-        try FileManager.default.createDirectory(
-            at: directory,
-            withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o700]
-        )
-        try data.write(to: fallbackURL, options: .atomic)
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o600],
-            ofItemAtPath: fallbackURL.path
-        )
-    }
-
-    private static func writeKeychain(_ data: Data) throws {
-        let service = "cn.org.bcds.elink-ai.cluster"
-        let account = "cluster-credentials-v2"
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-        ]
-        let attributes: [String: Any] = [
-            kSecValueData as String: data,
-            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock,
-        ]
-        let status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
-        if status == errSecItemNotFound {
-            var insertion = query
-            attributes.forEach { insertion[$0.key] = $0.value }
-            let inserted = SecItemAdd(insertion as CFDictionary, nil)
-            guard inserted == errSecSuccess else { throw ClusterCryptoError.keychain(inserted) }
-        } else if status != errSecSuccess {
-            throw ClusterCryptoError.keychain(status)
-        }
-    }
-
-    private static func readKeychain() throws -> Data {
-        let service = "cn.org.bcds.elink-ai.cluster"
-        let account = "cluster-credentials-v2"
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-        ]
-        var result: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-        guard status == errSecSuccess, let data = result as? Data else {
-            throw ClusterCryptoError.keychain(status)
-        }
-        return data
+        try? FileManager.default.removeItem(at: legacyFallbackURL)
     }
 }

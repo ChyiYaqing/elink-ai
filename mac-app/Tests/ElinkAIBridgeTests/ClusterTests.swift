@@ -1,5 +1,4 @@
 import CryptoKit
-import Security
 import XCTest
 @testable import ElinkAIBridge
 
@@ -105,44 +104,29 @@ final class ClusterTests: XCTestCase {
         ))
     }
 
-    func testCredentialsFallBackWhenKeychainCannotInteractAndMigrateLater() throws {
+    func testCredentialsPersistInSQLiteAndMigrateLegacyFallback() throws {
+        let (usageStore, databasePath) = store()
+        defer { try? FileManager.default.removeItem(atPath: databasePath) }
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("elink-credentials-\(UUID().uuidString)", isDirectory: true)
         let fallbackURL = directory.appendingPathComponent("credentials.json")
         defer { try? FileManager.default.removeItem(at: directory) }
-
-        var keychainAvailable = false
-        var keychainData: Data?
-        let keychainRead: () throws -> Data = {
-            guard keychainAvailable else {
-                throw ClusterCryptoError.keychain(errSecInteractionNotAllowed)
-            }
-            guard let keychainData else { throw ClusterCryptoError.keychain(errSecItemNotFound) }
-            return keychainData
-        }
-        let keychainWrite: (Data) throws -> Void = { data in
-            guard keychainAvailable else {
-                throw ClusterCryptoError.keychain(errSecInteractionNotAllowed)
-            }
-            keychainData = data
-        }
-        let store = ClusterCredentialStore(
-            fallbackURL: fallbackURL,
-            keychainRead: keychainRead,
-            keychainWrite: keychainWrite
-        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let expected = credentials(node: "fallback-node")
+        try ClusterCrypto.encoder.encode(expected).write(to: fallbackURL)
+        let credentialStore = ClusterCredentialStore(
+            store: usageStore, legacyFallbackURL: fallbackURL
+        )
 
-        XCTAssertNoThrow(try store.save(expected))
-        XCTAssertTrue(FileManager.default.fileExists(atPath: fallbackURL.path))
-        let attributes = try FileManager.default.attributesOfItem(atPath: fallbackURL.path)
-        XCTAssertEqual((attributes[.posixPermissions] as? NSNumber)?.intValue, 0o600)
-        XCTAssertEqual(store.loadOrCreate(), expected)
-
-        keychainAvailable = true
-        XCTAssertEqual(store.loadOrCreate(), expected)
-        XCTAssertNotNil(keychainData)
+        XCTAssertEqual(credentialStore.loadOrCreate(), expected)
         XCTAssertFalse(FileManager.default.fileExists(atPath: fallbackURL.path))
+        XCTAssertEqual(credentialStore.loadOrCreate(), expected)
+
+        let replacement = credentials(node: "sqlite-node", secret: Data(repeating: 8, count: 32))
+        try credentialStore.save(replacement)
+        XCTAssertEqual(credentialStore.loadOrCreate(), replacement)
+        let attributes = try FileManager.default.attributesOfItem(atPath: databasePath)
+        XCTAssertEqual((attributes[.posixPermissions] as? NSNumber)?.intValue, 0o600)
     }
 
     func testJoiningClusterReportsMissingPairingCodeInsteadOfDoingNothing() {

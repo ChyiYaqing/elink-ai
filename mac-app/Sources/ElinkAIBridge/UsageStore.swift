@@ -14,6 +14,7 @@ final class UsageStore {
     static let shared = UsageStore()
 
     private let queue = DispatchQueue(label: "elink.usage-store")
+    private let databasePath: String
     private var db: OpaquePointer?
     private var clusterNodeID: String?
     private var clusterAggregationEnabled = false
@@ -25,10 +26,14 @@ final class UsageStore {
         let directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("ElinkAI", isDirectory: true)
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try? FileManager.default.setAttributes(
+            [.posixPermissions: 0o700], ofItemAtPath: directory.path
+        )
         return directory.appendingPathComponent("usage.db").path
     }
 
     init(path: String = UsageStore.defaultPath) {
+        databasePath = path
         queue.sync {
             guard sqlite3_open(path, &db) == SQLITE_OK else {
                 Log.error("usage db open failed: \(path)", category: "storage")
@@ -67,6 +72,7 @@ final class UsageStore {
                 Log.error("provider usage cache table create failed", category: "storage")
             }
             Self.createClusterTables(in: db)
+            Self.protectDatabaseFiles(at: path)
         }
     }
 
@@ -299,6 +305,49 @@ final class UsageStore {
 
     func setClusterAggregationEnabled(_ enabled: Bool) {
         queue.sync { clusterAggregationEnabled = enabled }
+    }
+
+    // The cluster identity and shared secret intentionally live in this local
+    // SQLite database. The app never stores or reads them from macOS Keychain.
+    func clusterCredentialsData() -> Data? {
+        queue.sync {
+            guard db != nil else { return nil }
+            var statement: OpaquePointer?
+            guard sqlite3_prepare_v2(
+                db, "SELECT payload FROM cluster_credentials WHERE singleton = 1",
+                -1, &statement, nil
+            ) == SQLITE_OK else { return nil }
+            defer { sqlite3_finalize(statement) }
+            guard sqlite3_step(statement) == SQLITE_ROW,
+                  let bytes = sqlite3_column_blob(statement, 0) else { return nil }
+            let count = Int(sqlite3_column_bytes(statement, 0))
+            guard count > 0 else { return nil }
+            return Data(bytes: bytes, count: count)
+        }
+    }
+
+    @discardableResult
+    func saveClusterCredentialsData(_ data: Data) -> Bool {
+        let saved = queue.sync {
+            guard db != nil, !data.isEmpty else { return false }
+            let sql = """
+            INSERT INTO cluster_credentials (singleton, payload, updated_at)
+            VALUES (1, ?, ?)
+            ON CONFLICT(singleton) DO UPDATE SET
+              payload = excluded.payload,
+              updated_at = excluded.updated_at
+            """
+            var statement: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return false }
+            defer { sqlite3_finalize(statement) }
+            _ = data.withUnsafeBytes { bytes in
+                sqlite3_bind_blob(statement, 1, bytes.baseAddress, Int32(data.count), Self.transient)
+            }
+            sqlite3_bind_double(statement, 2, Date().timeIntervalSince1970)
+            return sqlite3_step(statement) == SQLITE_DONE
+        }
+        if saved { Self.protectDatabaseFiles(at: databasePath) }
+        return saved
     }
 
     /// Removes data learned from a previous cluster while preserving this Mac's own history.
@@ -633,6 +682,11 @@ final class UsageStore {
           tokens INTEGER NOT NULL,
           PRIMARY KEY (origin_node_id, day, provider, model)
         );
+        CREATE TABLE IF NOT EXISTS cluster_credentials (
+          singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+          payload BLOB NOT NULL,
+          updated_at REAL NOT NULL
+        );
         CREATE INDEX IF NOT EXISTS idx_cluster_usage_provider_day
           ON cluster_usage_snapshots(provider, day);
         """
@@ -676,6 +730,16 @@ final class UsageStore {
         if sqlite3_exec(db, sql, nil, nil, nil) != SQLITE_OK {
             sqlite3_exec(db, "ROLLBACK", nil, nil, nil)
             Log.error("usage db timestamp migration failed", category: "storage")
+        }
+    }
+
+    private static func protectDatabaseFiles(at path: String) {
+        guard path != ":memory:" else { return }
+        for candidate in [path, path + "-wal", path + "-shm"]
+            where FileManager.default.fileExists(atPath: candidate) {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o600], ofItemAtPath: candidate
+            )
         }
     }
 }
