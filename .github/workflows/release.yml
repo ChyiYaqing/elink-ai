@@ -5,18 +5,68 @@ on:
     tags:
       - "v*"
 
-permissions:
-  contents: write
+permissions: {}
 
 jobs:
-  release:
-    runs-on: macos-14
+  build:
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Test macOS app
         run: swift test
         working-directory: mac-app
+
+      - name: Build ${{ matrix.arch }} binary
+        run: |
+          swift build -c release
+          BIN_DIR=$(swift build -c release --show-bin-path)
+          BINARY="$RUNNER_TEMP/ElinkAIBridge-${{ matrix.arch }}"
+          cp "$BIN_DIR/ElinkAIBridge" "$BINARY"
+          lipo "$BINARY" -verify_arch "${{ matrix.arch }}"
+        working-directory: mac-app
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ElinkAIBridge-${{ matrix.arch }}
+          path: ${{ runner.temp }}/ElinkAIBridge-${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    needs: build
+    permissions:
+      actions: read
+      contents: write
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: ElinkAIBridge-*
+          path: ${{ runner.temp }}/binaries
+          merge-multiple: true
+
+      - name: Create Universal Binary
+        run: |
+          ARM64="$RUNNER_TEMP/binaries/ElinkAIBridge-arm64"
+          X86_64="$RUNNER_TEMP/binaries/ElinkAIBridge-x86_64"
+          UNIVERSAL="$RUNNER_TEMP/ElinkAIBridge"
+          chmod 0755 "$ARM64" "$X86_64"
+          lipo -create "$ARM64" "$X86_64" -output "$UNIVERSAL"
+          lipo "$UNIVERSAL" -verify_arch arm64 x86_64
+          file "$UNIVERSAL"
 
       - name: Build DMG
         run: |
@@ -26,19 +76,46 @@ jobs:
             echo "Tag version $VERSION does not match app version $APP_VERSION" >&2
             exit 1
           fi
-          RELEASE_VERSION="$VERSION" sh build-dmg.sh
+          ELINK_BINARY="$RUNNER_TEMP/ElinkAIBridge" \
+            RELEASE_VERSION="$VERSION" \
+            sh build-dmg.sh
         working-directory: mac-app
+
+      - name: Prepare release notes
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          NOTES="$RUNNER_TEMP/release-notes.md"
+          if ! awk -v version="$VERSION" '
+              $0 == "## " version { found = 1; next }
+              found && /^## / { exit }
+              found { print }
+              END { if (!found) exit 1 }
+            ' CHANGELOG.md > "$NOTES"; then
+            echo "CHANGELOG.md has no ## $VERSION section" >&2
+            exit 1
+          fi
+          if ! grep -Eq '^### (Packaging|Added|Changed|Fixed|Removed)$' "$NOTES" || \
+             ! grep -q '^- ' "$NOTES"; then
+            echo "CHANGELOG.md has no categorized release notes for $VERSION" >&2
+            exit 1
+          fi
 
       - name: Publish DMG
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          VERSION="${GITHUB_REF_NAME#v}"
           DMG="mac-app/.build/elink-ai-${GITHUB_REF_NAME}.dmg"
+          NOTES="$RUNNER_TEMP/release-notes.md"
+          TITLE="elink-ai Version $VERSION"
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release edit "$GITHUB_REF_NAME" \
+              --notes-file "$NOTES" \
+              --title "$TITLE"
             gh release upload "$GITHUB_REF_NAME" "$DMG" --clobber
           else
             gh release create "$GITHUB_REF_NAME" "$DMG" \
               --verify-tag \
-              --generate-notes \
-              --title "$GITHUB_REF_NAME"
+              --notes-file "$NOTES" \
+              --title "$TITLE"
           fi
