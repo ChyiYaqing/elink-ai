@@ -4,8 +4,8 @@ import SwiftUI
 import XCTest
 @testable import ElinkAIBridge
 
-@MainActor
 final class UsagePanelViewTests: XCTestCase {
+    @MainActor
     func testSingleNodeClusterShowsPairingCodeInput() {
         let path = NSTemporaryDirectory() + "elink-panel-\(UUID().uuidString).db"
         defer { try? FileManager.default.removeItem(atPath: path) }

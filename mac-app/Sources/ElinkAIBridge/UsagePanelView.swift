@@ -37,7 +37,6 @@ struct UsagePanelView: View {
     @State private var clusterAddress = ""
     @State private var clusterCode = ""
     @State private var clusterMessage: String?
-    @State private var showClusterJoin = false
     @State private var showClusterAdvanced = false
     @State private var showLeaveClusterConfirmation = false
 
@@ -387,23 +386,26 @@ struct UsagePanelView: View {
                         }
 
                         if cluster.nodes.count <= 1 {
-                            Button(showClusterJoin ? "取消加入其他集群" : "已有配对码？加入另一集群") {
-                                withAnimation(.easeOut(duration: 0.2)) {
-                                    showClusterJoin.toggle()
-                                }
-                                clusterMessage = nil
-                            }
-                            .buttonStyle(.plain)
-                            .font(.system(size: 9, weight: .semibold))
-                            .foregroundStyle(theme.textSecondary)
+                            Divider().opacity(0.35)
 
-                            if showClusterJoin {
-                                Text("本机当前是单节点集群；加入后将替换集群配置，本机历史用量会保留。")
-                                    .font(.system(size: 8, weight: .medium))
-                                    .foregroundStyle(theme.statusWarning)
-                                clusterJoinFields(theme, buttonTitle: "加入另一集群")
-                                    .transition(.opacity)
+                            HStack(spacing: 8) {
+                                Image(systemName: "link.badge.plus")
+                                    .font(.system(size: 10, weight: .semibold))
+                                    .foregroundStyle(Color(red: 0.32, green: 0.58, blue: 0.96))
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text("加入已有同步集群")
+                                        .font(.system(size: 9, weight: .semibold, design: .rounded))
+                                        .foregroundStyle(theme.textPrimary)
+                                    Text("输入另一台 Mac 显示的地址和 6 位配对码")
+                                        .font(.system(size: 8, weight: .medium))
+                                        .foregroundStyle(theme.textTertiary)
+                                }
                             }
+
+                            Text("加入后将替换本机的单节点集群配置，本机历史用量会保留。")
+                                .font(.system(size: 8, weight: .medium))
+                                .foregroundStyle(theme.statusWarning)
+                            clusterJoinFields(theme, buttonTitle: "加入已有集群")
                         }
 
                         if let message = clusterMessage ?? cluster.lastError {
@@ -627,7 +629,6 @@ struct UsagePanelView: View {
                 clusterMessage = "配对失败：\(error.localizedDescription)"
             } else {
                 clusterMessage = "配对成功，正在同步其他 Mac 的历史用量"
-                showClusterJoin = false
                 clusterAddress = ""
                 clusterCode = ""
             }
