@@ -86,12 +86,14 @@ final class UpdateChecker: ObservableObject {
     }
 
     func setAutomaticallyChecks(_ enabled: Bool) {
+        Log.user("automatic update checks \(enabled ? "enabled" : "disabled")")
         automaticallyChecks = enabled
         defaults.set(enabled, forKey: DefaultsKey.automaticallyChecks)
         if enabled { checkAutomaticallyIfNeeded() }
     }
 
     func setIncludesPrereleases(_ enabled: Bool) {
+        Log.user("prerelease updates \(enabled ? "enabled" : "disabled")")
         includesPrereleases = enabled
         defaults.set(enabled, forKey: DefaultsKey.includesPrereleases)
         check()
@@ -139,6 +141,7 @@ final class UpdateChecker: ObservableObject {
 
     func openAvailableUpdate() {
         guard let updateURL else { return }
+        Log.user("open application update \(updateURL.absoluteString)")
         NSWorkspace.shared.open(updateURL)
     }
 
@@ -153,13 +156,16 @@ final class UpdateChecker: ObservableObject {
                 latestVersion = release.version
                 updateURL = release.dmgURL ?? release.pageURL
                 state = .updateAvailable
+                Log.info("update check completed: v\(release.version) available")
             } else {
                 latestVersion = nil
                 updateURL = nil
                 state = .upToDate
+                Log.info("update check completed: application is up to date")
             }
         case let .failure(error):
             state = .failed(error.localizedDescription)
+            Log.warning("update check failed: \(error.localizedDescription)", category: "update")
         }
     }
 

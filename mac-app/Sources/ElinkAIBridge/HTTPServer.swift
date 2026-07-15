@@ -63,8 +63,11 @@ final class HTTPServer {
     }
 
     private func respond(_ connection: NWConnection, method: String, path: String, body: Data) {
+        let startedAt = Date()
+        var peer = "unknown"
         if case let .hostPort(host, _) = connection.endpoint {
             let ip = String(host.debugDescription.split(separator: "%").first ?? "")
+            if !ip.isEmpty { peer = ip }
             if !ip.isEmpty { onRequest?(path, ip) }
         }
         let result: (Int, String, Data)
@@ -76,6 +79,11 @@ final class HTTPServer {
             result = (404, "application/json", Data("{\"error\":\"not found\"}".utf8))
         }
         let phrase = result.0 == 200 ? "OK" : "Not Found"
+        let duration = max(0, Int(Date().timeIntervalSince(startedAt) * 1_000))
+        Log.device(
+            "bridge request \(method) \(path) peer=\(peer) status=\(result.0) request_bytes=\(body.count) response_bytes=\(result.2.count) duration_ms=\(duration)",
+            level: (200...299).contains(result.0) ? .info : .warning
+        )
         let header = "HTTP/1.1 \(result.0) \(phrase)\r\nContent-Type: \(result.1)\r\nContent-Length: \(result.2.count)\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
         connection.send(content: Data(header.utf8) + result.2,
                         completion: .contentProcessed { _ in connection.cancel() })

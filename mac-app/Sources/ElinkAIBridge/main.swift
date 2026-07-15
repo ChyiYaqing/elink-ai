@@ -1,6 +1,7 @@
 import AppKit
 
 let port: UInt16 = 8765
+Log.info("application v\(AppInfo.version) launching")
 let usageStore = UsageStore.shared
 let usage = UsageFetcher(cacheStore: usageStore)
 let status = StatusService(usage: usage, store: usageStore)
@@ -41,7 +42,7 @@ do {
     try server.start()
     Log.info("bridge v\(AppInfo.version) started on port \(port)")
 } catch {
-    Log.info("server start failed: \(error.localizedDescription)")
+    Log.error("server start failed: \(error.localizedDescription)", category: "server")
     let alert = NSAlert(); alert.messageText = "Elink AI Bridge 无法启动"
     alert.informativeText = "端口 \(port) 绑定失败：\(error.localizedDescription)"; alert.runModal()
 }

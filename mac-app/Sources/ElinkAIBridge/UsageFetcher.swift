@@ -64,7 +64,11 @@ final class UsageFetcher {
                 let summary = "usage claude=\(Self.describe(claude)) codex=\(Self.describe(codex))"
                 if summary != self.lastLogSummary {
                     self.lastLogSummary = summary
-                    Log.info(summary)
+                    if claude.error != nil || codex.error != nil {
+                        Log.warning(summary, category: "usage")
+                    } else {
+                        Log.info(summary, category: "usage")
+                    }
                 }
                 let values = self.refreshCompletions
                 self.refreshCompletions.removeAll()

@@ -4,7 +4,14 @@ enum AppInfo {
     static let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
         ?? "0.1.3"
     static let repoURL = URL(string: "https://github.com/ChyiYaqing/elink-ai")!
-    static let logPath = "/tmp/elink-ai-bridge.log"
+    static let logDirectoryURL = FileManager.default
+        .urls(for: .libraryDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("Logs/Elink AI", isDirectory: true)
+    static let logURL = logDirectoryURL.appendingPathComponent("elink-ai.log")
+    static let archivedLogURL = logDirectoryURL.appendingPathComponent("elink-ai.1.log")
+    static let consoleLogURL = logDirectoryURL.appendingPathComponent("elink-ai-console.log")
+    static let logPath = logURL.path
+    static let legacyLogPath = "/tmp/elink-ai-bridge.log"
 }
 
 // 通过 ~/Library/LaunchAgents 的 launchd plist 实现开机自启动
@@ -23,12 +30,16 @@ enum LaunchAtLogin {
             return
         }
         let executable = Bundle.main.executablePath ?? CommandLine.arguments[0]
+        try FileManager.default.createDirectory(
+            at: AppInfo.logDirectoryURL,
+            withIntermediateDirectories: true
+        )
         let plist: [String: Any] = [
             "Label": "local.elink-ai-bridge",
             "ProgramArguments": [executable],
             "RunAtLoad": true,
-            "StandardOutPath": AppInfo.logPath,
-            "StandardErrorPath": AppInfo.logPath,
+            "StandardOutPath": AppInfo.consoleLogURL.path,
+            "StandardErrorPath": AppInfo.consoleLogURL.path,
         ]
         let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
         try FileManager.default.createDirectory(

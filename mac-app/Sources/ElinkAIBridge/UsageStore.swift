@@ -27,7 +27,7 @@ final class UsageStore {
     init(path: String = UsageStore.defaultPath) {
         queue.sync {
             guard sqlite3_open(path, &db) == SQLITE_OK else {
-                Log.info("usage db open failed: \(path)")
+                Log.error("usage db open failed: \(path)", category: "storage")
                 sqlite3_close(db)
                 db = nil
                 return
@@ -45,7 +45,7 @@ final class UsageStore {
             )
             """
             if sqlite3_exec(db, create, nil, nil, nil) != SQLITE_OK {
-                Log.info("usage db create table failed")
+                Log.error("usage db create table failed", category: "storage")
             } else if !Self.columns(in: db).isSuperset(of: ["created_at", "updated_at"]) {
                 Self.migrateTimestamps(in: db)
             }
@@ -60,7 +60,7 @@ final class UsageStore {
             )
             """
             if sqlite3_exec(db, createCache, nil, nil, nil) != SQLITE_OK {
-                Log.info("provider usage cache table create failed")
+                Log.error("provider usage cache table create failed", category: "storage")
             }
         }
     }
@@ -276,7 +276,7 @@ final class UsageStore {
         """
         if sqlite3_exec(db, sql, nil, nil, nil) != SQLITE_OK {
             sqlite3_exec(db, "ROLLBACK", nil, nil, nil)
-            Log.info("usage db timestamp migration failed")
+            Log.error("usage db timestamp migration failed", category: "storage")
         }
     }
 }

@@ -44,11 +44,13 @@ struct UsagePanelView: View {
                         ProviderCard(name: "Claude", pet: PixelPet.claude,
                                      accent: PanelTheme.claudeColor(dark: theme.dark),
                                      status: model.claude, theme: theme) {
+                            Log.user("open Claude usage statistics")
                             withAnimation(.easeOut(duration: 0.2)) { model.statsProvider = "claude" }
                         }
                         ProviderCard(name: "Codex", pet: PixelPet.codex,
                                      accent: PanelTheme.codexColor(dark: theme.dark),
                                      status: model.codex, theme: theme) {
+                            Log.user("open Codex usage statistics")
                             withAnimation(.easeOut(duration: 0.2)) { model.statsProvider = "codex" }
                         }
                     }
@@ -171,7 +173,10 @@ struct UsagePanelView: View {
             accent: claude ? PanelTheme.claudeColor(dark: theme.dark)
                            : PanelTheme.codexColor(dark: theme.dark),
             theme: theme,
-            onBack: { withAnimation(.easeOut(duration: 0.2)) { model.statsProvider = nil } }
+            onBack: {
+                Log.user("close \(claude ? "Claude" : "Codex") usage statistics")
+                withAnimation(.easeOut(duration: 0.2)) { model.statsProvider = nil }
+            }
         )
         .glassCard(theme)
     }
@@ -184,6 +189,7 @@ struct UsagePanelView: View {
                     .foregroundStyle(theme.textPrimary)
                 HStack {
                     PillButton(title: "返回", icon: "chevron.left", theme: theme) {
+                        Log.user("close settings")
                         withAnimation(.easeOut(duration: 0.2)) { model.showSettings = false }
                     }
                     Spacer()
@@ -252,8 +258,9 @@ struct UsagePanelView: View {
                     do {
                         try LaunchAtLogin.setEnabled(enabled)
                         model.launchAtLogin = enabled
-                        Log.info("launch at login \(enabled ? "enabled" : "disabled")")
+                        Log.user("launch at login \(enabled ? "enabled" : "disabled")")
                     } catch {
+                        Log.warning("set launch at login failed: \(error.localizedDescription)", category: "user")
                         model.settingsMessage = "设置开机自启动失败：\(error.localizedDescription)"
                     }
                 }
@@ -271,10 +278,14 @@ struct UsagePanelView: View {
             settingsHeader(theme, icon: "doc.text.fill", color: Color(red: 0.55, green: 0.52, blue: 0.62),
                            title: "日志", subtitle: "查看桥接应用运行日志")
             WideButton(title: "打开日志文件", icon: "doc.text", theme: theme) {
-                if FileManager.default.fileExists(atPath: AppInfo.logPath) {
-                    NSWorkspace.shared.open(URL(fileURLWithPath: AppInfo.logPath))
+                let url = Log.fileURL()
+                Log.user("open log file in Console \(url.path)")
+                Log.flush()
+                if NSWorkspace.shared.open(url) {
+                    model.settingsMessage = "日志文件：\(url.path)"
                 } else {
-                    model.settingsMessage = "暂无日志文件（以开机自启动方式运行后生成于 \(AppInfo.logPath)）"
+                    Log.warning("Console failed to open log file \(url.path)", category: "user")
+                    model.settingsMessage = "无法使用 Console 打开日志文件：\(url.path)"
                 }
             }
         }
@@ -288,6 +299,7 @@ struct UsagePanelView: View {
             settingsHeader(theme, icon: "info.circle.fill", color: theme.statusCritical,
                            title: "关于", subtitle: "版本 \(AppInfo.version)")
             WideButton(title: "在 GitHub 查看", icon: "link", theme: theme) {
+                Log.user("open project page on GitHub")
                 NSWorkspace.shared.open(AppInfo.repoURL)
             }
             Text("在 GitHub 反馈问题或参与贡献")
@@ -303,6 +315,7 @@ struct UsagePanelView: View {
         DisclosureGroup(isExpanded: $updatesExpanded) {
             VStack(alignment: .leading, spacing: 9) {
                 UpdateCheckButton(checking: updater.isChecking, theme: theme) {
+                    Log.user("check for application updates")
                     updater.check()
                 }
                 .disabled(updater.isChecking)
@@ -449,9 +462,12 @@ struct UsagePanelView: View {
                 .foregroundStyle(theme.textTertiary)
             Spacer()
             CircleIconButton(icon: model.showSettings ? "xmark" : "gearshape.fill", theme: theme) {
+                Log.user(model.showSettings ? "close settings" : "open settings")
                 withAnimation(.easeOut(duration: 0.2)) { model.showSettings.toggle() }
             }
             CircleIconButton(icon: "power", theme: theme) {
+                Log.user("quit application")
+                Log.flush()
                 NSApp.terminate(nil)
             }
         }

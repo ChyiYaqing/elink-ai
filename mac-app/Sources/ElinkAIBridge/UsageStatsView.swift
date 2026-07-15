@@ -119,7 +119,10 @@ struct UsageStatsView: View {
         .padding(12)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .onAppear(perform: load)
-        .onChange(of: range) { _ in hoveredBucket = nil }
+        .onChange(of: range) { value in
+            Log.user("change \(provider) usage statistics range to \(value.rawValue)")
+            hoveredBucket = nil
+        }
     }
 
     private var header: some View {

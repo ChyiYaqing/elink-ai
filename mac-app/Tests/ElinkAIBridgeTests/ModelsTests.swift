@@ -429,9 +429,40 @@ final class ModelsTests: XCTestCase {
         XCTAssertEqual(plist["Label"] as? String, "local.elink-ai-bridge")
         XCTAssertEqual(plist["RunAtLoad"] as? Bool, true)
         XCTAssertFalse((plist["ProgramArguments"] as? [String] ?? []).isEmpty)
+        XCTAssertEqual(plist["StandardOutPath"] as? String, AppInfo.consoleLogURL.path)
+        XCTAssertEqual(plist["StandardErrorPath"] as? String, AppInfo.consoleLogURL.path)
 
         try LaunchAtLogin.setEnabled(false, at: path)
         XCTAssertFalse(LaunchAtLogin.isEnabled(at: path))
+    }
+
+    func testApplicationLogUsesPersistentUserLibraryLocation() {
+        XCTAssertTrue(AppInfo.logPath.contains("/Library/Logs/Elink AI/"))
+        XCTAssertFalse(AppInfo.logPath.hasPrefix("/tmp/"))
+        XCTAssertEqual(AppInfo.logURL.lastPathComponent, "elink-ai.log")
+    }
+
+    func testLogRedactsCredentials() {
+        let message = #"Authorization: Bearer secret-token access_token=abc123 api-key: key456"#
+        let result = Log.redacted(message)
+
+        XCTAssertFalse(result.contains("secret-token"))
+        XCTAssertFalse(result.contains("abc123"))
+        XCTAssertFalse(result.contains("key456"))
+        XCTAssertTrue(result.contains("<redacted>"))
+    }
+
+    func testLogDefinesThreeLevelsAndFormatsThem() {
+        XCTAssertEqual(Log.Level.allCases.map(\.rawValue), ["INFO", "WARNING", "ERROR"])
+
+        let warning = Log.formattedLine(
+            level: .warning,
+            category: "device",
+            message: "request timed out",
+            at: Date(timeIntervalSince1970: 0)
+        )
+        XCTAssertTrue(warning.contains("[WARNING] [device] request timed out"))
+        XCTAssertTrue(warning.hasSuffix("\n"))
     }
 
     func testUpdateCheckerComparesSemanticVersions() {

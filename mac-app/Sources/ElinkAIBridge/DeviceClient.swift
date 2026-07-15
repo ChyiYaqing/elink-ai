@@ -59,12 +59,22 @@ final class DeviceClient {
     }
 
     static func verify(_ candidate: String, completion: @escaping (Bool) -> Void) {
-        guard let base = candidateURL(candidate) else { completion(false); return }
+        guard let base = candidateURL(candidate) else {
+            Log.device("verify failed: invalid address \(candidate)", level: .warning)
+            completion(false)
+            return
+        }
         let url = base.appendingPathComponent("v1/device")
         var request = URLRequest(url: url); request.timeoutInterval = 1.5
-        URLSession.shared.dataTask(with: request) { data, _, _ in
+        let startedAt = Date()
+        Log.device("request -> GET \(url.absoluteString) purpose=verify")
+        URLSession.shared.dataTask(with: request) { data, response, error in
             let valid = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
                 .map { $0["device_type"] as? String == "elink-agent" } ?? false
+            Log.device(responseLog(
+                method: "GET", url: url, response: response, data: data,
+                error: error, startedAt: startedAt, suffix: " valid=\(valid)"
+            ), level: valid ? responseLevel(response: response, error: error) : .warning)
             DispatchQueue.main.async { completion(valid) }
         }.resume()
     }
@@ -76,7 +86,11 @@ final class DeviceClient {
         let configured = normalizedHost(host)
         if !configured.isEmpty, !candidates.contains(configured) { candidates.append(configured) }
         func next() {
-            guard !candidates.isEmpty else { scanSubnet(progress: progress, completion: completion); return }
+            guard !candidates.isEmpty else {
+                Log.user("device auto-pair scanning local subnet")
+                scanSubnet(progress: progress, completion: completion)
+                return
+            }
             let candidate = candidates.removeFirst()
             progress("验证 \(candidate)…")
             verify(candidate) { ok in
@@ -88,7 +102,11 @@ final class DeviceClient {
 
     private static func scanSubnet(progress: @escaping (String) -> Void,
                                    completion: @escaping (String?) -> Void) {
-        guard let local = localIPv4(), let dot = local.lastIndex(of: ".") else { completion(nil); return }
+        guard let local = localIPv4(), let dot = local.lastIndex(of: ".") else {
+            Log.warning("auto-pair failed: local IPv4 unavailable", category: "device")
+            completion(nil)
+            return
+        }
         let prefix = local[..<dot]
         progress("扫描 \(prefix).1–254…")
         let group = DispatchGroup(), lock = NSLock(), limit = DispatchSemaphore(value: 32)
@@ -111,6 +129,11 @@ final class DeviceClient {
             }
             group.notify(queue: .main) {
                 if let found { host = found }
+                Log.device(
+                    found.map { "auto-pair scan found \($0)" }
+                        ?? "auto-pair scan completed: no device found",
+                    level: found == nil ? .warning : .info
+                )
                 completion(found)
             }
         }
@@ -138,9 +161,9 @@ final class DeviceClient {
                 }
                 setBridge(desired) { error in
                     if let error {
-                        FileHandle.standardError.write(Data(
-                            "[pair] bridge self-heal failed: \(error.localizedDescription)\n".utf8
-                        ))
+                        Log.warning("bridge self-heal failed: \(error.localizedDescription)", category: "device")
+                    } else {
+                        Log.device("bridge self-heal updated bridge URL")
                     }
                     finishHealing()
                 }
@@ -186,32 +209,72 @@ final class DeviceClient {
     }
 
     private static func get(path: String, completion: @escaping (Result<Data, Error>) -> Void) {
-        guard let base = baseURL else { completion(.failure(BridgeError.message("未设置设备地址"))); return }
-        var request = URLRequest(url: base.appendingPathComponent(path)); request.timeoutInterval = 5
+        guard let base = baseURL else {
+            Log.warning("request GET \(path) failed: device address is not configured", category: "device")
+            completion(.failure(BridgeError.message("未设置设备地址")))
+            return
+        }
+        let url = base.appendingPathComponent(path)
+        var request = URLRequest(url: url); request.timeoutInterval = 5
+        let startedAt = Date()
+        Log.device("request -> GET \(url.absoluteString)")
         URLSession.shared.dataTask(with: request) { data, response, error in
             let result: Result<Data, Error>
             if let error { result = .failure(error) }
             else if let data, let response = response as? HTTPURLResponse,
                     (200...299).contains(response.statusCode) { result = .success(data) }
             else { result = .failure(BridgeError.message("设备响应失败")) }
+            Log.device(responseLog(
+                method: "GET", url: url, response: response, data: data,
+                error: error, startedAt: startedAt
+            ), level: responseLevel(response: response, error: error))
             DispatchQueue.main.async { completion(result) }
         }.resume()
     }
 
     private static func send(path: String, method: String, object: [String: Any],
                              completion: @escaping (Error?) -> Void) {
-        guard let base = baseURL else { completion(BridgeError.message("未设置设备地址")); return }
-        var request = URLRequest(url: base.appendingPathComponent(path))
+        guard let base = baseURL else {
+            Log.warning("request \(method) \(path) failed: device address is not configured", category: "device")
+            completion(BridgeError.message("未设置设备地址"))
+            return
+        }
+        let url = base.appendingPathComponent(path)
+        var request = URLRequest(url: url)
         request.httpMethod = method; request.timeoutInterval = 8
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try? JSONSerialization.data(withJSONObject: object)
+        let startedAt = Date()
+        Log.device("request -> \(method) \(url.absoluteString) body_bytes=\(request.httpBody?.count ?? 0)")
         URLSession.shared.dataTask(with: request) { data, response, error in
             var result = error
             if result == nil, let response = response as? HTTPURLResponse,
                !(200...299).contains(response.statusCode) {
                 result = BridgeError.message(data.map { String(decoding: $0, as: UTF8.self) } ?? "HTTP \(response.statusCode)")
             }
+            Log.device(responseLog(
+                method: method, url: url, response: response, data: data,
+                error: result, startedAt: startedAt
+            ), level: responseLevel(response: response, error: result))
             DispatchQueue.main.async { completion(result) }
         }.resume()
+    }
+
+    private static func responseLog(method: String, url: URL, response: URLResponse?,
+                                    data: Data?, error: Error?, startedAt: Date,
+                                    suffix: String = "") -> String {
+        let milliseconds = max(0, Int(Date().timeIntervalSince(startedAt) * 1_000))
+        let status = (response as? HTTPURLResponse)?.statusCode
+        if let error {
+            return "response <- \(method) \(url.absoluteString) status=\(status.map(String.init) ?? "-") bytes=\(data?.count ?? 0) duration_ms=\(milliseconds) error=\(error.localizedDescription)\(suffix)"
+        }
+        return "response <- \(method) \(url.absoluteString) status=\(status.map(String.init) ?? "-") bytes=\(data?.count ?? 0) duration_ms=\(milliseconds)\(suffix)"
+    }
+
+    private static func responseLevel(response: URLResponse?, error: Error?) -> Log.Level {
+        guard error == nil,
+              let status = (response as? HTTPURLResponse)?.statusCode,
+              (200...299).contains(status) else { return .warning }
+        return .info
     }
 }
