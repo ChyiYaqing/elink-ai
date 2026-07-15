@@ -1,6 +1,6 @@
 import Foundation
 
-struct UsageWindow {
+struct UsageWindow: Equatable {
     var percent: Double?
     var resetMinutes: Int?
     var resetAt: Date?
@@ -19,6 +19,7 @@ struct ProviderUsage {
     var weekly = UsageWindow()
     var error: String?
     var fetchedAt: Date?
+    var isCached = false
 }
 
 struct ModelUsage: Equatable {
@@ -34,6 +35,8 @@ struct AgentStatus {
     var weekly = UsageWindow()
     var needsInput = false
     var error: String?
+    var usageFetchedAt: Date?
+    var usageCached = false
 }
 
 struct BridgeSnapshot {
@@ -53,6 +56,10 @@ struct BridgeSnapshot {
                 },
                 "needs_input": value.needsInput,
                 "error": nullable(value.error),
+                "provider_usage_fetched_at": nullable(value.usageFetchedAt.map {
+                    Int($0.timeIntervalSince1970)
+                }),
+                "provider_usage_cached": value.usageCached,
             ]
             let primary = claude ? "five_hour" : "primary"
             let weekly = claude ? "seven_day" : "weekly"

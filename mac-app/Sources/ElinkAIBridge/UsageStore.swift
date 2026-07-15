@@ -15,6 +15,7 @@ final class UsageStore {
     private let queue = DispatchQueue(label: "elink.usage-store")
     private var db: OpaquePointer?
     private static let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+    private static let noResetMaxAge: TimeInterval = 6 * 60 * 60
 
     static var defaultPath: String {
         let directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -47,6 +48,19 @@ final class UsageStore {
                 Log.info("usage db create table failed")
             } else if !Self.columns(in: db).isSuperset(of: ["created_at", "updated_at"]) {
                 Self.migrateTimestamps(in: db)
+            }
+            let createCache = """
+            CREATE TABLE IF NOT EXISTS provider_usage_cache (
+                provider TEXT NOT NULL,
+                window_type TEXT NOT NULL,
+                percent REAL NOT NULL,
+                reset_at REAL,
+                fetched_at REAL NOT NULL,
+                PRIMARY KEY (provider, window_type)
+            )
+            """
+            if sqlite3_exec(db, createCache, nil, nil, nil) != SQLITE_OK {
+                Log.info("provider usage cache table create failed")
             }
         }
     }
@@ -104,6 +118,127 @@ final class UsageStore {
                 ))
             }
             return result
+        }
+    }
+
+    /// 只保存配额窗口；OAuth 凭据永远不会写入数据库。
+    func cacheUsage(provider: String, usage: ProviderUsage) {
+        let fetchedAt = usage.fetchedAt ?? Date()
+        let windows = [("primary", usage.primary), ("weekly", usage.weekly)]
+            .filter { $0.1.percent != nil }
+        queue.sync {
+            guard db != nil else { return }
+            var latestStatement: OpaquePointer?
+            if sqlite3_prepare_v2(
+                db,
+                "SELECT MAX(fetched_at) FROM provider_usage_cache WHERE provider = ?",
+                -1,
+                &latestStatement,
+                nil
+            ) == SQLITE_OK {
+                sqlite3_bind_text(latestStatement, 1, provider, -1, Self.transient)
+                if sqlite3_step(latestStatement) == SQLITE_ROW,
+                   sqlite3_column_type(latestStatement, 0) != SQLITE_NULL,
+                   sqlite3_column_double(latestStatement, 0) > fetchedAt.timeIntervalSince1970 {
+                    sqlite3_finalize(latestStatement)
+                    return
+                }
+            }
+            sqlite3_finalize(latestStatement)
+
+            guard sqlite3_exec(db, "BEGIN IMMEDIATE", nil, nil, nil) == SQLITE_OK else { return }
+            var succeeded = true
+
+            var deleteStatement: OpaquePointer?
+            if sqlite3_prepare_v2(db, "DELETE FROM provider_usage_cache WHERE provider = ?", -1,
+                                  &deleteStatement, nil) == SQLITE_OK {
+                sqlite3_bind_text(deleteStatement, 1, provider, -1, Self.transient)
+                succeeded = sqlite3_step(deleteStatement) == SQLITE_DONE
+            } else {
+                succeeded = false
+            }
+            sqlite3_finalize(deleteStatement)
+
+            let insert = """
+            INSERT INTO provider_usage_cache
+                (provider, window_type, percent, reset_at, fetched_at)
+            VALUES (?, ?, ?, ?, ?)
+            """
+            var statement: OpaquePointer?
+            if succeeded,
+               sqlite3_prepare_v2(db, insert, -1, &statement, nil) == SQLITE_OK {
+                for (windowType, window) in windows {
+                    guard let percent = window.percent else { continue }
+                    sqlite3_reset(statement)
+                    sqlite3_clear_bindings(statement)
+                    sqlite3_bind_text(statement, 1, provider, -1, Self.transient)
+                    sqlite3_bind_text(statement, 2, windowType, -1, Self.transient)
+                    sqlite3_bind_double(statement, 3, percent)
+                    if let resetAt = window.resetAt {
+                        sqlite3_bind_double(statement, 4, resetAt.timeIntervalSince1970)
+                    } else {
+                        sqlite3_bind_null(statement, 4)
+                    }
+                    sqlite3_bind_double(statement, 5, fetchedAt.timeIntervalSince1970)
+                    if sqlite3_step(statement) != SQLITE_DONE {
+                        succeeded = false
+                        break
+                    }
+                }
+            } else if succeeded {
+                succeeded = false
+            }
+            sqlite3_finalize(statement)
+            sqlite3_exec(db, succeeded ? "COMMIT" : "ROLLBACK", nil, nil, nil)
+        }
+    }
+
+    /// 启动时恢复仍未重置的窗口；没有 reset_at 的旧数据最多保留 6 小时。
+    func cachedUsage(provider: String, now: Date = Date()) -> ProviderUsage? {
+        queue.sync {
+            guard db != nil else { return nil }
+            let sql = """
+            SELECT window_type, percent, reset_at, fetched_at
+            FROM provider_usage_cache WHERE provider = ?
+            """
+            var statement: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return nil }
+            defer { sqlite3_finalize(statement) }
+            sqlite3_bind_text(statement, 1, provider, -1, Self.transient)
+
+            var primary = UsageWindow()
+            var weekly = UsageWindow()
+            var latestFetchedAt: Date?
+            while sqlite3_step(statement) == SQLITE_ROW,
+                  let typeText = sqlite3_column_text(statement, 0) {
+                let fetchedAt = Date(timeIntervalSince1970: sqlite3_column_double(statement, 3))
+                let resetAt = sqlite3_column_type(statement, 2) == SQLITE_NULL
+                    ? nil
+                    : Date(timeIntervalSince1970: sqlite3_column_double(statement, 2))
+                if let resetAt, resetAt <= now { continue }
+                if resetAt == nil, now.timeIntervalSince(fetchedAt) > Self.noResetMaxAge { continue }
+
+                let window = UsageWindow(
+                    percent: sqlite3_column_double(statement, 1),
+                    resetMinutes: resetAt.map { max(0, Int($0.timeIntervalSince(now) / 60)) },
+                    resetAt: resetAt
+                )
+                switch String(cString: typeText) {
+                case "primary": primary = window
+                case "weekly": weekly = window
+                default: continue
+                }
+                if latestFetchedAt.map({ fetchedAt > $0 }) ?? true {
+                    latestFetchedAt = fetchedAt
+                }
+            }
+            guard primary.percent != nil || weekly.percent != nil else { return nil }
+            return ProviderUsage(
+                primary: primary,
+                weekly: weekly,
+                fetchedAt: latestFetchedAt,
+                isCached: true
+            )
         }
     }
 

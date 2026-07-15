@@ -1,8 +1,9 @@
 import AppKit
 
 let port: UInt16 = 8765
-let usage = UsageFetcher()
-let status = StatusService(usage: usage, store: UsageStore.shared)
+let usageStore = UsageStore.shared
+let usage = UsageFetcher(cacheStore: usageStore)
+let status = StatusService(usage: usage, store: usageStore)
 let server = HTTPServer(port: port, get: [
     "/": { ("application/json", status.snapshot().jsonData()) },
     "/v1/status": { ("application/json", status.snapshot().jsonData()) },

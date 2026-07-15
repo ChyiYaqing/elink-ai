@@ -12,6 +12,7 @@ final class ModelsTests: XCTestCase {
         XCTAssertEqual(object["schema_version"] as? Int, 1)
         let claude = try XCTUnwrap(object["claude"] as? [String: Any])
         XCTAssertEqual(claude["five_hour_pct"] as? Double, 42)
+        XCTAssertEqual(claude["provider_usage_cached"] as? Bool, false)
         let models = try XCTUnwrap(claude["model_usage_today"] as? [[String: Any]])
         XCTAssertEqual(models.first?["model"] as? String, "claude-sonnet")
         XCTAssertEqual(models.first?["tokens"] as? Int, 1200)
@@ -140,6 +141,88 @@ final class ModelsTests: XCTestCase {
         XCTAssertEqual(String(cString: createdAt), oldTimestamp)
         XCTAssertNotEqual(String(cString: updatedAt), oldTimestamp)
         sqlite3_finalize(rowStatement)
+    }
+
+    func testUsageStoreRestoresUnexpiredProviderWindowsAfterRestart() throws {
+        let path = NSTemporaryDirectory() + "elink-provider-cache-\(UUID().uuidString).db"
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let store = UsageStore(path: path)
+        let now = Date()
+        store.cacheUsage(provider: "claude", usage: ProviderUsage(
+            primary: UsageWindow(percent: 31, resetAt: now.addingTimeInterval(60 * 60)),
+            weekly: UsageWindow(percent: 62, resetAt: now.addingTimeInterval(6 * 24 * 60 * 60)),
+            fetchedAt: now.addingTimeInterval(-90)
+        ))
+
+        let restartedFetcher = UsageFetcher(cacheStore: store)
+        XCTAssertEqual(restartedFetcher.claude.primary.percent, 31)
+        XCTAssertEqual(restartedFetcher.claude.weekly.percent, 62)
+        XCTAssertTrue(restartedFetcher.claude.isCached)
+        XCTAssertTrue((58...60).contains(
+            try XCTUnwrap(restartedFetcher.claude.primary.resetMinutes)))
+    }
+
+    func testUsageStoreDropsOnlyExpiredWindowAndReplacesOldRows() {
+        let path = NSTemporaryDirectory() + "elink-provider-expiry-\(UUID().uuidString).db"
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let store = UsageStore(path: path)
+        let now = Date()
+        store.cacheUsage(provider: "codex", usage: ProviderUsage(
+            primary: UsageWindow(percent: 80, resetAt: now.addingTimeInterval(60)),
+            weekly: UsageWindow(percent: 70, resetAt: now.addingTimeInterval(60)),
+            fetchedAt: now
+        ))
+        store.cacheUsage(provider: "codex", usage: ProviderUsage(
+            weekly: UsageWindow(percent: 0, resetAt: now.addingTimeInterval(7 * 24 * 60 * 60)),
+            fetchedAt: now.addingTimeInterval(10)
+        ))
+
+        let restored = store.cachedUsage(provider: "codex", now: now.addingTimeInterval(20))
+        XCTAssertNil(restored?.primary.percent)
+        XCTAssertEqual(restored?.weekly.percent, 0)
+    }
+
+    func testUsageStoreRejectsExpiredCachedWindow() {
+        let path = NSTemporaryDirectory() + "elink-provider-expired-\(UUID().uuidString).db"
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let store = UsageStore(path: path)
+        let now = Date()
+        store.cacheUsage(provider: "claude", usage: ProviderUsage(
+            primary: UsageWindow(percent: 48, resetAt: now.addingTimeInterval(-1)),
+            fetchedAt: now.addingTimeInterval(-60)
+        ))
+
+        XCTAssertNil(store.cachedUsage(provider: "claude", now: now))
+    }
+
+    func testUsageStoreRejectsOldWindowWithoutResetTime() {
+        let path = NSTemporaryDirectory() + "elink-provider-no-reset-\(UUID().uuidString).db"
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let store = UsageStore(path: path)
+        let now = Date()
+        store.cacheUsage(provider: "claude", usage: ProviderUsage(
+            weekly: UsageWindow(percent: 51),
+            fetchedAt: now.addingTimeInterval(-7 * 60 * 60)
+        ))
+
+        XCTAssertNil(store.cachedUsage(provider: "claude", now: now))
+    }
+
+    func testOlderFallbackCannotOverwriteNewerProviderCache() {
+        let path = NSTemporaryDirectory() + "elink-provider-newest-\(UUID().uuidString).db"
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let store = UsageStore(path: path)
+        let now = Date()
+        store.cacheUsage(provider: "claude", usage: ProviderUsage(
+            weekly: UsageWindow(percent: 80, resetAt: now.addingTimeInterval(60 * 60)),
+            fetchedAt: now
+        ))
+        store.cacheUsage(provider: "claude", usage: ProviderUsage(
+            weekly: UsageWindow(percent: 20, resetAt: now.addingTimeInterval(60 * 60)),
+            fetchedAt: now.addingTimeInterval(-60)
+        ))
+
+        XCTAssertEqual(store.cachedUsage(provider: "claude", now: now)?.weekly.percent, 80)
     }
 
     func testStatsBucketsCoverRangeAndAggregateYearByMonth() {
@@ -403,6 +486,7 @@ final class ModelsTests: XCTestCase {
         let result = UsageFetcher.keepLastGood(old: old, new: failed)
         XCTAssertEqual(result.weekly.percent, 18)
         XCTAssertEqual(result.error, "temporary error")
+        XCTAssertTrue(result.isCached)
     }
 
     func testDoesNotKeepExpiredUsageAfterError() {
@@ -425,5 +509,23 @@ final class ModelsTests: XCTestCase {
         XCTAssertNil(result.primary.percent)
         XCTAssertEqual(result.weekly.percent, 52)
         XCTAssertEqual(result.error, "temporary error")
+    }
+
+    func testWeeklyOnlyUsageDoesNotClaimAllUsageIsMissing() {
+        let status = AgentStatus(
+            weekly: UsageWindow(percent: 0),
+            error: "temporary error"
+        )
+        XCTAssertEqual(UsagePresentation.missingPrimaryText(status),
+                       "当前无活跃的 5 小时窗口")
+    }
+
+    func testProviderFreshnessIdentifiesCachedData() {
+        let now = Date(timeIntervalSince1970: 10_000)
+        let status = AgentStatus(
+            usageFetchedAt: now.addingTimeInterval(-120),
+            usageCached: true
+        )
+        XCTAssertEqual(UsagePresentation.freshnessText(status, now: now), "缓存 · 2分钟前")
     }
 }

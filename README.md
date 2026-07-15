@@ -43,6 +43,7 @@ OAuth tokens and raw session logs never leave the Mac.
 - stale/offline display, last-frame preview, and persistent device settings
 - menu-bar device discovery, DHCP/bridge self-healing, and detailed quota/reset status
 - exact last-frame preview with page switching and smart/full refresh controls
+- restart-safe quota caching with per-provider freshness and fallback status
 - manual and periodic GitHub Release checks with direct access to the newest DMG
 
 The LCD-specific pet animation, music, and network graphs from `esp8266-ai`

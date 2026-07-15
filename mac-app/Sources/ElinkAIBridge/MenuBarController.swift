@@ -15,6 +15,7 @@ final class MenuBarController: NSObject {
             button.sendAction(on: [.leftMouseUp])
         }
         usage.onUpdate = { [weak self] in self?.refreshUsage() }
+        refreshStatusButton()
     }
 
     // Menubar 只能使用专用资源；AppLogo.image 的系统应用图标回退在裸可执行文件下

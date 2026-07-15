@@ -482,6 +482,20 @@ private struct CircleIconButton: View {
     }
 }
 
+enum UsagePresentation {
+    static func missingPrimaryText(_ status: AgentStatus) -> String {
+        if status.weekly.percent != nil { return "当前无活跃的 5 小时窗口" }
+        return status.error ?? "暂无用量数据"
+    }
+
+    static func freshnessText(_ status: AgentStatus, now: Date = Date()) -> String? {
+        guard let fetchedAt = status.usageFetchedAt else { return nil }
+        let age = max(0, Int(now.timeIntervalSince(fetchedAt)))
+        let relative = age < 5 ? "刚刚" : "\(PreviewPopoverController.formatAge(age))前"
+        return status.usageCached ? "缓存 · \(relative)" : "\(relative)更新"
+    }
+}
+
 private struct ProviderCard: View {
     let name: String
     let pet: [String]
@@ -523,11 +537,20 @@ private struct ProviderCard: View {
                 UsageBar(percent: percent, theme: theme)
                 resetLine(status.primary.resetMinutes)
             } else {
-                Text(status.error ?? "暂无用量数据")
+                HStack(alignment: .firstTextBaseline, spacing: 2) {
+                    Text("—")
+                        .font(.system(size: 30, weight: .bold, design: .rounded))
+                        .foregroundStyle(theme.textTertiary)
+                    Spacer()
+                    Text("5 小时")
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundStyle(theme.textSecondary)
+                }
+                Text(UsagePresentation.missingPrimaryText(status))
                     .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(theme.textTertiary)
                     .lineLimit(2)
-                    .frame(maxWidth: .infinity, minHeight: 56, alignment: .leading)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
             if let weekly = status.weekly.percent {
                 HStack {
@@ -542,6 +565,26 @@ private struct ProviderCard: View {
                 }
                 UsageBar(percent: weekly, theme: theme)
                 resetLine(status.weekly.resetMinutes)
+            }
+            if let error = status.error,
+               status.primary.percent != nil || status.weekly.percent != nil {
+                HStack(spacing: 3) {
+                    Image(systemName: "exclamationmark.triangle.fill").font(.system(size: 7))
+                    Text("更新失败 · \(error)")
+                        .font(.system(size: 8, weight: .semibold))
+                        .lineLimit(2)
+                }
+                .foregroundStyle(theme.statusWarning)
+                .help(error)
+            }
+            if let freshness = UsagePresentation.freshnessText(status) {
+                HStack(spacing: 3) {
+                    Image(systemName: status.usageCached ? "archivebox.fill" : "clock.fill")
+                        .font(.system(size: 7))
+                    Text(freshness)
+                        .font(.system(size: 8, weight: .medium))
+                }
+                .foregroundStyle(status.usageCached ? theme.statusWarning : theme.textTertiary)
             }
             if status.tokensToday > 0 {
                 HStack(spacing: 3) {

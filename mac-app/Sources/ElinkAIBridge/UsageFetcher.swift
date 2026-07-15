@@ -2,6 +2,7 @@ import Foundation
 
 final class UsageFetcher {
     private let lock = NSLock()
+    private let cacheStore: UsageStore?
     private var storedClaude = ProviderUsage()
     private var storedCodex = ProviderUsage()
     private var fetching = false
@@ -11,8 +12,14 @@ final class UsageFetcher {
     private var refreshCompletions: [() -> Void] = []
     var onUpdate: (() -> Void)?
 
-    var claude: ProviderUsage { lock.holding { storedClaude } }
-    var codex: ProviderUsage { lock.holding { storedCodex } }
+    var claude: ProviderUsage { lock.holding { Self.discardingExpiredWindows(storedClaude) } }
+    var codex: ProviderUsage { lock.holding { Self.discardingExpiredWindows(storedCodex) } }
+
+    init(cacheStore: UsageStore? = nil) {
+        self.cacheStore = cacheStore
+        storedClaude = cacheStore?.cachedUsage(provider: "claude") ?? ProviderUsage()
+        storedCodex = cacheStore?.cachedUsage(provider: "codex") ?? ProviderUsage()
+    }
 
     func start() {
         refresh()
@@ -42,6 +49,12 @@ final class UsageFetcher {
             guard let self else { return }
             let claude = self.fetchClaude()
             let codex = self.fetchCodex()
+            if claude.error == nil || claude.primary.percent != nil || claude.weekly.percent != nil {
+                self.cacheStore?.cacheUsage(provider: "claude", usage: claude)
+            }
+            if codex.error == nil || codex.primary.percent != nil || codex.weekly.percent != nil {
+                self.cacheStore?.cacheUsage(provider: "codex", usage: codex)
+            }
             let completions = self.lock.holding { () -> [() -> Void] in
                 self.storedClaude = Self.keepLastGood(old: self.storedClaude, new: claude)
                 self.storedCodex = Self.keepLastGood(old: self.storedCodex, new: codex)
@@ -85,13 +98,29 @@ final class UsageFetcher {
         retained.primary = previousPrimary
         retained.weekly = previousWeekly
         retained.error = new.error
+        retained.isCached = true
         return retained
     }
 
+    private static func discardingExpiredWindows(_ usage: ProviderUsage,
+                                                  now: Date = Date()) -> ProviderUsage {
+        var value = usage
+        value.primary = value.primary.discardingIfExpired(at: now)
+        value.weekly = value.weekly.discardingIfExpired(at: now)
+        return value
+    }
+
     private func fetchClaude() -> ProviderUsage {
-        guard let token = Self.claudeToken() else {
-            return Self.cachedClaudeUsage()
-                ?? ProviderUsage(error: "未找到 Claude 登录凭据或可用的状态栏缓存")
+        let token: String
+        switch Self.claudeToken() {
+        case let .success(value):
+            token = value
+        case let .failure(error):
+            if var cached = Self.cachedClaudeUsage() {
+                cached.error = "\(error.localizedDescription)，显示状态栏缓存"
+                return cached
+            }
+            return ProviderUsage(error: error.localizedDescription)
         }
         var request = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
         request.timeoutInterval = 20
@@ -99,17 +128,23 @@ final class UsageFetcher {
         request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         guard let (data, status) = Self.request(request) else {
-            return Self.cachedClaudeUsage() ?? ProviderUsage(error: "Claude 用量请求失败")
+            return Self.claudeFallback(error: "Claude 用量请求失败")
         }
         guard status == 200 else {
-            return Self.cachedClaudeUsage() ?? ProviderUsage(error: "Claude 用量 HTTP \(status)")
+            return Self.claudeFallback(error: "Claude 用量 HTTP \(status)")
         }
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return Self.cachedClaudeUsage() ?? ProviderUsage(error: "Claude 用量响应解析失败")
+            return Self.claudeFallback(error: "Claude 用量响应解析失败")
         }
         let primary = Self.isoWindow(json["five_hour"])
         let weekly = Self.isoWindow(json["seven_day"])
         return ProviderUsage(primary: primary, weekly: weekly, fetchedAt: Date())
+    }
+
+    private static func claudeFallback(error: String) -> ProviderUsage {
+        guard var cached = cachedClaudeUsage() else { return ProviderUsage(error: error) }
+        cached.error = error
+        return cached
     }
 
     private static func cachedClaudeUsage(now: Date = Date()) -> ProviderUsage? {
@@ -117,23 +152,27 @@ final class UsageFetcher {
         guard let attributes = try? FileManager.default.attributesOfItem(atPath: file.path),
               let modified = attributes[.modificationDate] as? Date,
               now.timeIntervalSince(modified) >= 0,
-              now.timeIntervalSince(modified) <= 6 * 60 * 60,
               let data = FileManager.default.contents(atPath: file.path),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return nil
         }
-        return claudeStatuslineUsage(json, fetchedAt: modified)
+        guard var usage = claudeStatuslineUsage(json, fetchedAt: modified, now: now) else { return nil }
+        let hasResetTime = usage.primary.resetAt != nil || usage.weekly.resetAt != nil
+        guard hasResetTime || now.timeIntervalSince(modified) <= 6 * 60 * 60 else { return nil }
+        usage.isCached = true
+        return usage
     }
 
-    static func claudeStatuslineUsage(_ json: [String: Any], fetchedAt: Date) -> ProviderUsage? {
+    static func claudeStatuslineUsage(_ json: [String: Any], fetchedAt: Date,
+                                      now: Date = Date()) -> ProviderUsage? {
         guard let limits = json["rate_limits"] as? [String: Any] else { return nil }
-        let primary = statuslineWindow(limits["five_hour"])
-        let weekly = statuslineWindow(limits["seven_day"])
+        let primary = statuslineWindow(limits["five_hour"], now: now)
+        let weekly = statuslineWindow(limits["seven_day"], now: now)
         guard primary.percent != nil || weekly.percent != nil else { return nil }
-        return ProviderUsage(primary: primary, weekly: weekly, fetchedAt: fetchedAt)
+        return ProviderUsage(primary: primary, weekly: weekly, fetchedAt: fetchedAt, isCached: true)
     }
 
-    private static func statuslineWindow(_ value: Any?) -> UsageWindow {
+    private static func statuslineWindow(_ value: Any?, now: Date) -> UsageWindow {
         guard let object = value as? [String: Any] else { return UsageWindow() }
         let percent = (object["used_percentage"] as? NSNumber)?.doubleValue
         let resetAt = (object["resets_at"] as? NSNumber).map {
@@ -141,20 +180,24 @@ final class UsageFetcher {
         }
         return UsageWindow(
             percent: percent,
-            resetMinutes: resetAt.flatMap { Self.remainingMinutes(untilEpoch: $0.timeIntervalSince1970) },
+            resetMinutes: resetAt.flatMap {
+                Self.remainingMinutes(untilEpoch: $0.timeIntervalSince1970, now: now)
+            },
             resetAt: resetAt
-        ).discardingIfExpired()
+        ).discardingIfExpired(at: now)
     }
 
     /// 窗口已过期（resets_at <= now）时返回 nil，显示端渲染为 "—"。
-    private static func remainingMinutes(untilEpoch epoch: Double) -> Int? {
-        let seconds = epoch - Date().timeIntervalSince1970
+    private static func remainingMinutes(untilEpoch epoch: Double, now: Date = Date()) -> Int? {
+        let seconds = epoch - now.timeIntervalSince1970
         return seconds > 0 ? Int(seconds / 60) : nil
     }
 
     private func fetchCodex() -> ProviderUsage {
-        guard let credentials = Self.codexCredentials() else {
-            return ProviderUsage(error: "未找到 Codex 登录凭据")
+        let credentials: (token: String, account: String?)
+        switch Self.codexCredentials() {
+        case let .success(value): credentials = value
+        case let .failure(error): return ProviderUsage(error: error.localizedDescription)
         }
         var request = URLRequest(url: URL(string: "https://chatgpt.com/backend-api/wham/usage")!)
         request.timeoutInterval = 20
@@ -220,7 +263,30 @@ final class UsageFetcher {
         return codexWindows(converted)
     }
 
-    private static func claudeToken() -> String? {
+    private enum CredentialError: LocalizedError {
+        case claudeKeychainUnavailable
+        case claudeKeychain(Int32)
+        case invalidClaudeCredentials
+        case missingCodexFile
+        case invalidCodexCredentials
+
+        var errorDescription: String? {
+            switch self {
+            case .claudeKeychainUnavailable:
+                return "无法调用 macOS Keychain 读取 Claude 凭据"
+            case let .claudeKeychain(status):
+                return "Keychain 中未找到或无法访问 Claude 凭据（security \(status)）"
+            case .invalidClaudeCredentials:
+                return "Claude 凭据格式无效，请运行 claude 重新登录"
+            case .missingCodexFile:
+                return "未找到 ~/.codex/auth.json，请运行 codex 重新登录"
+            case .invalidCodexCredentials:
+                return "Codex 凭据格式无效，请运行 codex 重新登录"
+            }
+        }
+    }
+
+    private static func claudeToken() -> Result<String, CredentialError> {
         let file = ("~/.claude/.credentials.json" as NSString).expandingTildeInPath
         var data = FileManager.default.contents(atPath: file)
         if data == nil {
@@ -228,26 +294,33 @@ final class UsageFetcher {
             process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
             process.arguments = ["find-generic-password", "-s", "Claude Code-credentials", "-w"]
             let output = Pipe(); process.standardOutput = output; process.standardError = Pipe()
-            guard (try? process.run()) != nil else { return nil }
+            guard (try? process.run()) != nil else { return .failure(.claudeKeychainUnavailable) }
             process.waitUntilExit()
-            guard process.terminationStatus == 0 else { return nil }
+            guard process.terminationStatus == 0 else {
+                return .failure(.claudeKeychain(process.terminationStatus))
+            }
             data = output.fileHandleForReading.readDataToEndOfFile()
         }
         guard let data,
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let oauth = json["claudeAiOauth"] as? [String: Any] else { return nil }
-        return oauth["accessToken"] as? String
+              let oauth = json["claudeAiOauth"] as? [String: Any],
+              let token = oauth["accessToken"] as? String,
+              !token.isEmpty else { return .failure(.invalidClaudeCredentials) }
+        return .success(token)
     }
 
-    private static func codexCredentials() -> (token: String, account: String?)? {
+    private static func codexCredentials() -> Result<(token: String, account: String?), CredentialError> {
         let file = ("~/.codex/auth.json" as NSString).expandingTildeInPath
-        guard let data = FileManager.default.contents(atPath: file),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        guard let data = FileManager.default.contents(atPath: file) else {
+            return .failure(.missingCodexFile)
+        }
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let tokens = json["tokens"] as? [String: Any],
-              let token = tokens["access_token"] as? String else { return nil }
+              let token = tokens["access_token"] as? String,
+              !token.isEmpty else { return .failure(.invalidCodexCredentials) }
         var account = tokens["account_id"] as? String
         if account == nil, let jwt = tokens["id_token"] as? String { account = accountID(jwt: jwt) }
-        return (token, account)
+        return .success((token, account))
     }
 
     static func accountID(jwt: String) -> String? {

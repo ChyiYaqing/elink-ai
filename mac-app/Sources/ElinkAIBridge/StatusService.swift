@@ -38,8 +38,8 @@ final class StatusService {
             value.claude = overlay(value.claude, provider: "claude", usage: usage.claude)
             value.codex = overlay(value.codex, provider: "codex", usage: usage.codex)
             value.usageFetchedAt = Self.latestUsageFetchedAt(
-                claude: usage.claude.fetchedAt,
-                codex: usage.codex.fetchedAt
+                claude: value.claude.usageFetchedAt,
+                codex: value.codex.usageFetchedAt
             )
             return value
         }
@@ -73,6 +73,10 @@ final class StatusService {
         value.primary = usage.primary.percent == nil ? value.primary : usage.primary
         value.weekly = usage.weekly.percent == nil ? value.weekly : usage.weekly
         value.error = usage.error
+        if usage.primary.percent != nil || usage.weekly.percent != nil {
+            value.usageFetchedAt = usage.fetchedAt
+            value.usageCached = usage.isCached
+        }
         if let hook = hooks[provider] {
             let age = Date().timeIntervalSince(hook.at)
             if hook.state == "working", age < 600 { value.state = "working" }
@@ -142,12 +146,15 @@ final class StatusService {
         store?.record(day: today, provider: "codex", models: totals)
         let models = Self.sorted(totals)
         let windows = latestRateLimits.map(UsageFetcher.codexLogWindows)
+        let rateLimitDate = Self.timestamp(latestRateLimitsTimestamp)
         return AgentStatus(
             state: state(latest),
             tokensToday: models.reduce(0) { $0 + $1.tokens },
             modelUsageToday: models,
             primary: windows?.primary ?? UsageWindow(),
-            weekly: windows?.weekly ?? UsageWindow()
+            weekly: windows?.weekly ?? UsageWindow(),
+            usageFetchedAt: rateLimitDate,
+            usageCached: windows != nil
         )
     }
 
