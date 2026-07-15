@@ -38,6 +38,7 @@ struct UsagePanelView: View {
     @State private var clusterCode = ""
     @State private var clusterMessage: String?
     @State private var showClusterJoin = false
+    @State private var showClusterAdvanced = false
     @State private var showLeaveClusterConfirmation = false
 
     var body: some View {
@@ -323,39 +324,35 @@ struct UsagePanelView: View {
 
                     if cluster.enabled {
                         ForEach(cluster.nodes.prefix(6)) { node in
-                            HStack(spacing: 6) {
-                                Circle()
-                                    .fill(node.isOnline() ? theme.statusHealthy : theme.textTertiary)
-                                    .frame(width: 6, height: 6)
-                                VStack(alignment: .leading, spacing: 1) {
-                                    Text(node.name + (node.nodeID == cluster.nodeID ? " · 本机" : ""))
-                                        .font(.system(size: 10, weight: .semibold, design: .rounded))
-                                        .foregroundStyle(theme.textPrimary)
-                                    Text(node.isOnline()
-                                         ? "在线"
-                                         : node.lastSeenAt.map { "最后在线 \($0.formatted(date: .omitted, time: .shortened))" }
-                                            ?? "尚未同步")
-                                        .font(.system(size: 8, weight: .medium))
-                                        .foregroundStyle(theme.textTertiary)
-                                }
-                                Spacer()
-                            }
+                            clusterNodeRow(node, theme: theme)
                         }
 
                         if let code = cluster.pairingCode {
-                            HStack {
-                                Text("配对码")
-                                    .font(.system(size: 9, weight: .medium))
-                                    .foregroundStyle(theme.textTertiary)
+                            HStack(spacing: 8) {
+                                Image(systemName: "link.badge.plus")
+                                    .font(.system(size: 11, weight: .semibold))
+                                    .foregroundStyle(Color(red: 0.32, green: 0.58, blue: 0.96))
+                                    .frame(width: 24, height: 24)
+                                    .background(Circle().fill(Color.blue.opacity(theme.dark ? 0.18 : 0.09)))
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text("在另一台 Mac 输入配对码")
+                                        .font(.system(size: 9, weight: .semibold, design: .rounded))
+                                        .foregroundStyle(theme.textPrimary)
+                                    Text("两分钟内有效")
+                                        .font(.system(size: 8, weight: .medium))
+                                        .foregroundStyle(theme.textTertiary)
+                                }
                                 Spacer()
                                 Text(code)
                                     .font(.system(size: 16, weight: .bold, design: .monospaced))
                                     .foregroundStyle(theme.textPrimary)
                                     .textSelection(.enabled)
                             }
-                            Text("两分钟内在另一台 Mac 输入此配对码")
-                                .font(.system(size: 8, weight: .medium))
-                                .foregroundStyle(theme.textTertiary)
+                            .padding(8)
+                            .background(
+                                RoundedRectangle(cornerRadius: 9)
+                                    .fill(Color.blue.opacity(theme.dark ? 0.10 : 0.05))
+                            )
                         }
 
                         HStack(spacing: 8) {
@@ -401,36 +398,72 @@ struct UsagePanelView: View {
                             }
                         }
 
-                        Divider().opacity(0.4)
-
-                        HStack(spacing: 6) {
-                            TextField("已配对节点地址（VPN 兜底）", text: $clusterAddress)
-                                .textFieldStyle(.roundedBorder)
-                                .font(.system(size: 9, design: .monospaced))
-                            PillButton(title: "连接", icon: "link", theme: theme) {
-                                let address = clusterAddress
-                                clusterMessage = "正在连接 \(address)…"
-                                cluster.addManualEndpoint(address)
-                                cluster.syncAll { error in
-                                    if let error {
-                                        clusterMessage = "连接失败：\(error.localizedDescription)"
-                                    } else {
-                                        clusterMessage = "已连接并完成同步"
-                                        clusterAddress = ""
-                                    }
-                                }
-                            }
-                            .disabled(clusterAddress.isEmpty)
+                        if let message = clusterMessage ?? cluster.lastError {
+                            clusterFeedback(
+                                message,
+                                forceError: clusterMessage == nil && cluster.lastError != nil,
+                                theme: theme
+                            )
                         }
 
-                        Text("“连接”仅用于已完成配对的节点；添加新 Mac 请使用“添加 Mac”和配对码。")
-                            .font(.system(size: 8, weight: .medium))
-                            .foregroundStyle(theme.textTertiary)
+                        Divider().opacity(0.35)
 
-                        Button("离开同步集群") { showLeaveClusterConfirmation = true }
-                            .buttonStyle(.plain)
-                            .font(.system(size: 9, weight: .semibold))
-                            .foregroundStyle(theme.statusCritical)
+                        Button {
+                            withAnimation(.easeOut(duration: 0.2)) {
+                                showClusterAdvanced.toggle()
+                            }
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: "network")
+                                    .font(.system(size: 9, weight: .semibold))
+                                Text("高级连接")
+                                    .font(.system(size: 9, weight: .semibold, design: .rounded))
+                                Spacer()
+                                Text("VPN 手动地址")
+                                    .font(.system(size: 8, weight: .medium))
+                                    .foregroundStyle(theme.textTertiary)
+                                Image(systemName: "chevron.right")
+                                    .font(.system(size: 8, weight: .semibold))
+                                    .rotationEffect(.degrees(showClusterAdvanced ? 90 : 0))
+                            }
+                            .foregroundStyle(theme.textSecondary)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+
+                        if showClusterAdvanced {
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack(spacing: 6) {
+                                    TextField("已配对节点地址，例如 10.1.7.106:8765", text: $clusterAddress)
+                                        .textFieldStyle(.roundedBorder)
+                                        .font(.system(size: 9, design: .monospaced))
+                                    PillButton(title: "连接", icon: "link", theme: theme) {
+                                        let address = clusterAddress
+                                        clusterMessage = "正在连接 \(address)…"
+                                        cluster.addManualEndpoint(address)
+                                        cluster.syncAll { error in
+                                            if let error {
+                                                clusterMessage = "连接失败：\(error.localizedDescription)"
+                                            } else {
+                                                clusterMessage = "已连接并完成同步"
+                                                clusterAddress = ""
+                                            }
+                                        }
+                                    }
+                                    .disabled(clusterAddress.isEmpty)
+                                }
+                                Text("仅用于已经完成配对、但 Bonjour 无法发现的 VPN 节点。")
+                                    .font(.system(size: 8, weight: .medium))
+                                    .foregroundStyle(theme.textTertiary)
+                            }
+                            .transition(.opacity)
+                        }
+
+                        DestructiveButton(
+                            title: "离开同步集群",
+                            icon: "rectangle.portrait.and.arrow.right",
+                            theme: theme
+                        ) { showLeaveClusterConfirmation = true }
                     } else {
                         WideButton(title: "创建同步集群", icon: "plus.circle", theme: theme) {
                             cluster.createCluster()
@@ -442,10 +475,12 @@ struct UsagePanelView: View {
                         clusterJoinFields(theme, buttonTitle: "加入同步集群")
                     }
 
-                    if let message = clusterMessage ?? cluster.lastError {
-                        Text(message)
-                            .font(.system(size: 8, weight: .medium))
-                            .foregroundStyle(theme.statusWarning)
+                    if !cluster.enabled, let message = clusterMessage ?? cluster.lastError {
+                        clusterFeedback(
+                            message,
+                            forceError: clusterMessage == nil && cluster.lastError != nil,
+                            theme: theme
+                        )
                     }
                 }
                 .padding(.horizontal, 12)
@@ -461,6 +496,78 @@ struct UsagePanelView: View {
         } message: {
             Text("本机将停止同步；本地采集数据不会删除。重新加入需要新的配对码。")
         }
+    }
+
+    private func clusterNodeRow(_ node: ClusterNodeRecord, theme: PanelTheme) -> some View {
+        let local = node.nodeID == cluster.nodeID
+        let online = node.isOnline()
+        return HStack(spacing: 8) {
+            Image(systemName: local ? "laptopcomputer" : "desktopcomputer")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(online ? Color(red: 0.32, green: 0.58, blue: 0.96) : theme.textTertiary)
+                .frame(width: 26, height: 26)
+                .background(
+                    RoundedRectangle(cornerRadius: 7)
+                        .fill((online ? Color.blue : theme.textTertiary).opacity(theme.dark ? 0.16 : 0.08))
+                )
+            VStack(alignment: .leading, spacing: 1) {
+                HStack(spacing: 5) {
+                    Text(node.name)
+                        .font(.system(size: 10, weight: .semibold, design: .rounded))
+                        .foregroundStyle(theme.textPrimary)
+                        .lineLimit(1)
+                    if local {
+                        Text("本机")
+                            .font(.system(size: 7, weight: .bold, design: .rounded))
+                            .foregroundStyle(theme.textSecondary)
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 1)
+                            .background(Capsule().fill(theme.glassBackground))
+                    }
+                }
+                Text(local
+                     ? "本机节点"
+                     : node.lastSyncAt.map { "同步于 \($0.formatted(date: .omitted, time: .shortened))" }
+                        ?? (online ? "已连接，等待首次同步" : "尚未同步"))
+                    .font(.system(size: 8, weight: .medium))
+                    .foregroundStyle(theme.textTertiary)
+            }
+            Spacer(minLength: 6)
+            StateBadge(
+                text: online ? "在线" : "离线",
+                color: online ? theme.statusHealthy : theme.textTertiary
+            )
+        }
+        .padding(8)
+        .background(
+            RoundedRectangle(cornerRadius: 9)
+                .fill(theme.glassBackground.opacity(theme.dark ? 0.72 : 0.58))
+        )
+    }
+
+    private func clusterFeedback(_ message: String, forceError: Bool,
+                                 theme: PanelTheme) -> some View {
+        let failed = forceError || ["失败", "错误", "无法", "不属于", "尚无"]
+            .contains { message.contains($0) }
+        let working = message.contains("正在")
+        let color = failed
+            ? theme.statusCritical
+            : working ? Color(red: 0.32, green: 0.58, blue: 0.96) : theme.statusHealthy
+        let icon = failed ? "exclamationmark.circle.fill"
+            : working ? "arrow.triangle.2.circlepath" : "checkmark.circle.fill"
+        return HStack(spacing: 6) {
+            Image(systemName: icon)
+                .font(.system(size: 9, weight: .semibold))
+            Text(message)
+                .font(.system(size: 8, weight: .semibold, design: .rounded))
+                .lineLimit(3)
+            Spacer(minLength: 0)
+        }
+        .foregroundStyle(color)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(RoundedRectangle(cornerRadius: 8).fill(color.opacity(theme.dark ? 0.14 : 0.08)))
+        .accessibilityLabel(message)
     }
 
     @ViewBuilder
@@ -1016,6 +1123,38 @@ private struct WideButton: View {
         .buttonStyle(.plain)
         .animation(.easeOut(duration: 0.15), value: hovering)
         .onHover { hovering = $0 }
+    }
+}
+
+private struct DestructiveButton: View {
+    let title: String
+    let icon: String
+    let theme: PanelTheme
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 5) {
+                Image(systemName: icon)
+                    .font(.system(size: 9, weight: .semibold))
+                Text(title)
+                    .font(.system(size: 10, weight: .semibold, design: .rounded))
+            }
+            .foregroundStyle(hovering ? Color.white : theme.statusCritical)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 7)
+            .background(
+                Capsule().fill(
+                    hovering ? theme.statusCritical : theme.statusCritical.opacity(theme.dark ? 0.13 : 0.07)
+                )
+            )
+            .overlay(Capsule().stroke(theme.statusCritical.opacity(0.42), lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+        .animation(.easeOut(duration: 0.15), value: hovering)
+        .onHover { hovering = $0 }
+        .accessibilityHint("停止与其他 Mac 同步，本机历史数据会保留")
     }
 }
 

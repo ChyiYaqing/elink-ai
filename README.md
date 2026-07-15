@@ -125,12 +125,12 @@ Build an ad-hoc-signed DMG installer with:
 ```bash
 cd mac-app
 sh build-dmg.sh
-open .build/elink-ai-v0.1.4.dmg
+open .build/elink-ai-v0.1.5.dmg
 ```
 
 Pushing a `v*` tag runs the release workflow, creates the matching GitHub
 Release when needed, and uploads a versioned asset such as
-`elink-ai-v0.1.4.dmg`.
+`elink-ai-v0.1.5.dmg`.
 
 After copying it to `/Applications`, the example LaunchAgent in `install/` can
 start it at login.
