@@ -44,6 +44,7 @@ OAuth tokens and raw session logs never leave the Mac.
 - menu-bar device discovery, DHCP/bridge self-healing, and detailed quota/reset status
 - exact last-frame preview with page switching and smart/full refresh controls
 - restart-safe quota caching with per-provider freshness and fallback status
+- encrypted peer-to-peer usage aggregation across paired Macs on the same LAN/VPN
 - manual and periodic GitHub Release checks with direct access to the newest DMG
 
 The LCD-specific pet animation, music, and network graphs from `esp8266-ai`
@@ -91,6 +92,22 @@ Verify the bridge with:
 ```bash
 curl -s http://localhost:8765/v1/status | python3 -m json.tool
 ```
+
+### Sync usage across Macs
+
+Open Settings → Multi-Mac Sync on the first Mac and create a sync cluster.
+Choose “Add Mac” to show a six-digit code, then enter that code and the first
+Mac's address on another Mac. Bonjour discovers peers on a normal LAN; a manual
+`host:8765` address also works when a VPN does not forward multicast discovery.
+
+Each Mac keeps the latest per-node daily/model snapshots. The dashboard and
+`/v1/status` return the cluster-wide sum, while quota windows use the freshest
+observation because quota percentages are account-level values and must not be
+added together. Pairing and sync never transfer OAuth credentials or raw logs.
+The cluster secret is kept in Keychain when available. For non-interactive
+LaunchAgent or remote sessions where Keychain access is denied, it falls back
+to `~/Library/Application Support/ElinkAI/cluster-credentials-v2.json` with
+owner-only (`0600`) permissions and migrates back automatically later.
 
 Build an ad-hoc-signed menu-bar app bundle with:
 

@@ -8,6 +8,7 @@ final class StatusService {
 
     private let usage: UsageFetcher
     private let store: UsageStore?
+    private weak var cluster: ClusterManager?
     private let lock = NSLock()
     private var cached: BridgeSnapshot?
     private var cachedAt = Date.distantPast
@@ -19,12 +20,18 @@ final class StatusService {
     private static let codexRoot = URL(
         fileURLWithPath: ("~/.codex/sessions" as NSString).expandingTildeInPath)
 
-    init(usage: UsageFetcher, store: UsageStore? = nil) {
+    init(usage: UsageFetcher, store: UsageStore? = nil, cluster: ClusterManager? = nil) {
         self.usage = usage
         self.store = store
+        self.cluster = cluster
     }
 
     func snapshot() -> BridgeSnapshot {
+        let local = localSnapshotForSync()
+        return cluster?.aggregate(local: local) ?? local
+    }
+
+    func localSnapshotForSync() -> BridgeSnapshot {
         lock.holding {
             var value: BridgeSnapshot
             if let cached, Date().timeIntervalSince(cachedAt) < 5 {
@@ -262,12 +269,23 @@ final class StatusService {
         }
     }
 
-    static func dayKey(_ date: Date) -> String { dayFormatter.string(from: date) }
+    static func dayKey(_ date: Date) -> String {
+        dayFormatterLock.holding { dayFormatter.string(from: date) }
+    }
+
+    static func setAggregationTimeZone(_ identifier: String?) {
+        dayFormatterLock.holding {
+            dayFormatter.timeZone = identifier.flatMap(TimeZone.init(identifier:)) ?? .current
+        }
+    }
+
+    private static let dayFormatterLock = NSLock()
 
     private static let dayFormatter: DateFormatter = {
         let value = DateFormatter()
         value.calendar = Calendar(identifier: .gregorian)
         value.dateFormat = "yyyy-MM-dd"
+        value.timeZone = .current
         return value
     }()
 

@@ -95,12 +95,14 @@ struct UsageStatsView: View {
     let pet: [String]
     let accent: Color
     let theme: PanelTheme
+    let clusterNodes: [ClusterNodeRecord]
     let onBack: () -> Void
 
     @State private var range: StatsRange = .week
     @State private var rows: [DailyModelUsage] = []
     @State private var loaded = false
     @State private var hoveredBucket: String?
+    @State private var selectedNodeID = ""
 
     var body: some View {
         let buckets = UsageStats.buckets(rows: rows, range: range)
@@ -108,6 +110,7 @@ struct UsageStatsView: View {
         let colors = UsageStats.colors(for: order)
         return VStack(spacing: 10) {
             header
+            if clusterNodes.count > 1 { nodeFilter }
             if order.isEmpty {
                 emptyState
             } else {
@@ -122,6 +125,10 @@ struct UsageStatsView: View {
         .onChange(of: range) { value in
             Log.user("change \(provider) usage statistics range to \(value.rawValue)")
             hoveredBucket = nil
+        }
+        .onChange(of: selectedNodeID) { _ in
+            hoveredBucket = nil
+            load()
         }
     }
 
@@ -140,6 +147,26 @@ struct UsageStatsView: View {
             .pickerStyle(.segmented)
             .labelsHidden()
             .frame(width: 120)
+        }
+    }
+
+    private var nodeFilter: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "laptopcomputer.and.arrow.down")
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(theme.textTertiary)
+            Text("数据来源")
+                .font(.system(size: 9, weight: .medium))
+                .foregroundStyle(theme.textSecondary)
+            Spacer()
+            Picker("数据来源", selection: $selectedNodeID) {
+                Text("全部 Mac").tag("")
+                ForEach(clusterNodes) { node in
+                    Text(node.name).tag(node.nodeID)
+                }
+            }
+            .labelsHidden()
+            .frame(width: 150)
         }
     }
 
@@ -299,9 +326,14 @@ struct UsageStatsView: View {
         let since = StatusService.dayKey(
             Calendar.current.date(byAdding: .day, value: -366, to: Date()) ?? Date())
         let provider = provider
+        let nodeID = selectedNodeID.isEmpty ? nil : selectedNodeID
+        loaded = false
         DispatchQueue.global(qos: .userInitiated).async {
-            let result = UsageStore.shared.usage(provider: provider, since: since)
+            let result = nodeID.map {
+                UsageStore.shared.clusterUsage(provider: provider, since: since, nodeID: $0)
+            } ?? UsageStore.shared.usage(provider: provider, since: since)
             DispatchQueue.main.async {
+                guard nodeID == (selectedNodeID.isEmpty ? nil : selectedNodeID) else { return }
                 rows = result
                 loaded = true
             }

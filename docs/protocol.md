@@ -11,6 +11,10 @@ zero. Each provider may also include `model_usage_today`, sorted by descending
 token count, as objects containing `model` and `tokens`. See
 `fixtures/status-v1.json` for the complete shape.
 
+When Multi-Mac Sync is enabled, token/model fields contain the sum of all known
+node snapshots. The additive `cluster` object reports `enabled`, `node_count`,
+`online_count`, and `last_synced_at`. Existing v1 clients may ignore it.
+
 `POST /v1/event` accepts:
 
 ```json
@@ -30,3 +34,43 @@ lifecycle event arrives.
 - `PUT /v1/config/bridge` with `{"bridge_url":"http://host:8765"}`
 
 No endpoint accepts or returns OAuth tokens or raw session logs.
+
+## Mac peer sync protocol v2
+
+Mac bridges advertise `_elink-ai._tcp` over Bonjour. TXT records contain only
+protocol version, node ID, cluster ID, and whether a two-minute pairing window
+is open. VPN deployments may configure a peer address manually.
+
+Pairing uses `POST /v2/cluster/pair/join`. A six-digit code authenticates an
+ephemeral Curve25519 key agreement; the responder encrypts the cluster ID,
+timezone, and random 256-bit cluster secret with AES-GCM. Pairing attempts are
+limited to five per window.
+
+After pairing, peer traffic uses these endpoints:
+
+- `GET /v2/cluster/manifest` returns known `(origin_node_id, day, provider)`
+  snapshot revisions and the sender's live provider state.
+- `POST /v2/cluster/pull` returns up to 200 requested complete snapshots.
+- `POST /v2/cluster/announce` asks a peer to reconcile immediately after local
+  data changes; a full manifest comparison still runs every 15 seconds.
+
+Every request carries the node ID, epoch timestamp, random nonce, and an
+HMAC-SHA256 signature over method, path, timestamp, nonce, and body hash.
+Requests outside a 60-second clock window or with a replayed nonce are rejected.
+Sync request and response JSON is encrypted with AES-GCM using purpose-specific
+keys derived from the cluster secret.
+
+The cluster secret is stored in macOS Keychain. If Keychain rejects access in a
+non-interactive login session, the bridge persists the same credential under
+its user Application Support directory with `0600` permissions. That fallback
+remains authoritative across restarts and is migrated back to Keychain when it
+becomes available, avoiding an accidental node identity change.
+
+The first protocol version uses one shared secret for the cluster and does not
+support individual-node revocation. To exclude a previously trusted Mac,
+create a new cluster and pair the remaining Macs again.
+
+Snapshots are absolute, not deltas. Receivers replace a source/day/provider
+only when its revision increases, so retries, relay through another Mac, and
+out-of-order delivery are idempotent. Offline nodes' last synchronized values
+remain part of aggregate history.

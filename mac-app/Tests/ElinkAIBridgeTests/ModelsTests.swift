@@ -16,6 +16,9 @@ final class ModelsTests: XCTestCase {
         let models = try XCTUnwrap(claude["model_usage_today"] as? [[String: Any]])
         XCTAssertEqual(models.first?["model"] as? String, "claude-sonnet")
         XCTAssertEqual(models.first?["tokens"] as? Int, 1200)
+        let cluster = try XCTUnwrap(object["cluster"] as? [String: Any])
+        XCTAssertEqual(cluster["enabled"] as? Bool, false)
+        XCTAssertEqual(cluster["node_count"] as? Int, 1)
     }
 
     func testSnapshotUsesLatestProviderUsageUpdate() {

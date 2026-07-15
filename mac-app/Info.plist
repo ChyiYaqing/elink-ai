@@ -14,6 +14,10 @@
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>LSUIElement</key><true/>
   <key>NSLocalNetworkUsageDescription</key>
-  <string>发现并控制同一局域网内的 elink 电子墨水屏。</string>
+  <string>发现同一局域网内的 Elink AI Mac 节点和电子墨水屏，并安全同步用量。</string>
+  <key>NSBonjourServices</key>
+  <array>
+    <string>_elink-ai._tcp</string>
+  </array>
 </dict>
 </plist>

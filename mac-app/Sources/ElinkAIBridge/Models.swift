@@ -1,6 +1,6 @@
 import Foundation
 
-struct UsageWindow: Equatable {
+struct UsageWindow: Codable, Equatable {
     var percent: Double?
     var resetMinutes: Int?
     var resetAt: Date?
@@ -14,7 +14,7 @@ struct UsageWindow: Equatable {
     }
 }
 
-struct ProviderUsage {
+struct ProviderUsage: Codable, Equatable {
     var primary = UsageWindow()
     var weekly = UsageWindow()
     var error: String?
@@ -22,12 +22,12 @@ struct ProviderUsage {
     var isCached = false
 }
 
-struct ModelUsage: Equatable {
+struct ModelUsage: Codable, Equatable {
     var model: String
     var tokens: Int
 }
 
-struct AgentStatus {
+struct AgentStatus: Codable, Equatable {
     var state = "offline"
     var tokensToday = 0
     var modelUsageToday: [ModelUsage] = []
@@ -39,11 +39,19 @@ struct AgentStatus {
     var usageCached = false
 }
 
-struct BridgeSnapshot {
+struct ClusterSummary: Codable, Equatable {
+    var enabled = false
+    var nodeCount = 1
+    var onlineCount = 1
+    var lastSyncedAt: Date?
+}
+
+struct BridgeSnapshot: Codable {
     var claude = AgentStatus()
     var codex = AgentStatus()
     var generatedAt = Date()
     var usageFetchedAt: Date?
+    var cluster = ClusterSummary()
 
     func jsonData() -> Data {
         func nullable(_ value: Any?) -> Any { value ?? NSNull() }
@@ -73,6 +81,12 @@ struct BridgeSnapshot {
             "schema_version": 1,
             "generated_at": Int(generatedAt.timeIntervalSince1970),
             "usage_fetched_at": nullable(usageFetchedAt.map { Int($0.timeIntervalSince1970) }),
+            "cluster": [
+                "enabled": cluster.enabled,
+                "node_count": cluster.nodeCount,
+                "online_count": cluster.onlineCount,
+                "last_synced_at": nullable(cluster.lastSyncedAt.map { Int($0.timeIntervalSince1970) }),
+            ],
             "claude": provider(claude, claude: true),
             "codex": provider(codex, claude: false),
         ]

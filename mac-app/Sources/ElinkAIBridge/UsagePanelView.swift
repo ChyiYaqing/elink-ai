@@ -30,8 +30,14 @@ final class PanelModel: ObservableObject {
 struct UsagePanelView: View {
     @ObservedObject var model: PanelModel
     @ObservedObject var updater: UpdateChecker
+    @ObservedObject var cluster: ClusterManager
     @Environment(\.colorScheme) private var scheme
     @State private var updatesExpanded = false
+    @State private var clusterExpanded = false
+    @State private var clusterAddress = ""
+    @State private var clusterCode = ""
+    @State private var clusterMessage: String?
+    @State private var showLeaveClusterConfirmation = false
 
     var body: some View {
         let theme = PanelTheme(scheme)
@@ -95,6 +101,13 @@ struct UsagePanelView: View {
                     .foregroundStyle(theme.textTertiary)
             }
             Spacer()
+            if cluster.enabled {
+                StateBadge(
+                    text: "\(max(1, cluster.nodes.filter { $0.isOnline() }.count))/\(max(1, cluster.nodes.count)) 台",
+                    color: cluster.nodes.allSatisfy { $0.isOnline() }
+                        ? theme.statusHealthy : theme.statusWarning
+                )
+            }
             PillButton(title: model.refreshingUsage ? "刷新中" : "刷新",
                        icon: "arrow.clockwise", theme: theme) {
                 model.onRefreshAll?()
@@ -173,6 +186,7 @@ struct UsagePanelView: View {
             accent: claude ? PanelTheme.claudeColor(dark: theme.dark)
                            : PanelTheme.codexColor(dark: theme.dark),
             theme: theme,
+            clusterNodes: cluster.enabled ? cluster.nodes : [],
             onBack: {
                 Log.user("close \(claude ? "Claude" : "Codex") usage statistics")
                 withAnimation(.easeOut(duration: 0.2)) { model.statsProvider = nil }
@@ -199,6 +213,7 @@ struct UsagePanelView: View {
                 VStack(spacing: 10) {
                     deviceSettings(theme)
                     launchSettings(theme)
+                    clusterSettings(theme)
                     logSettings(theme)
                     updateSettings(theme)
                     aboutSettings(theme)
@@ -271,6 +286,182 @@ struct UsagePanelView: View {
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
         .glassCard(theme)
+    }
+
+    private func clusterSettings(_ theme: PanelTheme) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+                withAnimation(.easeOut(duration: 0.2)) {
+                    clusterExpanded.toggle()
+                }
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(theme.textTertiary)
+                        .rotationEffect(.degrees(clusterExpanded ? 90 : 0))
+                    settingsHeader(
+                        theme,
+                        icon: "macbook.and.iphone",
+                        color: Color(red: 0.32, green: 0.58, blue: 0.96),
+                        title: "多机同步",
+                        subtitle: cluster.enabled
+                            ? "\(max(1, cluster.nodes.filter { $0.isOnline() }.count))/\(max(1, cluster.nodes.count)) 台在线"
+                            : "独立模式 · 本机数据不会广播"
+                    )
+                }
+                .padding(12)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityValue(clusterExpanded ? "已展开" : "已折叠")
+
+            if clusterExpanded {
+                VStack(alignment: .leading, spacing: 9) {
+
+                    if cluster.enabled {
+                        ForEach(cluster.nodes.prefix(6)) { node in
+                            HStack(spacing: 6) {
+                                Circle()
+                                    .fill(node.isOnline() ? theme.statusHealthy : theme.textTertiary)
+                                    .frame(width: 6, height: 6)
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(node.name + (node.nodeID == cluster.nodeID ? " · 本机" : ""))
+                                        .font(.system(size: 10, weight: .semibold, design: .rounded))
+                                        .foregroundStyle(theme.textPrimary)
+                                    Text(node.isOnline()
+                                         ? "在线"
+                                         : node.lastSeenAt.map { "最后在线 \($0.formatted(date: .omitted, time: .shortened))" }
+                                            ?? "尚未同步")
+                                        .font(.system(size: 8, weight: .medium))
+                                        .foregroundStyle(theme.textTertiary)
+                                }
+                                Spacer()
+                            }
+                        }
+
+                        if let code = cluster.pairingCode {
+                            HStack {
+                                Text("配对码")
+                                    .font(.system(size: 9, weight: .medium))
+                                    .foregroundStyle(theme.textTertiary)
+                                Spacer()
+                                Text(code)
+                                    .font(.system(size: 16, weight: .bold, design: .monospaced))
+                                    .foregroundStyle(theme.textPrimary)
+                                    .textSelection(.enabled)
+                            }
+                            Text("两分钟内在另一台 Mac 输入此配对码")
+                                .font(.system(size: 8, weight: .medium))
+                                .foregroundStyle(theme.textTertiary)
+                        }
+
+                        HStack(spacing: 6) {
+                            TextField("已配对节点地址（VPN 兜底）", text: $clusterAddress)
+                                .textFieldStyle(.roundedBorder)
+                                .font(.system(size: 9, design: .monospaced))
+                            PillButton(title: "连接", icon: "link", theme: theme) {
+                                let address = clusterAddress
+                                clusterMessage = "正在连接 \(address)…"
+                                cluster.addManualEndpoint(address)
+                                cluster.syncAll { error in
+                                    if let error {
+                                        clusterMessage = "连接失败：\(error.localizedDescription)"
+                                    } else {
+                                        clusterMessage = "已连接并完成同步"
+                                        clusterAddress = ""
+                                    }
+                                }
+                            }
+                            .disabled(clusterAddress.isEmpty)
+                        }
+
+                        Text("添加新 Mac：点击“添加 Mac”生成配对码，再到新 Mac 输入本机地址和配对码。")
+                            .font(.system(size: 8, weight: .medium))
+                            .foregroundStyle(theme.textTertiary)
+
+                        HStack(spacing: 8) {
+                            PillButton(
+                                title: cluster.syncing ? "同步中" : "立即同步",
+                                icon: "arrow.triangle.2.circlepath",
+                                theme: theme
+                            ) {
+                                clusterMessage = "正在同步…"
+                                cluster.syncAll { error in
+                                    clusterMessage = error.map { "同步失败：\($0.localizedDescription)" }
+                                        ?? "同步完成"
+                                }
+                            }
+                            .disabled(cluster.syncing)
+                            PillButton(
+                                title: cluster.pairingCode == nil ? "添加 Mac" : "停止配对",
+                                icon: cluster.pairingCode == nil ? "plus" : "xmark",
+                                theme: theme
+                            ) {
+                                if cluster.pairingCode == nil { cluster.startPairing() }
+                                else { cluster.stopPairing() }
+                            }
+                        }
+
+                        Button("离开同步集群") { showLeaveClusterConfirmation = true }
+                            .buttonStyle(.plain)
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundStyle(theme.statusCritical)
+                    } else {
+                        WideButton(title: "创建同步集群", icon: "plus.circle", theme: theme) {
+                            cluster.createCluster()
+                            clusterMessage = "同步集群已创建，可在此生成配对码"
+                        }
+
+                        Divider().opacity(0.4)
+
+                        TextField("另一台 Mac 地址，例如 macbook.local:8765", text: $clusterAddress)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(size: 10, design: .monospaced))
+                        TextField("6 位配对码", text: $clusterCode)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(size: 10, design: .monospaced))
+                        Text("先在已有集群的 Mac 点击“添加 Mac”，再将它显示的 6 位配对码填到本机。")
+                            .font(.system(size: 8, weight: .medium))
+                            .foregroundStyle(theme.textTertiary)
+                        if let peer = cluster.discoveredPeers.first(where: { $0.pairable }) {
+                            Button("使用已发现的 \(peer.name)") { clusterAddress = peer.endpoint }
+                                .buttonStyle(.plain)
+                                .font(.system(size: 9, weight: .semibold))
+                                .foregroundStyle(theme.textSecondary)
+                        }
+                        WideButton(title: "加入同步集群", icon: "link.badge.plus", theme: theme) {
+                            model.busy = true
+                            clusterMessage = "正在安全配对…"
+                            cluster.joinCluster(endpoint: clusterAddress, code: clusterCode) { error in
+                                model.busy = false
+                                clusterMessage = error.map { "配对失败：\($0.localizedDescription)" }
+                                    ?? "配对成功，正在同步其他 Mac 的历史用量"
+                            }
+                        }
+                        .disabled(model.busy)
+                    }
+
+                    if let message = clusterMessage ?? cluster.lastError {
+                        Text(message)
+                            .font(.system(size: 8, weight: .medium))
+                            .foregroundStyle(theme.statusWarning)
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.bottom, 12)
+                .transition(.opacity)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .glassCard(theme)
+        .alert("离开同步集群？", isPresented: $showLeaveClusterConfirmation) {
+            Button("取消", role: .cancel) {}
+            Button("离开", role: .destructive) { cluster.leaveCluster() }
+        } message: {
+            Text("本机将停止同步；本地采集数据不会删除。重新加入需要新的配对码。")
+        }
     }
 
     private func logSettings(_ theme: PanelTheme) -> some View {

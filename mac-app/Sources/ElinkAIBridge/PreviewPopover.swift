@@ -6,6 +6,7 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
     private let model = PanelModel()
     private let status: StatusService
     private let usage: UsageFetcher
+    private let cluster: ClusterManager
     private let updater = UpdateChecker()
     private let port: UInt16
     private var pollTimer: Timer?
@@ -14,9 +15,10 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
     private var loadingSnapshot = false
     private var actionInFlight = false
 
-    init(status: StatusService, usage: UsageFetcher, port: UInt16) {
+    init(status: StatusService, usage: UsageFetcher, cluster: ClusterManager, port: UInt16) {
         self.status = status
         self.usage = usage
+        self.cluster = cluster
         self.port = port
         super.init()
         model.onSetMode = { [weak self] mode in
@@ -94,7 +96,9 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
             Log.user("open device status page \(base.appendingPathComponent("v1/device").absoluteString)")
             NSWorkspace.shared.open(base.appendingPathComponent("v1/device"))
         }
-        let hosting = NSHostingController(rootView: UsagePanelView(model: model, updater: updater))
+        let hosting = NSHostingController(
+            rootView: UsagePanelView(model: model, updater: updater, cluster: cluster)
+        )
         hosting.sizingOptions = .preferredContentSize
         popover.contentViewController = hosting
         popover.behavior = .transient

@@ -4,24 +4,27 @@ let port: UInt16 = 8765
 Log.info("application v\(AppInfo.version) launching")
 let usageStore = UsageStore.shared
 let usage = UsageFetcher(cacheStore: usageStore)
-let status = StatusService(usage: usage, store: usageStore)
-let server = HTTPServer(port: port, get: [
-    "/": { ("application/json", status.snapshot().jsonData()) },
-    "/v1/status": { ("application/json", status.snapshot().jsonData()) },
-    "/v1/health": { ("application/json", Data("{\"ok\":true,\"schema_version\":1}".utf8)) },
-], post: [
-    "/v1/event": { body in
-        guard let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+let cluster = ClusterManager(store: usageStore)
+let status = StatusService(usage: usage, store: usageStore, cluster: cluster)
+cluster.localStatusProvider = { status.localSnapshotForSync() }
+var routes = cluster.routes()
+routes[HTTPRouteKey("GET", "/")] = { _ in .json(status.snapshot().jsonData()) }
+routes[HTTPRouteKey("GET", "/v1/status")] = { _ in .json(status.snapshot().jsonData()) }
+routes[HTTPRouteKey("GET", "/v1/health")] = { _ in
+    .json(Data("{\"ok\":true,\"schema_version\":1}".utf8))
+}
+routes[HTTPRouteKey("POST", "/v1/event")] = { request in
+        guard let object = try? JSONSerialization.jsonObject(with: request.body) as? [String: Any],
               let agent = object["agent"] as? String, let event = object["event"] as? String else {
-            return Data("{\"ok\":false}".utf8)
+            return .json(Data("{\"ok\":false}".utf8), status: 400)
         }
         status.recordEvent(agent: agent, event: event, message: object["message"] as? String)
         if ["Notification", "SessionStart", "SessionEnd", "Stop"].contains(event) {
             Log.info("hook \(agent): \(event)")
         }
-        return Data("{\"ok\":true}".utf8)
-    },
-])
+        return .json(Data("{\"ok\":true}".utf8))
+}
+let server = HTTPServer(port: port, routes: routes)
 server.onRequest = { path, ip in
     guard path == "/v1/status", !["127.0.0.1", "::1", ""].contains(ip) else { return }
     DeviceClient.recordDevicePoll(ip: ip)
@@ -40,6 +43,7 @@ Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { _ in
 }
 do {
     try server.start()
+    cluster.start(port: port)
     Log.info("bridge v\(AppInfo.version) started on port \(port)")
 } catch {
     Log.error("server start failed: \(error.localizedDescription)", category: "server")
@@ -49,7 +53,7 @@ do {
 
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
-let menu = MenuBarController(usage: usage, status: status, port: port)
+let menu = MenuBarController(usage: usage, status: status, cluster: cluster, port: port)
 _ = menu
 usage.start()
 app.run()
