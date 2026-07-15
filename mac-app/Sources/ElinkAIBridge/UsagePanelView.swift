@@ -41,6 +41,14 @@ struct UsagePanelView: View {
     @State private var showClusterAdvanced = false
     @State private var showLeaveClusterConfirmation = false
 
+    init(model: PanelModel, updater: UpdateChecker, cluster: ClusterManager,
+         initialClusterExpanded: Bool = false) {
+        self.model = model
+        self.updater = updater
+        self.cluster = cluster
+        _clusterExpanded = State(initialValue: initialClusterExpanded)
+    }
+
     var body: some View {
         let theme = PanelTheme(scheme)
         VStack(spacing: 12) {
