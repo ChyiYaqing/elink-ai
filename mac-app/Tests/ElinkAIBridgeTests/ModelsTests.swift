@@ -384,6 +384,13 @@ final class ModelsTests: XCTestCase {
         XCTAssertEqual(windows.weekly.percent, 18)
     }
 
+    func testClaudeTokenFromShellOutputExtractsToken() {
+        let noisy = "p10k banner\nELINK_TOKEN<sk-ant-oat01-abc123>\n"
+        XCTAssertEqual(UsageFetcher.claudeTokenFromShellOutput(noisy), "sk-ant-oat01-abc123")
+        XCTAssertNil(UsageFetcher.claudeTokenFromShellOutput("ELINK_TOKEN<>"))
+        XCTAssertNil(UsageFetcher.claudeTokenFromShellOutput("no marker here"))
+    }
+
     func testUsageLevelThresholdsFollowRemainingPercent() {
         XCTAssertEqual(UsageLevel.level(usedPercent: 10), .healthy)
         XCTAssertEqual(UsageLevel.level(usedPercent: 50), .healthy)

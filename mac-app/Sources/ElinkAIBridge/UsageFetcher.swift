@@ -291,6 +291,10 @@ final class UsageFetcher {
     }
 
     private static func claudeToken() -> Result<String, CredentialError> {
+        if let token = ProcessInfo.processInfo.environment["CLAUDE_CODE_OAUTH_TOKEN"],
+           !token.isEmpty {
+            return .success(token)
+        }
         let file = ("~/.claude/.credentials.json" as NSString).expandingTildeInPath
         var data = FileManager.default.contents(atPath: file)
         if data == nil {
@@ -298,9 +302,13 @@ final class UsageFetcher {
             process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
             process.arguments = ["find-generic-password", "-s", "Claude Code-credentials", "-w"]
             let output = Pipe(); process.standardOutput = output; process.standardError = Pipe()
-            guard (try? process.run()) != nil else { return .failure(.claudeKeychainUnavailable) }
+            guard (try? process.run()) != nil else {
+                if let token = loginShellClaudeToken() { return .success(token) }
+                return .failure(.claudeKeychainUnavailable)
+            }
             process.waitUntilExit()
             guard process.terminationStatus == 0 else {
+                if let token = loginShellClaudeToken() { return .success(token) }
                 return .failure(.claudeKeychain(process.terminationStatus))
             }
             data = output.fileHandleForReading.readDataToEndOfFile()
@@ -311,6 +319,40 @@ final class UsageFetcher {
               let token = oauth["accessToken"] as? String,
               !token.isEmpty else { return .failure(.invalidClaudeCredentials) }
         return .success(token)
+    }
+
+    // The menu-bar app launched via LaunchAgent does not inherit shell
+    // exports, so CLAUDE_CODE_OAUTH_TOKEN set in ~/.zshrc must be resolved
+    // through an interactive login shell.
+    private static func loginShellClaudeToken() -> String? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        process.arguments = ["-lic", "printf 'ELINK_TOKEN<%s>' \"$CLAUDE_CODE_OAUTH_TOKEN\""]
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = Pipe()
+        process.standardInput = FileHandle.nullDevice
+        guard (try? process.run()) != nil else { return nil }
+        let deadline = Date().addingTimeInterval(10)
+        while process.isRunning && Date() < deadline { usleep(100_000) }
+        if process.isRunning {
+            process.terminate()
+            return nil
+        }
+        guard process.terminationStatus == 0,
+              let text = String(data: output.fileHandleForReading.readDataToEndOfFile(),
+                                encoding: .utf8) else { return nil }
+        return claudeTokenFromShellOutput(text)
+    }
+
+    static func claudeTokenFromShellOutput(_ text: String) -> String? {
+        guard let start = text.range(of: "ELINK_TOKEN<"),
+              let end = text.range(of: ">", range: start.upperBound..<text.endIndex) else {
+            return nil
+        }
+        let token = String(text[start.upperBound..<end.lowerBound])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return token.isEmpty ? nil : token
     }
 
     private static func codexCredentials() -> Result<(token: String, account: String?), CredentialError> {
