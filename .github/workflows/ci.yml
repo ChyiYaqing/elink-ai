@@ -2,22 +2,41 @@ name: CI
 
 on:
   push:
-  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  python:
-    runs-on: ubuntu-latest
+  test:
+    runs-on: [self-hosted, macOS, ARM64, elink-ci]
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
-      - run: pip install -e '.[test]'
-      - run: pytest -q
 
-  macos:
-    runs-on: macos-14
-    steps:
-      - uses: actions/checkout@v4
-      - run: swift test
+      - name: Show toolchain versions
+        run: |
+          python --version
+          swift --version
+
+      - name: Test Python agent
+        run: |
+          VENV="$RUNNER_TEMP/elink-ai-venv-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          trap 'rm -rf "$VENV"' EXIT
+          python -m venv "$VENV"
+          "$VENV/bin/python" -m pip install -e '.[test]'
+          "$VENV/bin/python" -m pytest -q
+
+      - name: Test macOS app
+        run: swift test
         working-directory: mac-app
