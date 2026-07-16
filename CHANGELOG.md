@@ -6,6 +6,16 @@ and `Removed`.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## 0.1.8
+
+### Added
+
+- Setting to disable the e-paper device connection entirely
+
+### Fixed
+
+- Multi-Mac Sync feedback keeping a stale "sync failed" message after the underlying error had actually recovered
+
 ## 0.1.7
 
 ### Fixed
