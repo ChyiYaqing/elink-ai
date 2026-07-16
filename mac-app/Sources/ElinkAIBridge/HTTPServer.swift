@@ -57,6 +57,25 @@ final class HTTPServer {
         parameters.allowLocalEndpointReuse = true
         let listener = try NWListener(using: parameters, on: port)
         listener.newConnectionHandler = { [weak self] in self?.accept($0) }
+        // Port conflicts surface asynchronously as a .failed state, e.g. when
+        // an old bridge instance still holds the port during a restart. Retry
+        // instead of leaving the app running without an HTTP server.
+        listener.stateUpdateHandler = { [weak self] state in
+            guard let self else { return }
+            switch state {
+            case .ready:
+                Log.info("HTTP 服务已监听端口 \(self.port.rawValue)", category: "app")
+            case let .failed(error):
+                Log.error("HTTP 端口 \(self.port.rawValue) 监听失败：\(error)，5 秒后重试", category: "app")
+                self.listener?.cancel()
+                self.listener = nil
+                self.queue.asyncAfter(deadline: .now() + 5) { [weak self] in
+                    try? self?.start()
+                }
+            default:
+                break
+            }
+        }
         listener.start(queue: queue)
         self.listener = listener
     }
