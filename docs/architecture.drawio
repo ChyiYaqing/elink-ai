@@ -1,0 +1,132 @@
+<mxfile host="app.diagrams.net" agent="elink-ai" version="24.7.0">
+  <diagram name="Architecture" id="elink-ai-architecture">
+    <mxGraphModel dx="1400" dy="800" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1400" pageHeight="720" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <mxCell id="grp-cli" value="CLI tools (Mac)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;opacity=60;verticalAlign=top;fontStyle=1;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="40" y="200" width="220" height="230" as="geometry" />
+        </mxCell>
+        <mxCell id="grp-mac" value="mac-app — macOS menu-bar bridge (:8765)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;opacity=60;verticalAlign=top;fontStyle=1;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="340" y="40" width="470" height="520" as="geometry" />
+        </mxCell>
+        <mxCell id="grp-peer" value="Paired Mac(s), optional" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;dashed=1;opacity=80;verticalAlign=top;fontStyle=1;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="40" y="490" width="220" height="130" as="geometry" />
+        </mxCell>
+        <mxCell id="grp-pi" value="elink-agent — Raspberry Pi (:8766)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;opacity=60;verticalAlign=top;fontStyle=1;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="890" y="40" width="290" height="620" as="geometry" />
+        </mxCell>
+
+        <mxCell id="claude" value="Claude Code" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="70" y="260" width="160" height="44" as="geometry" />
+        </mxCell>
+        <mxCell id="codex" value="Codex" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="70" y="340" width="160" height="44" as="geometry" />
+        </mxCell>
+
+        <mxCell id="hooks" value="POST /v1/event" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="370" y="110" width="180" height="44" as="geometry" />
+        </mxCell>
+        <mxCell id="fetcher" value="UsageFetcher&lt;br&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;credentials + JSONL + quota&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="370" y="190" width="180" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="status" value="StatusService&lt;br&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;GET /v1/status&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="600" y="140" width="180" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="ui" value="MenuBarController /&lt;br&gt;UsagePanelView" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="370" y="310" width="180" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="store" value="usage.db&lt;br&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;SQLite, 0600&lt;/font&gt;" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=15;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="615" y="280" width="150" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="cluster" value="ClusterManager&lt;br&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;Bonjour discovery + AES-GCM sync&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="370" y="440" width="200" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="deviceclient" value="DeviceClient" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="630" y="450" width="140" height="50" as="geometry" />
+        </mxCell>
+
+        <mxCell id="peer" value="mac-app bridge" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="70" y="545" width="160" height="50" as="geometry" />
+        </mxCell>
+
+        <mxCell id="bridgeclient" value="bridge_client&lt;br&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;polls /v1/status&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#d79b00;" vertex="1" parent="1">
+          <mxGeometry x="920" y="110" width="220" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="api" value="/v1/device, /v1/display/*,&lt;br&gt;/v1/config/bridge" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#d79b00;" vertex="1" parent="1">
+          <mxGeometry x="920" y="230" width="220" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="renderer" value="renderer&lt;br&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;1-bit dashboard&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#d79b00;" vertex="1" parent="1">
+          <mxGeometry x="920" y="340" width="220" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="refresh" value="refresh_policy&lt;br&gt;&lt;font style=&quot;font-size: 10px;&quot;&gt;smart / partial / full&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#d79b00;" vertex="1" parent="1">
+          <mxGeometry x="920" y="440" width="220" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="panel" value="Waveshare 5.83&quot; V2&lt;br&gt;e-paper (SPI/GPIO)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;" vertex="1" parent="1">
+          <mxGeometry x="920" y="550" width="220" height="70" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e-claude-hooks" value="hook events" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=9;exitX=1;exitY=0.5;entryX=0;entryY=0.25;" edge="1" parent="1" source="claude" target="hooks">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e-codex-hooks" value="hook events" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=9;exitX=1;exitY=0.5;entryX=0;entryY=0.75;" edge="1" parent="1" source="codex" target="hooks">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e-hooks-status" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;exitX=1;exitY=0.5;entryX=0;entryY=0.25;" edge="1" parent="1" source="hooks" target="status">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e-fetcher-status" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;exitX=1;exitY=0.5;entryX=0;entryY=0.75;" edge="1" parent="1" source="fetcher" target="status">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e-status-store" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;exitX=0.75;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="status" target="store">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e-status-ui" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;exitX=0.25;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="status" target="ui">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="645" y="285" />
+              <mxPoint x="460" y="285" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e-cluster-store" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;startArrow=classic;startFill=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="cluster" target="store">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e-cluster-peer" value="v2 encrypted sync&lt;br&gt;LAN / VPN" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=9;startArrow=classic;startFill=1;exitX=0;exitY=0.5;entryX=1;entryY=0.5;" edge="1" parent="1" source="cluster" target="peer">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="300" y="475" />
+              <mxPoint x="300" y="570" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e-bridgeclient-status" value="GET /v1/status" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=9;exitX=0;exitY=0.5;entryX=1;entryY=0.5;" edge="1" parent="1" source="bridgeclient" target="status">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="850" y="135" />
+              <mxPoint x="850" y="170" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e-deviceclient-api" value="mode / refresh / config" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=9;exitX=1;exitY=0.5;entryX=0;entryY=0.5;" edge="1" parent="1" source="deviceclient" target="api">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="850" y="475" />
+              <mxPoint x="850" y="260" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e-api-renderer" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="api" target="renderer">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e-renderer-refresh" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="renderer" target="refresh">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e-refresh-panel" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="refresh" target="panel">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
