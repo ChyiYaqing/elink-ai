@@ -6,6 +6,18 @@ and `Removed`.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## 0.1.10
+
+### Packaging
+
+- CI and Universal macOS releases now run on the project's self-hosted Mac mini, with explicit `arm64` and `x86_64` architecture verification
+
+### Fixed
+
+- Menu-bar weekly usage not reflecting the combined usage from paired Macs
+- Claude HTTP 429 responses appearing as a persistent update failure instead of showing cached status or the quota reset time
+- E-paper usage percentages above 100% being capped at 100% even though the macOS app showed the exact value
+
 ## 0.1.9
 
 ### Changed
