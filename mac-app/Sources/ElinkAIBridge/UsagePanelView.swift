@@ -408,7 +408,10 @@ struct UsagePanelView: View {
                             clusterJoinFields(theme, buttonTitle: "加入已有集群")
                         }
 
-                        if let message = clusterMessage ?? cluster.lastError {
+                        if let message = Self.clusterFeedbackMessage(
+                            transient: clusterMessage,
+                            currentError: cluster.lastError
+                        ) {
                             clusterFeedback(
                                 message,
                                 forceError: clusterMessage == nil && cluster.lastError != nil,
@@ -578,6 +581,21 @@ struct UsagePanelView: View {
         .padding(.vertical, 6)
         .background(RoundedRectangle(cornerRadius: 8).fill(color.opacity(theme.dark ? 0.14 : 0.08)))
         .accessibilityLabel(message)
+    }
+
+    static func clusterFeedbackMessage(transient: String?, currentError: String?) -> String? {
+        guard let transient else { return currentError }
+        if transient.hasPrefix("正在") { return transient }
+
+        if transient.hasPrefix("同步失败：") || transient == "同步完成" {
+            return currentError.map { "同步失败：\($0)" }
+                ?? (transient == "同步完成" ? transient : nil)
+        }
+        if transient.hasPrefix("连接失败：") || transient == "已连接并完成同步" {
+            return currentError.map { "连接失败：\($0)" }
+                ?? (transient == "已连接并完成同步" ? transient : nil)
+        }
+        return transient
     }
 
     @ViewBuilder
