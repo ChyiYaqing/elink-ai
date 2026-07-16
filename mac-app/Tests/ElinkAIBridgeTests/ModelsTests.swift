@@ -553,6 +553,92 @@ final class ModelsTests: XCTestCase {
         XCTAssertEqual(result.error, "temporary error")
     }
 
+    func testUsageLogDescriptionIncludesValuesCacheAndError() {
+        let usage = ProviderUsage(
+            primary: UsageWindow(percent: 102),
+            weekly: UsageWindow(percent: 10),
+            error: "Claude 用量 HTTP 429",
+            isCached: true
+        )
+
+        XCTAssertEqual(
+            UsageFetcher.describe(usage),
+            "primary=102% weekly=10% cached error=Claude 用量 HTTP 429"
+        )
+    }
+
+    func testRateLimitedExhaustedUsageShowsResetInsteadOfFailure() throws {
+        let now = Date(timeIntervalSince1970: 0)
+        let resetAt = Date(timeIntervalSince1970: 8 * 60 * 60 + 20 * 60)
+        let status = AgentStatus(
+            primary: UsageWindow(percent: 102, resetAt: resetAt),
+            error: "Claude 用量 HTTP 429",
+            usageFetchedAt: now,
+            usageCached: true
+        )
+
+        let notice = try XCTUnwrap(UsagePresentation.notice(
+            status,
+            now: now,
+            timeZone: try XCTUnwrap(TimeZone(secondsFromGMT: 0))
+        ))
+        XCTAssertEqual(notice.kind, .limit)
+        XCTAssertEqual(notice.text, "已达到用量上限 · 08:20 重置")
+        XCTAssertFalse(notice.text.contains("更新失败"))
+    }
+
+    func testFreshCachedRateLimitDoesNotShowWarning() {
+        let now = Date(timeIntervalSince1970: 10_000)
+        let status = AgentStatus(
+            primary: UsageWindow(percent: 72),
+            error: "Claude 用量 HTTP 429",
+            usageFetchedAt: now.addingTimeInterval(-120),
+            usageCached: true
+        )
+
+        XCTAssertNil(UsagePresentation.notice(status, now: now))
+    }
+
+    func testStaleCachedRateLimitShowsSoftNotice() {
+        let now = Date(timeIntervalSince1970: 10_000)
+        let status = AgentStatus(
+            primary: UsageWindow(percent: 72),
+            error: "Claude 用量 HTTP 429",
+            usageFetchedAt: now.addingTimeInterval(-601),
+            usageCached: true
+        )
+
+        XCTAssertEqual(
+            UsagePresentation.notice(status, now: now),
+            UsagePresentation.Notice(
+                kind: .cachedRateLimit,
+                text: "用量更新受限 · 显示缓存"
+            )
+        )
+    }
+
+    func testNonRateLimitErrorStillShowsFailure() {
+        let status = AgentStatus(
+            primary: UsageWindow(percent: 50),
+            error: "Claude 用量响应解析失败"
+        )
+
+        XCTAssertEqual(
+            UsagePresentation.notice(status),
+            UsagePresentation.Notice(
+                kind: .failure,
+                text: "更新失败 · Claude 用量响应解析失败"
+            )
+        )
+    }
+
+    func testMissingUsageDoesNotRepeatErrorAsNotice() {
+        let status = AgentStatus(error: "Claude 用量请求失败")
+
+        XCTAssertEqual(UsagePresentation.missingPrimaryText(status), "Claude 用量请求失败")
+        XCTAssertNil(UsagePresentation.notice(status))
+    }
+
     func testWeeklyOnlyUsageDoesNotClaimAllUsageIsMissing() {
         let status = AgentStatus(
             weekly: UsageWindow(percent: 0),

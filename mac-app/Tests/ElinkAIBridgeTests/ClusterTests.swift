@@ -240,4 +240,46 @@ final class ClusterTests: XCTestCase {
         XCTAssertEqual(aggregate.cluster.nodeCount, 2)
         XCTAssertEqual(aggregate.cluster.onlineCount, 1)
     }
+
+    func testAggregatePrefersRecentErrorFreeUsageStatus() throws {
+        let now = Date(timeIntervalSince1970: 10_000)
+        let limited = AgentStatus(
+            primary: UsageWindow(percent: 102),
+            error: "Claude 用量 HTTP 429",
+            usageFetchedAt: now
+        )
+        let successful = AgentStatus(
+            primary: UsageWindow(percent: 98),
+            usageFetchedAt: now.addingTimeInterval(-300)
+        )
+
+        let preferred = try XCTUnwrap(ClusterManager.preferredUsageStatus(
+            [(now, limited), (now, successful)],
+            now: now
+        ))
+
+        XCTAssertEqual(preferred.primary.percent, 98)
+        XCTAssertNil(preferred.error)
+    }
+
+    func testAggregateDoesNotReplaceFreshLimitedUsageWithStaleSuccess() throws {
+        let now = Date(timeIntervalSince1970: 10_000)
+        let limited = AgentStatus(
+            primary: UsageWindow(percent: 102),
+            error: "Claude 用量 HTTP 429",
+            usageFetchedAt: now
+        )
+        let staleSuccess = AgentStatus(
+            primary: UsageWindow(percent: 72),
+            usageFetchedAt: now.addingTimeInterval(-1_200)
+        )
+
+        let preferred = try XCTUnwrap(ClusterManager.preferredUsageStatus(
+            [(now, limited), (now, staleSuccess)],
+            now: now
+        ))
+
+        XCTAssertEqual(preferred.primary.percent, 102)
+        XCTAssertEqual(preferred.error, "Claude 用量 HTTP 429")
+    }
 }

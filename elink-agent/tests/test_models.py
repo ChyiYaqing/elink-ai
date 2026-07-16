@@ -1,7 +1,7 @@
 from elink_agent.models import StatusSnapshot
 
 
-def test_parse_bridge_shape_and_clamp_percentage():
+def test_parse_bridge_shape_and_preserve_overage_percentage():
     snapshot = StatusSnapshot.from_dict({
         "schema_version": 1,
         "generated_at": 123,
@@ -24,7 +24,7 @@ def test_parse_bridge_shape_and_clamp_percentage():
         },
     })
     assert snapshot.generated_at == 123
-    assert snapshot.claude.primary_pct == 100
+    assert snapshot.claude.primary_pct == 125
     assert snapshot.claude.weekly_pct is None
     assert snapshot.claude.needs_input is True
     assert [(item.model, item.tokens) for item in snapshot.claude.model_usage_today] == [
@@ -32,6 +32,15 @@ def test_parse_bridge_shape_and_clamp_percentage():
         ("claude-opus", 12),
     ]
     assert snapshot.codex.primary_pct == 12.5
+
+
+def test_percentage_clamps_negative_and_rejects_non_finite_values():
+    snapshot = StatusSnapshot.from_dict({
+        "claude": {"five_hour_pct": -5, "seven_day_pct": "nan"},
+    })
+
+    assert snapshot.claude.primary_pct == 0
+    assert snapshot.claude.weekly_pct is None
 
 
 def test_invalid_status_degrades_to_offline():

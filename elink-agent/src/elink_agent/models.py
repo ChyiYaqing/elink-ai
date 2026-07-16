@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from math import isfinite
 from typing import Any
 
 
@@ -101,6 +102,7 @@ def _pct(value: Any) -> float | None:
     if value is None or isinstance(value, bool):
         return None
     try:
-        return min(100.0, max(0.0, float(value)))
+        percent = float(value)
+        return max(0.0, percent) if isfinite(percent) else None
     except (TypeError, ValueError):
         return None

@@ -1,3 +1,5 @@
+from unittest.mock import Mock
+
 from PIL import Image, ImageDraw
 
 from elink_agent.models import ModelUsage, ProviderStatus, StatusSnapshot
@@ -29,14 +31,24 @@ def test_single_provider_mode_renders():
     assert image.size == (648, 480)
 
 
-def test_dual_panel_percentage_fits_before_usage_label():
+def test_dual_panel_overage_percentage_fits_before_usage_label():
     renderer = DashboardRenderer()
     draw = ImageDraw.Draw(Image.new("L", (renderer.width, renderer.height), 255))
-    percentage = "100%"
+    percentage = renderer._percentage(102)
     font = renderer._fit_font(draw, percentage, preferred=66, minimum=42,
                               max_width=140, bold=True)
 
+    assert percentage == "102%"
     assert draw.textbbox((0, 0), percentage, font=font)[2] <= 140
+
+
+def test_overage_percentage_does_not_overfill_progress_bar():
+    draw = Mock()
+
+    DashboardRenderer._progress(draw, 10, 5, 110, 102)
+
+    assert draw.rectangle.call_args_list[0].args == ((10, 5, 110, 23),)
+    assert draw.rectangle.call_args_list[1].args == ((13, 8, 107, 20),)
 
 
 def test_model_labels_drop_redundant_provider_prefix():

@@ -53,7 +53,7 @@ class DashboardRenderer:
         sw = draw.textbbox((0, 0), status, font=status_font)[2]
         draw.text((x1 - 16 - sw, y0 + 20), status, font=status_font, fill=0)
 
-        pct = "—" if provider.primary_pct is None else f"{int(provider.primary_pct)}%"
+        pct = self._percentage(provider.primary_pct)
         label_x = x0 + (250 if large else 168)
         pct_font = self._fit_font(draw, pct, preferred=92 if large else 66,
                                   minimum=54 if large else 42,
@@ -68,7 +68,7 @@ class DashboardRenderer:
 
         weekly_y = bar_y + 48
         draw.text((x0 + 16, weekly_y), "WEEK", font=self._font(17, bold=True), fill=0)
-        weekly = "—" if provider.weekly_pct is None else f"{int(provider.weekly_pct)}%"
+        weekly = self._percentage(provider.weekly_pct)
         wf = self._font(25, bold=True)
         ww = draw.textbbox((0, 0), weekly, font=wf)[2]
         draw.text((x1 - 16 - ww, weekly_y - 5), weekly, font=wf, fill=0)
@@ -126,6 +126,10 @@ class DashboardRenderer:
         if minutes >= 60:
             return f"reset {minutes // 60}h {minutes % 60}m"
         return f"reset {minutes}m"
+
+    @staticmethod
+    def _percentage(value: float | None) -> str:
+        return "—" if value is None else f"{int(value)}%"
 
     @staticmethod
     def _compact(value: int) -> str:

@@ -946,8 +946,22 @@ private struct CircleIconButton: View {
 }
 
 enum UsagePresentation {
+    enum NoticeKind: Equatable {
+        case limit
+        case cachedRateLimit
+        case failure
+    }
+
+    struct Notice: Equatable {
+        let kind: NoticeKind
+        let text: String
+    }
+
+    private static let freshCacheAge: TimeInterval = 10 * 60
+
     static func missingPrimaryText(_ status: AgentStatus) -> String {
         if status.weekly.percent != nil { return "当前无活跃的 5 小时窗口" }
+        if isRateLimited(status.error) { return "用量更新受限，稍后自动重试" }
         return status.error ?? "暂无用量数据"
     }
 
@@ -956,6 +970,49 @@ enum UsagePresentation {
         let age = max(0, Int(now.timeIntervalSince(fetchedAt)))
         let relative = age < 5 ? "刚刚" : "\(PreviewPopoverController.formatAge(age))前"
         return status.usageCached ? "缓存 · \(relative)" : "\(relative)更新"
+    }
+
+    static func notice(_ status: AgentStatus, now: Date = Date(),
+                       timeZone: TimeZone = .current) -> Notice? {
+        guard let error = status.error else { return nil }
+        guard status.primary.percent != nil || status.weekly.percent != nil else { return nil }
+        guard isRateLimited(error) else {
+            return Notice(kind: .failure, text: "更新失败 · \(error)")
+        }
+
+        let exceededWindows = [status.primary, status.weekly].filter {
+            ($0.percent ?? 0) >= 100
+        }
+        if !exceededWindows.isEmpty {
+            let resetAt = exceededWindows.compactMap { window -> Date? in
+                if let resetAt = window.resetAt { return resetAt }
+                return window.resetMinutes.map { now.addingTimeInterval(TimeInterval($0 * 60)) }
+            }.min()
+            let suffix = resetAt.map { " · \(clockTime($0, timeZone: timeZone)) 重置" } ?? ""
+            return Notice(kind: .limit, text: "已达到用量上限\(suffix)")
+        }
+
+        if status.usageCached,
+           let fetchedAt = status.usageFetchedAt,
+           max(0, now.timeIntervalSince(fetchedAt)) <= freshCacheAge {
+            return nil
+        }
+        let text = status.usageCached
+            ? "用量更新受限 · 显示缓存"
+            : "用量更新受限 · 稍后自动重试"
+        return Notice(kind: .cachedRateLimit, text: text)
+    }
+
+    static func isRateLimited(_ error: String?) -> Bool {
+        error?.contains("429") == true
+    }
+
+    private static func clockTime(_ date: Date, timeZone: TimeZone) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = timeZone
+        formatter.dateFormat = "HH:mm"
+        return formatter.string(from: date)
     }
 }
 
@@ -1029,16 +1086,20 @@ private struct ProviderCard: View {
                 UsageBar(percent: weekly, theme: theme)
                 resetLine(status.weekly.resetMinutes)
             }
-            if let error = status.error,
-               status.primary.percent != nil || status.weekly.percent != nil {
+            if let notice = UsagePresentation.notice(status) {
                 HStack(spacing: 3) {
-                    Image(systemName: "exclamationmark.triangle.fill").font(.system(size: 7))
-                    Text("更新失败 · \(error)")
+                    Image(systemName: notice.kind == .limit
+                          ? "hourglass"
+                          : "exclamationmark.triangle.fill")
+                        .font(.system(size: 7))
+                    Text(notice.text)
                         .font(.system(size: 8, weight: .semibold))
                         .lineLimit(2)
                 }
-                .foregroundStyle(theme.statusWarning)
-                .help(error)
+                .foregroundStyle(notice.kind == .failure
+                                 ? theme.statusWarning
+                                 : theme.textSecondary)
+                .help(status.error ?? notice.text)
             }
             if let freshness = UsagePresentation.freshnessText(status) {
                 HStack(spacing: 3) {

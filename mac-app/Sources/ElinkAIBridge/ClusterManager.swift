@@ -318,10 +318,8 @@ final class ClusterManager: ObservableObject {
         let sortedModels = models.map { ModelUsage(model: $0.key, tokens: $0.value) }
             .sorted { $0.tokens == $1.tokens ? $0.model < $1.model : $0.tokens > $1.tokens }
         let online = statuses.filter { now.timeIntervalSince($0.0) < 90 }
-        let freshest = statuses.max {
-            ($0.1.usageFetchedAt ?? .distantPast) < ($1.1.usageFetchedAt ?? .distantPast)
-        }?.1
-        var value = freshest ?? AgentStatus()
+        let preferred = Self.preferredUsageStatus(statuses, now: now)
+        var value = preferred ?? AgentStatus()
         value.tokensToday = sortedModels.reduce(0) { $0 + $1.tokens }
         value.modelUsageToday = sortedModels
         if online.contains(where: { $0.1.state == "working" }) { value.state = "working" }
@@ -331,6 +329,31 @@ final class ClusterManager: ObservableObject {
         value.primary = value.primary.discardingIfExpired(at: now)
         value.weekly = value.weekly.discardingIfExpired(at: now)
         return value
+    }
+
+    static func preferredUsageStatus(_ statuses: [(Date, AgentStatus)], now: Date,
+                                     errorFreeTolerance: TimeInterval = 10 * 60) -> AgentStatus? {
+        let normalized = statuses.map { candidate -> (Date, AgentStatus) in
+            var value = candidate.1
+            value.primary = value.primary.discardingIfExpired(at: now)
+            value.weekly = value.weekly.discardingIfExpired(at: now)
+            return (candidate.0, value)
+        }
+        let withUsage = normalized.filter {
+            $0.1.primary.percent != nil || $0.1.weekly.percent != nil
+        }
+        let candidates = withUsage.isEmpty ? normalized : withUsage
+        guard let newest = candidates.map({ $0.1.usageFetchedAt ?? $0.0 }).max() else {
+            return nil
+        }
+        let recent = candidates.filter {
+            newest.timeIntervalSince($0.1.usageFetchedAt ?? $0.0) <= errorFreeTolerance
+        }
+        let errorFree = recent.filter { $0.1.error == nil }
+        let preferred = errorFree.isEmpty ? recent : errorFree
+        return preferred.max {
+            ($0.1.usageFetchedAt ?? $0.0) < ($1.1.usageFetchedAt ?? $1.0)
+        }?.1
     }
 
     // MARK: - Server routes

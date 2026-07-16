@@ -81,10 +81,17 @@ final class UsageFetcher {
         }
     }
 
-    private static func describe(_ usage: ProviderUsage) -> String {
-        if let percent = usage.primary.percent { return "\(Int(percent))%" }
-        if let percent = usage.weekly.percent { return "weekly \(Int(percent))%" }
-        return usage.error ?? "n/a"
+    static func describe(_ usage: ProviderUsage) -> String {
+        var parts: [String] = []
+        if let percent = usage.primary.percent {
+            parts.append("primary=\(Int(percent))%")
+        }
+        if let percent = usage.weekly.percent {
+            parts.append("weekly=\(Int(percent))%")
+        }
+        if usage.isCached { parts.append("cached") }
+        if let error = usage.error { parts.append("error=\(error)") }
+        return parts.isEmpty ? "n/a" : parts.joined(separator: " ")
     }
 
     static func keepLastGood(old: ProviderUsage, new: ProviderUsage) -> ProviderUsage {
