@@ -13,6 +13,51 @@ It has two deliberately separate processes:
 
 OAuth tokens and raw session logs never leave the Mac.
 
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph CLIs["CLI tools (Mac)"]
+        ClaudeCode["Claude Code"]
+        Codex["Codex"]
+    end
+
+    subgraph MacApp["mac-app — macOS menu-bar bridge (:8765)"]
+        Hooks["POST /v1/event"]
+        Fetcher["UsageFetcher\ncredentials + JSONL + quota"]
+        Status["StatusService\nGET /v1/status"]
+        DeviceClient["DeviceClient"]
+        Cluster["ClusterManager\nBonjour discovery + AES-GCM sync"]
+        Store[("usage.db\nSQLite, 0600")]
+        UI["MenuBarController /\nUsagePanelView"]
+    end
+
+    subgraph Peer["Paired Mac(s), optional"]
+        PeerBridge["mac-app bridge"]
+    end
+
+    subgraph Pi["elink-agent — Raspberry Pi (:8766)"]
+        API["/v1/device, /v1/display/*,\n/v1/config/bridge"]
+        BridgeClient["bridge_client\npolls /v1/status"]
+        Renderer["renderer\n1-bit dashboard"]
+        Refresh["refresh_policy\nsmart/partial/full"]
+        Panel["Waveshare 5.83in V2\ne-paper (SPI/GPIO)"]
+    end
+
+    ClaudeCode -- hook events --> Hooks
+    Codex -- hook events --> Hooks
+    Hooks --> Status
+    Fetcher --> Status
+    Status --> Store
+    Status --> UI
+    Cluster <-- "v2 encrypted sync\nLAN/VPN" --> PeerBridge
+    Cluster <--> Store
+
+    BridgeClient -- "GET /v1/status" --> Status
+    DeviceClient -- "mode / refresh / config" --> API
+    API --> Renderer --> Refresh --> Panel
+```
+
 ## Dashboard preview
 
 <p>
