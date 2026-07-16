@@ -17,23 +17,21 @@ jobs:
   test:
     runs-on: [self-hosted, macOS, ARM64, elink-ci]
     timeout-minutes: 20
+    env:
+      PYTHON_BIN: /opt/homebrew/opt/python@3.12/bin/python3.12
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
-        with:
-          python-version: "3.12"
-
       - name: Show toolchain versions
         run: |
-          python --version
+          "$PYTHON_BIN" --version
           swift --version
 
       - name: Test Python agent
         run: |
           VENV="$RUNNER_TEMP/elink-ai-venv-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           trap 'rm -rf "$VENV"' EXIT
-          python -m venv "$VENV"
+          "$PYTHON_BIN" -m venv "$VENV"
           "$VENV/bin/python" -m pip install -e '.[test]'
           "$VENV/bin/python" -m pytest -q
 
