@@ -11,17 +11,18 @@ jobs:
   build:
     permissions:
       contents: read
+    runs-on: [self-hosted, macOS, ARM64, elink-ci]
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-14
-            arch: arm64
-          - runner: macos-15-intel
-            arch: x86_64
-    runs-on: ${{ matrix.runner }}
+          - arch: arm64
+            triple: arm64-apple-macosx13.0
+          - arch: x86_64
+            triple: x86_64-apple-macosx13.0
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Test macOS app
         run: swift test
@@ -29,8 +30,15 @@ jobs:
 
       - name: Build ${{ matrix.arch }} binary
         run: |
-          swift build -c release
-          BIN_DIR=$(swift build -c release --show-bin-path)
+          SCRATCH="$RUNNER_TEMP/swift-release-${{ matrix.arch }}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          trap 'rm -rf "$SCRATCH"' EXIT
+          swift build -c release \
+            --triple "${{ matrix.triple }}" \
+            --scratch-path "$SCRATCH"
+          BIN_DIR=$(swift build -c release \
+            --triple "${{ matrix.triple }}" \
+            --scratch-path "$SCRATCH" \
+            --show-bin-path)
           BINARY="$RUNNER_TEMP/ElinkAIBridge-${{ matrix.arch }}"
           cp "$BIN_DIR/ElinkAIBridge" "$BINARY"
           lipo "$BINARY" -verify_arch "${{ matrix.arch }}"
@@ -48,9 +56,10 @@ jobs:
     permissions:
       actions: read
       contents: write
-    runs-on: macos-14
+    runs-on: [self-hosted, macOS, ARM64, elink-ci]
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -104,17 +113,22 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          GH=/opt/homebrew/bin/gh
+          if [ ! -x "$GH" ]; then
+            echo "GitHub CLI not found at $GH" >&2
+            exit 1
+          fi
           VERSION="${GITHUB_REF_NAME#v}"
           DMG="mac-app/.build/elink-ai-${GITHUB_REF_NAME}.dmg"
           NOTES="$RUNNER_TEMP/release-notes.md"
           TITLE="elink-ai Version $VERSION"
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release edit "$GITHUB_REF_NAME" \
+          if "$GH" release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            "$GH" release edit "$GITHUB_REF_NAME" \
               --notes-file "$NOTES" \
               --title "$TITLE"
-            gh release upload "$GITHUB_REF_NAME" "$DMG" --clobber
+            "$GH" release upload "$GITHUB_REF_NAME" "$DMG" --clobber
           else
-            gh release create "$GITHUB_REF_NAME" "$DMG" \
+            "$GH" release create "$GITHUB_REF_NAME" "$DMG" \
               --verify-tag \
               --notes-file "$NOTES" \
               --title "$TITLE"

@@ -79,8 +79,13 @@ Also verify that:
 - `main` still has no unexpected divergence from `origin/main`.
 
 A local `mac-app/build-dmg.sh` run is an optional packaging smoke test. It does
-not replace GitHub Actions, which builds both `arm64` and `x86_64` executables
-and combines them into the released Universal Binary.
+not replace GitHub Actions. The Release workflow runs on the `MacMiniM4`
+self-hosted runner selected by `[self-hosted, macOS, ARM64, elink-ci]`, builds
+the `arm64` executable natively, cross-compiles the `x86_64` executable with an
+explicit macOS target triple, and combines them into the released Universal
+Binary. Keep the architecture checks in the workflow; the Intel build must be
+verified with `lipo` even when a physical Intel Mac will be used for final
+manual validation.
 
 ### 4. Publish in order
 
@@ -108,7 +113,7 @@ gh run watch RUN_ID --exit-status
 
 The successful run must have all of these results:
 
-- Swift tests pass on both macOS runners;
+- Swift tests pass in both architecture build jobs on the self-hosted runner;
 - the `arm64` and `x86_64` release binaries build successfully;
 - the Universal Binary and DMG steps succeed;
 - release notes are extracted from `CHANGELOG.md`; and
