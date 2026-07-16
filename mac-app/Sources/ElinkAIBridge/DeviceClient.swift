@@ -4,6 +4,7 @@ import Darwin
 final class DeviceClient {
     private static let hostKey = "elink_device_host"
     private static let seenKey = "elink_device_last_seen"
+    private static let enabledKey = "elink_device_connection_enabled"
     private static let pairingLock = NSLock()
     private static var lastDevicePoll = Date.distantPast
     private static var healing = false
@@ -17,13 +18,27 @@ final class DeviceClient {
         get { UserDefaults.standard.string(forKey: seenKey) ?? "" }
         set { UserDefaults.standard.set(newValue, forKey: seenKey) }
     }
+    static var isEnabled: Bool {
+        get { connectionEnabled(in: .standard) }
+        set { setConnectionEnabled(newValue, in: .standard) }
+    }
     static var baseURL: URL? {
+        guard isEnabled else { return nil }
         let value = host.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty else { return nil }
         return URL(string: value.hasPrefix("http") ? value : "http://\(value)")
     }
 
+    static func connectionEnabled(in defaults: UserDefaults) -> Bool {
+        defaults.object(forKey: enabledKey) == nil ? true : defaults.bool(forKey: enabledKey)
+    }
+
+    static func setConnectionEnabled(_ enabled: Bool, in defaults: UserDefaults) {
+        defaults.set(enabled, forKey: enabledKey)
+    }
+
     static func recordDevicePoll(ip: String) {
+        guard isEnabled else { return }
         pairingLock.holding {
             lastDevicePoll = Date()
             lastSeenIP = ip
@@ -81,11 +96,13 @@ final class DeviceClient {
 
     static func autoPair(progress: @escaping (String) -> Void,
                          completion: @escaping (String?) -> Void) {
+        guard isEnabled else { completion(nil); return }
         var candidates = [String]()
         if !lastSeenIP.isEmpty { candidates.append("\(lastSeenIP):8766") }
         let configured = normalizedHost(host)
         if !configured.isEmpty, !candidates.contains(configured) { candidates.append(configured) }
         func next() {
+            guard isEnabled else { completion(nil); return }
             guard !candidates.isEmpty else {
                 Log.user("device auto-pair scanning local subnet")
                 scanSubnet(progress: progress, completion: completion)
@@ -94,6 +111,7 @@ final class DeviceClient {
             let candidate = candidates.removeFirst()
             progress("验证 \(candidate)…")
             verify(candidate) { ok in
+                guard isEnabled else { completion(nil); return }
                 if ok { host = candidate; completion(candidate) } else { next() }
             }
         }
@@ -128,6 +146,7 @@ final class DeviceClient {
                 }.resume()
             }
             group.notify(queue: .main) {
+                guard isEnabled else { completion(nil); return }
                 if let found { host = found }
                 Log.device(
                     found.map { "auto-pair scan found \($0)" }
@@ -140,6 +159,7 @@ final class DeviceClient {
     }
 
     static func healPairingIfNeeded(port: UInt16) {
+        guard isEnabled else { return }
         let shouldHeal = pairingLock.holding { () -> Bool in
             guard Date().timeIntervalSince(lastDevicePoll) > 180,
                   !healing,

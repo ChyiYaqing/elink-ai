@@ -21,6 +21,11 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
         self.cluster = cluster
         self.port = port
         super.init()
+        model.deviceConnectionEnabled = DeviceClient.isEnabled
+        if !model.deviceConnectionEnabled {
+            model.deviceSummary = "屏幕连接已关闭"
+            model.deviceBadge = "已关闭"
+        }
         model.onSetMode = { [weak self] mode in
             Log.user("change device display mode to \(mode)")
             self?.performAction("正在切换页面…") { DeviceClient.setMode(mode, completion: $0) }
@@ -42,6 +47,24 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
                 self.reload()
             }
         }
+        model.onSetDeviceConnectionEnabled = { [weak self] enabled in
+            guard let self else { return }
+            DeviceClient.isEnabled = enabled
+            self.model.deviceConnectionEnabled = enabled
+            self.model.settingsMessage = enabled ? "屏幕连接已开启" : "屏幕连接已关闭"
+            Log.user("device connection \(enabled ? "enabled" : "disabled")")
+            if enabled {
+                self.model.deviceSummary = "正在连接设备…"
+                self.model.deviceBadge = "连接中"
+                self.reload()
+            } else {
+                self.model.previewImage = nil
+                self.model.deviceSummary = "屏幕连接已关闭"
+                self.model.deviceBadge = "已关闭"
+                self.model.deviceHealthy = false
+                self.model.busy = false
+            }
+        }
         model.onSaveHost = { [weak self] host in
             DeviceClient.host = DeviceClient.normalizedHost(host)
             Log.user("save device address \(DeviceClient.host)")
@@ -50,22 +73,25 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
             self?.reload()
         }
         model.onAutoPair = { [weak self] in
+            guard self?.model.deviceConnectionEnabled == true else { return }
             Log.user("start device auto-pair")
             self?.model.busy = true
             self?.model.settingsMessage = "正在查找屏幕…"
             DeviceClient.autoPair(progress: { [weak self] text in
                 self?.model.settingsMessage = text
             }) { [weak self] found in
-                self?.model.busy = false
-                self?.model.deviceHost = DeviceClient.host
+                guard let self else { return }
+                self.model.busy = false
+                guard self.model.deviceConnectionEnabled else { return }
+                self.model.deviceHost = DeviceClient.host
                 Log.user(
                     found.map { "device auto-pair succeeded: \($0)" }
                         ?? "device auto-pair failed: no device found",
                     level: found == nil ? .warning : .info
                 )
-                self?.model.settingsMessage = found.map { "配对成功：\($0)" }
+                self.model.settingsMessage = found.map { "配对成功：\($0)" }
                     ?? "未找到屏幕，请确认树莓派与 Mac 在同一局域网"
-                self?.reload()
+                self.reload()
             }
         }
         model.onPointHere = { [weak self] in
@@ -112,6 +138,7 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
             return
         }
         Log.user("open menu panel")
+        model.deviceConnectionEnabled = DeviceClient.isEnabled
         model.deviceHost = DeviceClient.host
         model.bridgeAddress = "http://\(DeviceClient.localIPv4() ?? "127.0.0.1"):\(port)/v1/status"
         model.settingsMessage = nil
@@ -148,6 +175,7 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
 
     private func reload() {
         reloadSnapshot()
+        guard model.deviceConnectionEnabled else { return }
         reloadInfo()
         reloadPreview()
     }
@@ -175,6 +203,7 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
         DeviceClient.fetchPreview { [weak self] result in
             guard let self else { return }
             self.loadingPreview = false
+            guard self.model.deviceConnectionEnabled else { return }
             if case let .success(data) = result, let image = NSImage(data: data) {
                 self.model.previewImage = image
             }
@@ -183,7 +212,8 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
 
     private func reloadInfo() {
         DeviceClient.fetchInfo { [weak self] result in
-            guard let self, !self.actionInFlight else { return }
+            guard let self, self.model.deviceConnectionEnabled,
+                  !self.actionInFlight else { return }
             switch result {
             case let .success(info):
                 self.model.mode = info.mode
@@ -200,7 +230,7 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
 
     private func performAction(_ progress: String,
                                action: (@escaping (Error?) -> Void) -> Void) {
-        guard !actionInFlight else { return }
+        guard model.deviceConnectionEnabled, !actionInFlight else { return }
         actionInFlight = true
         model.busy = true
         model.deviceSummary = progress
@@ -208,6 +238,7 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
             guard let self else { return }
             self.actionInFlight = false
             self.model.busy = false
+            guard self.model.deviceConnectionEnabled else { return }
             if let error {
                 Log.warning("device action failed: \(error.localizedDescription)", category: "user")
                 self.model.deviceSummary = "操作失败 · \(error.localizedDescription)"

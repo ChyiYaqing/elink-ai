@@ -16,12 +16,14 @@ final class PanelModel: ObservableObject {
     @Published var launchAtLogin = false
     @Published var deviceHost = ""
     @Published var bridgeAddress = ""
+    @Published var deviceConnectionEnabled = true
     @Published var settingsMessage: String?
 
     var onSetMode: ((String) -> Void)?
     var onDeviceRefresh: ((String) -> Void)?
     var onRefreshAll: (() -> Void)?
     var onSaveHost: ((String) -> Void)?
+    var onSetDeviceConnectionEnabled: ((Bool) -> Void)?
     var onAutoPair: (() -> Void)?
     var onPointHere: (() -> Void)?
     var onOpenDeviceStatus: (() -> Void)?
@@ -33,6 +35,7 @@ struct UsagePanelView: View {
     @ObservedObject var cluster: ClusterManager
     @Environment(\.colorScheme) private var scheme
     @State private var updatesExpanded = false
+    @State private var deviceSettingsExpanded = false
     @State private var clusterExpanded = false
     @State private var clusterAddress = ""
     @State private var clusterCode = ""
@@ -41,10 +44,12 @@ struct UsagePanelView: View {
     @State private var showLeaveClusterConfirmation = false
 
     init(model: PanelModel, updater: UpdateChecker, cluster: ClusterManager,
+         initialDeviceSettingsExpanded: Bool = false,
          initialClusterExpanded: Bool = false) {
         self.model = model
         self.updater = updater
         self.cluster = cluster
+        _deviceSettingsExpanded = State(initialValue: initialDeviceSettingsExpanded)
         _clusterExpanded = State(initialValue: initialClusterExpanded)
     }
 
@@ -69,7 +74,9 @@ struct UsagePanelView: View {
                             withAnimation(.easeOut(duration: 0.2)) { model.statsProvider = "codex" }
                         }
                     }
-                    deviceCard(theme)
+                    if model.deviceConnectionEnabled || model.showSettings || model.statsProvider != nil {
+                        deviceCard(theme)
+                    }
                 }
                 .opacity(model.showSettings || model.statsProvider != nil ? 0 : 1)
                 .allowsHitTesting(!model.showSettings && model.statsProvider == nil)
@@ -240,32 +247,83 @@ struct UsagePanelView: View {
 
     private func deviceSettings(_ theme: PanelTheme) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            settingsHeader(theme, icon: "display", color: Color(red: 0.35, green: 0.60, blue: 0.95),
-                           title: "屏幕连接", subtitle: "树莓派电子纸的地址与配对")
             HStack(spacing: 8) {
-                TextField("例如 192.168.1.50:8766", text: $model.deviceHost)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.system(size: 11, design: .monospaced))
-                PillButton(title: "保存", icon: "checkmark", theme: theme) {
-                    model.onSaveHost?(model.deviceHost)
+                Button {
+                    guard model.deviceConnectionEnabled else { return }
+                    withAnimation(.easeOut(duration: 0.2)) {
+                        deviceSettingsExpanded.toggle()
+                    }
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundStyle(theme.textTertiary)
+                            .rotationEffect(.degrees(deviceSettingsExpanded ? 90 : 0))
+                        settingsHeader(
+                            theme,
+                            icon: "display",
+                            color: Color(red: 0.35, green: 0.60, blue: 0.95),
+                            title: "屏幕连接",
+                            subtitle: model.deviceConnectionEnabled
+                                ? "树莓派电子纸的地址与配对"
+                                : "已关闭 · 本机仅采集与同步用量"
+                        )
+                    }
+                    .contentShape(Rectangle())
                 }
+                .buttonStyle(.plain)
+                .disabled(!model.deviceConnectionEnabled)
+                .accessibilityValue(deviceSettingsExpanded ? "已展开" : "已折叠")
+                Toggle("", isOn: Binding(
+                    get: { model.deviceConnectionEnabled },
+                    set: { enabled in
+                        if !enabled {
+                            withAnimation(.easeOut(duration: 0.2)) {
+                                deviceSettingsExpanded = false
+                            }
+                        }
+                        model.onSetDeviceConnectionEnabled?(enabled)
+                    }
+                ))
+                .toggleStyle(.switch)
+                .tint(theme.statusHealthy)
+                .scaleEffect(0.78)
+                .labelsHidden()
+                .accessibilityLabel("屏幕连接")
+                .accessibilityHint(model.deviceConnectionEnabled
+                    ? "关闭电子纸设备发现、轮询与刷新"
+                    : "开启电子纸设备连接")
             }
-            HStack(spacing: 8) {
-                PillButton(title: "自动配对屏幕", icon: "antenna.radiowaves.left.and.right", theme: theme) {
-                    model.onAutoPair?()
+
+            if model.deviceConnectionEnabled && deviceSettingsExpanded {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 8) {
+                        TextField("例如 192.168.1.50:8766", text: $model.deviceHost)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(size: 11, design: .monospaced))
+                        PillButton(title: "保存", icon: "checkmark", theme: theme) {
+                            model.onSaveHost?(model.deviceHost)
+                        }
+                    }
+                    HStack(spacing: 8) {
+                        PillButton(title: "自动配对屏幕", icon: "antenna.radiowaves.left.and.right", theme: theme) {
+                            model.onAutoPair?()
+                        }
+                        PillButton(title: "设为数据桥接", icon: "point.3.connected.trianglepath.dotted", theme: theme) {
+                            model.onPointHere?()
+                        }
+                        PillButton(title: "设备状态页", icon: "safari", theme: theme) {
+                            model.onOpenDeviceStatus?()
+                        }
+                    }
+                    .disabled(model.busy)
+                    Text("桥接服务：\(model.bridgeAddress)")
+                        .font(.system(size: 9, weight: .medium, design: .monospaced))
+                        .foregroundStyle(theme.textTertiary)
+                        .textSelection(.enabled)
                 }
-                PillButton(title: "设为数据桥接", icon: "point.3.connected.trianglepath.dotted", theme: theme) {
-                    model.onPointHere?()
-                }
-                PillButton(title: "设备状态页", icon: "safari", theme: theme) {
-                    model.onOpenDeviceStatus?()
-                }
+                .transition(.opacity)
             }
-            .disabled(model.busy)
-            Text("桥接服务：\(model.bridgeAddress)")
-                .font(.system(size: 9, weight: .medium, design: .monospaced))
-                .foregroundStyle(theme.textTertiary)
-                .textSelection(.enabled)
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -290,7 +348,10 @@ struct UsagePanelView: View {
                 }
             ))
             .toggleStyle(.switch)
+            .tint(theme.statusHealthy)
+            .scaleEffect(0.78)
             .labelsHidden()
+            .accessibilityLabel("开机自启动")
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -854,9 +915,6 @@ struct UsagePanelView: View {
 
     private func footer(_ theme: PanelTheme) -> some View {
         HStack(spacing: 8) {
-            Text("localhost:8765/v1/status")
-                .font(.system(size: 9, weight: .medium, design: .monospaced))
-                .foregroundStyle(theme.textTertiary)
             Spacer()
             CircleIconButton(icon: model.showSettings ? "xmark" : "gearshape.fill", theme: theme) {
                 Log.user(model.showSettings ? "close settings" : "open settings")

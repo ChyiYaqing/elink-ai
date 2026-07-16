@@ -282,6 +282,18 @@ final class ModelsTests: XCTestCase {
                        "192.168.1.50:8766")
     }
 
+    func testDeviceConnectionDefaultsToEnabledAndPersistsToggle() throws {
+        let suiteName = "elink-device-tests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        XCTAssertTrue(DeviceClient.connectionEnabled(in: defaults))
+        DeviceClient.setConnectionEnabled(false, in: defaults)
+        XCTAssertFalse(DeviceClient.connectionEnabled(in: defaults))
+        DeviceClient.setConnectionEnabled(true, in: defaults)
+        XCTAssertTrue(DeviceClient.connectionEnabled(in: defaults))
+    }
+
     func testUsageMenuIncludesResetTimes() {
         let usage = ProviderUsage(
             primary: UsageWindow(percent: 4, resetMinutes: 127),

@@ -26,7 +26,8 @@ routes[HTTPRouteKey("POST", "/v1/event")] = { request in
 }
 let server = HTTPServer(port: port, routes: routes)
 server.onRequest = { path, ip in
-    guard path == "/v1/status", !["127.0.0.1", "::1", ""].contains(ip) else { return }
+    guard DeviceClient.isEnabled,
+          path == "/v1/status", !["127.0.0.1", "::1", ""].contains(ip) else { return }
     DeviceClient.recordDevicePoll(ip: ip)
     if DeviceClient.host.isEmpty {
         DeviceClient.host = "\(ip):8766"

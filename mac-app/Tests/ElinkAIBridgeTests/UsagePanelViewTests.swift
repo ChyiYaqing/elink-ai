@@ -47,6 +47,55 @@ final class UsagePanelViewTests: XCTestCase {
     }
 
     @MainActor
+    func testScreenConnectionSettingsAreCollapsedByDefault() {
+        XCTAssertFalse(deviceSettingsPlaceholders(
+            enabled: true,
+            expanded: false
+        ).contains("例如 192.168.1.50:8766"))
+        XCTAssertFalse(deviceSettingsPlaceholders(
+            enabled: false,
+            expanded: true
+        ).contains("例如 192.168.1.50:8766"))
+    }
+
+    @MainActor
+    func testExpandedScreenConnectionSettingsShowDeviceAddressControls() {
+        XCTAssertTrue(deviceSettingsPlaceholders(
+            enabled: true,
+            expanded: true
+        ).contains("例如 192.168.1.50:8766"))
+    }
+
+    @MainActor
+    private func deviceSettingsPlaceholders(enabled: Bool, expanded: Bool) -> [String] {
+        let path = NSTemporaryDirectory() + "elink-panel-\(UUID().uuidString).db"
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let store = UsageStore(path: path)
+        let cluster = ClusterManager(store: store, credentials: ClusterCredentials(
+            nodeID: "local-node",
+            nodeName: "Local Mac",
+            clusterID: nil,
+            clusterSecret: nil,
+            timezone: nil
+        ))
+        let model = PanelModel()
+        model.showSettings = true
+        model.deviceConnectionEnabled = enabled
+        let view = UsagePanelView(
+            model: model,
+            updater: UpdateChecker(currentVersion: "0.1.7"),
+            cluster: cluster,
+            initialDeviceSettingsExpanded: expanded
+        )
+        let host = NSHostingView(rootView: view)
+        host.frame = NSRect(x: 0, y: 0, width: 440, height: 900)
+        host.layoutSubtreeIfNeeded()
+
+        return host.descendants
+            .compactMap { ($0 as? NSTextField)?.placeholderString }
+    }
+
+    @MainActor
     func testSingleNodeClusterShowsPairingCodeInput() {
         let path = NSTemporaryDirectory() + "elink-panel-\(UUID().uuidString).db"
         defer { try? FileManager.default.removeItem(atPath: path) }
