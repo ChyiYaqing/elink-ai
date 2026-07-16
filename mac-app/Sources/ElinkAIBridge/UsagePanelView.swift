@@ -254,21 +254,16 @@ struct UsagePanelView: View {
                         deviceSettingsExpanded.toggle()
                     }
                 } label: {
-                    HStack(spacing: 8) {
-                        Image(systemName: "chevron.right")
-                            .font(.system(size: 9, weight: .semibold))
-                            .foregroundStyle(theme.textTertiary)
-                            .rotationEffect(.degrees(deviceSettingsExpanded ? 90 : 0))
-                        settingsHeader(
-                            theme,
-                            icon: "display",
-                            color: Color(red: 0.35, green: 0.60, blue: 0.95),
-                            title: "屏幕连接",
-                            subtitle: model.deviceConnectionEnabled
-                                ? "树莓派电子纸的地址与配对"
-                                : "已关闭 · 本机仅采集与同步用量"
-                        )
-                    }
+                    settingsHeader(
+                        theme,
+                        icon: "display",
+                        color: Color(red: 0.35, green: 0.60, blue: 0.95),
+                        title: "屏幕连接",
+                        subtitle: model.deviceConnectionEnabled
+                            ? "树莓派电子纸的地址与配对"
+                            : "已关闭 · 本机仅采集与同步用量",
+                        expanded: deviceSettingsExpanded
+                    )
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
@@ -365,21 +360,16 @@ struct UsagePanelView: View {
                     clusterExpanded.toggle()
                 }
             } label: {
-                HStack(spacing: 8) {
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: 9, weight: .semibold))
-                        .foregroundStyle(theme.textTertiary)
-                        .rotationEffect(.degrees(clusterExpanded ? 90 : 0))
-                    settingsHeader(
-                        theme,
-                        icon: "macbook.and.iphone",
-                        color: Color(red: 0.32, green: 0.58, blue: 0.96),
-                        title: "多机同步",
-                        subtitle: cluster.enabled
-                            ? "\(max(1, cluster.nodes.filter { $0.isOnline() }.count))/\(max(1, cluster.nodes.count)) 台在线"
-                            : "独立模式 · 本机数据不会广播"
-                    )
-                }
+                settingsHeader(
+                    theme,
+                    icon: "macbook.and.iphone",
+                    color: Color(red: 0.32, green: 0.58, blue: 0.96),
+                    title: "多机同步",
+                    subtitle: cluster.enabled
+                        ? "\(max(1, cluster.nodes.filter { $0.isOnline() }.count))/\(max(1, cluster.nodes.count)) 台在线"
+                        : "独立模式 · 本机数据不会广播",
+                    expanded: clusterExpanded
+                )
                 .padding(12)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .contentShape(Rectangle())
@@ -759,17 +749,12 @@ struct UsagePanelView: View {
                     updatesExpanded.toggle()
                 }
             } label: {
-                HStack(spacing: 8) {
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: 9, weight: .semibold))
-                        .foregroundStyle(theme.textTertiary)
-                        .rotationEffect(.degrees(updatesExpanded ? 90 : 0))
-                    settingsHeader(theme, icon: "arrow.down.circle.fill", color: theme.statusHealthy,
-                                   title: "软件更新", subtitle: "当前版本 \(updater.currentVersion)")
-                }
-                .padding(12)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .contentShape(Rectangle())
+                settingsHeader(theme, icon: "arrow.down.circle.fill", color: theme.statusHealthy,
+                               title: "软件更新", subtitle: "当前版本 \(updater.currentVersion)",
+                               expanded: updatesExpanded)
+                    .padding(12)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
 
@@ -892,7 +877,8 @@ struct UsagePanelView: View {
     }
 
     private func settingsHeader(_ theme: PanelTheme, icon: String, color: Color,
-                                title: String, subtitle: String) -> some View {
+                                title: String, subtitle: String,
+                                expanded: Bool? = nil) -> some View {
         HStack(spacing: 8) {
             ZStack {
                 Circle().fill(color)
@@ -910,6 +896,12 @@ struct UsagePanelView: View {
                     .foregroundStyle(theme.textTertiary)
             }
             Spacer()
+            if let expanded {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(theme.textTertiary)
+                    .rotationEffect(.degrees(expanded ? 90 : 0))
+            }
         }
     }
 
