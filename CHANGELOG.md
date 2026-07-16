@@ -6,6 +6,12 @@ and `Removed`.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## 0.1.7
+
+### Fixed
+
+- Single-node Multi-Mac Sync settings hiding the address and pairing-code fields needed to join an existing cluster
+
 ## 0.1.6
 
 ### Packaging

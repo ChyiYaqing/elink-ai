@@ -21,7 +21,7 @@ final class UsagePanelViewTests: XCTestCase {
         model.showSettings = true
         let view = UsagePanelView(
             model: model,
-            updater: UpdateChecker(currentVersion: "0.1.6"),
+            updater: UpdateChecker(currentVersion: "0.1.7"),
             cluster: cluster,
             initialClusterExpanded: true
         )
