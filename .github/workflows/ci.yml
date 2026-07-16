@@ -18,7 +18,7 @@ jobs:
     runs-on: [self-hosted, macOS, ARM64, elink-ci]
     timeout-minutes: 20
     env:
-      PYTHON_BIN: /opt/homebrew/opt/python@3.12/bin/python3.12
+      PYTHON_BIN: /opt/homebrew/bin/python3.13
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
