@@ -4,9 +4,11 @@ final class MenuBarController: NSObject {
     private let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let preview: PreviewPopoverController
     private let usage: UsageFetcher
+    private let status: StatusService
 
     init(usage: UsageFetcher, status: StatusService, cluster: ClusterManager, port: UInt16) {
         self.usage = usage
+        self.status = status
         self.preview = PreviewPopoverController(status: status, usage: usage, cluster: cluster, port: port)
         super.init()
         if let button = item.button {
@@ -64,19 +66,30 @@ final class MenuBarController: NSObject {
         refreshStatusButton()
     }
     private func refreshStatusButton() {
-        guard let button = item.button else { return }
-        let percent = Self.menuBarWeeklyPercent(claude: usage.claude, codex: usage.codex)
-        button.image = Self.menuBarImage(percent: percent)
-        if let percent {
-            button.imagePosition = .imageLeft
-            button.attributedTitle = Self.statusTitle(percent: percent)
-        } else {
-            button.imagePosition = .imageOnly
-            button.attributedTitle = NSAttributedString()
+        // 与面板一致：用集群聚合后的快照，本机被限流时仍能取到
+        // 其他节点同步来的最新配额。snapshot() 读文件，放到后台线程。
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            let snapshot = self.status.snapshot()
+            let percent = Self.menuBarWeeklyPercent(
+                claudeWeekly: snapshot.claude.weekly.percent,
+                codexWeekly: snapshot.codex.weekly.percent
+            )
+            DispatchQueue.main.async {
+                guard let button = self.item.button else { return }
+                button.image = Self.menuBarImage(percent: percent)
+                if let percent {
+                    button.imagePosition = .imageLeft
+                    button.attributedTitle = Self.statusTitle(percent: percent)
+                } else {
+                    button.imagePosition = .imageOnly
+                    button.attributedTitle = NSAttributedString()
+                }
+            }
         }
     }
-    static func menuBarWeeklyPercent(claude: ProviderUsage, codex: ProviderUsage) -> Double? {
-        [claude.weekly.percent, codex.weekly.percent].compactMap { $0 }.max()
+    static func menuBarWeeklyPercent(claudeWeekly: Double?, codexWeekly: Double?) -> Double? {
+        [claudeWeekly, codexWeekly].compactMap { $0 }.max()
     }
     static func statusColor(percent: Double) -> NSColor {
         switch UsageLevel.level(usedPercent: percent) {

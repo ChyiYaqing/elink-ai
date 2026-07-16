@@ -410,20 +410,9 @@ final class ModelsTests: XCTestCase {
     }
 
     func testMenuBarUsesLargestProviderWeeklyUsage() {
-        let claude = ProviderUsage(
-            primary: UsageWindow(percent: 99),
-            weekly: UsageWindow(percent: 47)
-        )
-        let codex = ProviderUsage(weekly: UsageWindow(percent: 68))
-        XCTAssertEqual(MenuBarController.menuBarWeeklyPercent(claude: claude, codex: codex), 68)
-        XCTAssertEqual(MenuBarController.menuBarWeeklyPercent(
-            claude: claude,
-            codex: ProviderUsage()
-        ), 47)
-        XCTAssertNil(MenuBarController.menuBarWeeklyPercent(
-            claude: ProviderUsage(),
-            codex: ProviderUsage()
-        ))
+        XCTAssertEqual(MenuBarController.menuBarWeeklyPercent(claudeWeekly: 47, codexWeekly: 68), 68)
+        XCTAssertEqual(MenuBarController.menuBarWeeklyPercent(claudeWeekly: 47, codexWeekly: nil), 47)
+        XCTAssertNil(MenuBarController.menuBarWeeklyPercent(claudeWeekly: nil, codexWeekly: nil))
     }
 
     func testMenuBarUsesDedicatedLogoInDevelopmentBuild() {
