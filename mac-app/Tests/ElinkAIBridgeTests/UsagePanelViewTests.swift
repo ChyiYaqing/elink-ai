@@ -83,7 +83,7 @@ final class UsagePanelViewTests: XCTestCase {
         model.deviceConnectionEnabled = enabled
         let view = UsagePanelView(
             model: model,
-            updater: UpdateChecker(currentVersion: "0.1.8"),
+            updater: UpdateChecker(currentVersion: "0.1.9"),
             cluster: cluster,
             initialDeviceSettingsExpanded: expanded
         )
@@ -111,7 +111,7 @@ final class UsagePanelViewTests: XCTestCase {
         model.showSettings = true
         let view = UsagePanelView(
             model: model,
-            updater: UpdateChecker(currentVersion: "0.1.8"),
+            updater: UpdateChecker(currentVersion: "0.1.9"),
             cluster: cluster,
             initialClusterExpanded: true
         )

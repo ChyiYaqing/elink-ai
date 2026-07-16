@@ -6,6 +6,17 @@ and `Removed`.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## 0.1.9
+
+### Changed
+
+- Settings cards now left-align consistently, with expand chevrons moved to the trailing edge of the header row
+
+### Fixed
+
+- Claude usage never updating when Claude Code authenticates via the CLAUDE_CODE_OAUTH_TOKEN environment variable instead of a credentials file or the Keychain
+- The bridge silently running without its HTTP server when port 8765 was still held by an old instance during a restart; the listener now logs the failure and retries
+
 ## 0.1.8
 
 ### Added
