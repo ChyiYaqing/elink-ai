@@ -65,6 +65,32 @@ def test_api_state_stays_reachable_while_display_refresh_blocks():
         assert display.calls == ["full"]
 
 
+class FailingBlockingDisplay(BlockingDisplay):
+    def show(self, image, *, kind: str = "full") -> None:
+        self.entered.set()
+        assert self.release.wait(timeout=10)
+        raise RuntimeError("panel hung")
+
+
+def test_identical_refresh_request_during_failed_refresh_is_preserved():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        config = AgentConfig(output_path=root / "frame.png", state_path=root / "state.json")
+        display = FailingBlockingDisplay(config.output_path)
+        service = AgentService(config, display)
+        service.request_refresh("full")
+        worker = threading.Thread(target=service._refresh, args=("full", False))
+        worker.start()
+        try:
+            assert display.entered.wait(timeout=10)
+            service.request_refresh("full")
+        finally:
+            display.release.set()
+            worker.join(timeout=10)
+        assert service._force == "full"
+        assert service.policy.last_signature == ""
+
+
 def test_mode_change_during_refresh_is_not_lost():
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)

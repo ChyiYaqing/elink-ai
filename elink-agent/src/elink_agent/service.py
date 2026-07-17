@@ -49,6 +49,7 @@ class AgentService:
         self._thread: threading.Thread | None = None
         self._force: str | None = None
         self._pending_since: float | None = None
+        self._request_gen = 0
         self._fetch_failures = 0
         self._next_fetch_at = 0.0
         self._display_retry_at = 0.0
@@ -75,6 +76,7 @@ class AgentService:
             if kind == "smart":
                 self.policy.last_signature = ""
             self._pending_since = 0.0
+            self._request_gen += 1
         self._wake.set()
 
     def set_mode(self, mode: str) -> None:
@@ -85,6 +87,7 @@ class AgentService:
                 self.runtime.mode = mode
                 self.policy.last_signature = ""
                 self._pending_since = 0.0
+                self._request_gen += 1
                 self._save_state()
         self._wake.set()
 
@@ -171,7 +174,7 @@ class AgentService:
         with self._lock:
             snapshot = self.snapshot
             mode = self.runtime.mode
-            marker = (mode, self._force, self._pending_since)
+            marker = self._request_gen
         image = self.renderer.render(
             snapshot,
             stale=stale,
@@ -200,9 +203,9 @@ class AgentService:
             self._save_state()
         logger.info("displayed %s refresh", kind)
 
-    def _finish_refresh(self, marker: tuple) -> None:
+    def _finish_refresh(self, marker: int) -> None:
         # 刷新期间到达的 set_mode/request_refresh 不能被清掉，保留其失效标记
-        if (self.runtime.mode, self._force, self._pending_since) == marker:
+        if self._request_gen == marker:
             self._force = None
             self._pending_since = None
         else:

@@ -130,6 +130,12 @@ struct UsageStatsView: View {
             hoveredBucket = nil
             load()
         }
+        .onChange(of: clusterNodes.map(\.nodeID)) { ids in
+            // 选中的节点离开集群后清空选择，触发上面的 onChange 重新按全部 Mac 加载
+            if !selectedNodeID.isEmpty, !ids.contains(selectedNodeID) {
+                selectedNodeID = ""
+            }
+        }
     }
 
     private var header: some View {
