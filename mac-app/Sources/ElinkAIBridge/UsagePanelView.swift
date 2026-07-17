@@ -60,6 +60,7 @@ struct UsagePanelView: View {
             // 设置页作为覆盖层，保持面板尺寸稳定，避免弹窗因高度突变而跳位
             ZStack(alignment: .top) {
                 VStack(spacing: 12) {
+                    // fixedSize 让 HStack 取最高卡片的高度，两张卡片再撑满对齐
                     HStack(alignment: .top, spacing: 10) {
                         ProviderCard(name: "Claude", pet: PixelPet.claude,
                                      accent: PanelTheme.claudeColor(dark: theme.dark),
@@ -74,6 +75,7 @@ struct UsagePanelView: View {
                             withAnimation(.easeOut(duration: 0.2)) { model.statsProvider = "codex" }
                         }
                     }
+                    .fixedSize(horizontal: false, vertical: true)
                     if model.deviceConnectionEnabled || model.showSettings || model.statsProvider != nil {
                         deviceCard(theme)
                     }
@@ -1134,7 +1136,7 @@ private struct ProviderCard: View {
             }
         }
         .padding(12)
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .glassCard(theme)
         .scaleEffect(hovering ? 1.015 : 1.0)
         .animation(.easeOut(duration: 0.15), value: hovering)
