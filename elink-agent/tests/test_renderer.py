@@ -31,6 +31,13 @@ def test_single_provider_mode_renders():
     assert image.size == (648, 480)
 
 
+def test_footer_shows_running_agent_version():
+    for mode in ("dashboard", "claude"):
+        image = DashboardRenderer().render(StatusSnapshot.offline(), mode=mode)
+        footer = image.convert("L").crop((18, 459, 300, 479))
+        assert footer.getextrema()[0] == 0, f"version footer missing in {mode} mode"
+
+
 def test_dual_panel_overage_percentage_fits_before_usage_label():
     renderer = DashboardRenderer()
     draw = ImageDraw.Draw(Image.new("L", (renderer.width, renderer.height), 255))

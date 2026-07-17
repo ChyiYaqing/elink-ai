@@ -96,6 +96,7 @@ struct BridgeSnapshot: Codable {
 
 struct DeviceInfo {
     let deviceType: String
+    let version: String?
     let bridgeURL: String
     let mode: String
     let stale: Bool
@@ -109,6 +110,7 @@ struct DeviceInfo {
             throw BridgeError.message("目标不是 elink-agent")
         }
         deviceType = "elink-agent"
+        version = (json["version"] as? String).flatMap { $0.isEmpty ? nil : $0 }
         bridgeURL = json["bridge_url"] as? String ?? ""
         mode = json["mode"] as? String ?? "dashboard"
         stale = json["stale"] as? Bool ?? true

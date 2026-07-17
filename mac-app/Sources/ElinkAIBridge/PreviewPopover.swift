@@ -261,14 +261,15 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
 
     static func deviceSummary(_ info: DeviceInfo) -> String {
         let connection = info.stale ? "数据陈旧" : "设备在线"
+        let version = info.version.map { " v\($0)" } ?? ""
         let mode = ["dashboard": "双栏", "claude": "Claude", "codex": "Codex"][info.mode] ?? info.mode
         let refresh = ["full": "完整刷新", "partial": "局部刷新", "none": "尚未刷新"][info.refreshKind]
             ?? info.refreshKind
         let age = info.lastRefreshAge.map { " · \(formatAge($0))前送屏" } ?? ""
         if let error = info.error, !error.isEmpty {
-            return "\(connection) · \(mode) · \(error)"
+            return "\(connection)\(version) · \(mode) · \(error)"
         }
-        return "\(connection) · \(mode) · \(refresh)\(age)"
+        return "\(connection)\(version) · \(mode) · \(refresh)\(age)"
     }
 
     static func formatAge(_ seconds: Int) -> String {

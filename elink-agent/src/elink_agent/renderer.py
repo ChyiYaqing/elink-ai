@@ -5,6 +5,7 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
+from . import __version__
 from .models import ProviderStatus, StatusSnapshot
 
 
@@ -27,6 +28,7 @@ class DashboardRenderer:
         else:
             self._provider_panel(draw, (18, 74, 316, 458), "Claude", snapshot.claude)
             self._provider_panel(draw, (332, 74, 630, 458), "Codex", snapshot.codex)
+        self._footer(draw)
         return image.convert("1", dither=Image.Dither.NONE)
 
     def _header(self, draw: ImageDraw.ImageDraw, stale: bool, updated_at: datetime) -> None:
@@ -40,6 +42,9 @@ class DashboardRenderer:
         stamp_width = draw.textbbox((0, 0), stamp, font=stamp_font)[2]
         draw.text((630 - stamp_width, 42), stamp, font=stamp_font, fill=0)
         draw.line((18, 64, 630, 64), fill=0, width=2)
+
+    def _footer(self, draw: ImageDraw.ImageDraw) -> None:
+        draw.text((18, 461), f"elink-agent v{__version__}", font=self._font(12, bold=False), fill=0)
 
     def _provider_panel(self, draw: ImageDraw.ImageDraw, box: tuple[int, int, int, int],
                         name: str, provider: ProviderStatus, large: bool = False) -> None:
