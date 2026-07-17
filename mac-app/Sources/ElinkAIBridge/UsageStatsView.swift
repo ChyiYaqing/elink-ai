@@ -27,6 +27,13 @@ struct StatsBucket: Identifiable, Equatable {
     var total: Int { models.values.reduce(0, +) }
 }
 
+struct DeviceUsage: Identifiable, Equatable {
+    let nodeID: String?          // nil = 无来源标记的本地行
+    let models: [String: Int]
+    var total: Int { models.values.reduce(0, +) }
+    var id: String { nodeID ?? "" }
+}
+
 enum UsageStats {
     static func buckets(rows: [DailyModelUsage], range: StatsRange, now: Date = Date()) -> [StatsBucket] {
         let calendar = StatusService.aggregationCalendar
@@ -58,6 +65,28 @@ enum UsageStats {
                 return StatsBucket(id: key, label: label, models: byMonth[key] ?? [:])
             }
         }
+    }
+
+    /// 范围内各设备的 token 总量与模型明细，按总量降序（并列按 nodeID 升序保证稳定）。
+    /// bucketID 非空时只统计该桶（悬停某天/某月），与 detail 的口径保持一致
+    static func deviceTotals(rows: [DailyModelUsage], range: StatsRange,
+                             now: Date = Date(), bucketID: String? = nil) -> [DeviceUsage] {
+        // 复用 buckets 的时间窗口，保证设备总和与图表总量一致
+        let keys = bucketID.map { Set([$0]) }
+            ?? Set(buckets(rows: [], range: range, now: now).map(\.id))
+        var byNode: [String?: [String: Int]] = [:]
+        for row in rows {
+            let key = range == .year ? String(row.day.prefix(7)) : row.day
+            guard keys.contains(key) else { continue }
+            byNode[row.nodeID, default: [:]][row.model, default: 0] += row.tokens
+        }
+        return byNode
+            .map { DeviceUsage(nodeID: $0.key, models: $0.value) }
+            .sorted {
+                $0.total == $1.total
+                    ? ($0.nodeID ?? "") < ($1.nodeID ?? "")
+                    : $0.total > $1.total
+            }
     }
 
     /// 全范围内按总量降序的模型列表，决定堆叠顺序与配色
@@ -105,9 +134,15 @@ struct UsageStatsView: View {
     @State private var selectedNodeID = ""
 
     var body: some View {
-        let buckets = UsageStats.buckets(rows: rows, range: range)
+        let chartRows = effectiveNodeID.map { id in rows.filter { $0.nodeID == id } } ?? rows
+        let buckets = UsageStats.buckets(rows: chartRows, range: range)
         let order = UsageStats.modelOrder(buckets)
         let colors = UsageStats.colors(for: order)
+        // 全范围的设备列表决定区块是否展示；悬停某个桶时明细跟随该桶，与 detail 口径一致
+        let rangeDevices = UsageStats.deviceTotals(rows: rows, range: range)
+        let devices = hoveredBucket.map {
+            UsageStats.deviceTotals(rows: rows, range: range, bucketID: $0)
+        } ?? rangeDevices
         return VStack(spacing: 10) {
             header
             if clusterNodes.count > 1 { nodeFilter }
@@ -115,7 +150,15 @@ struct UsageStatsView: View {
                 emptyState
             } else {
                 chart(buckets: buckets, order: order, colors: colors)
-                detail(buckets: buckets, order: order, colors: colors)
+                ScrollView(.vertical, showsIndicators: false) {
+                    VStack(spacing: 10) {
+                        detail(buckets: buckets, order: order, colors: colors)
+                        if clusterNodes.count > 1, effectiveNodeID == nil, rangeDevices.count > 1 {
+                            deviceSection(devices: devices, order: order, colors: colors,
+                                          heading: deviceHeading(buckets))
+                        }
+                    }
+                }
             }
             Spacer(minLength: 0)
         }
@@ -128,10 +171,9 @@ struct UsageStatsView: View {
         }
         .onChange(of: selectedNodeID) { _ in
             hoveredBucket = nil
-            load()
         }
         .onChange(of: clusterNodes.map(\.nodeID)) { ids in
-            // 选中的节点离开集群后清空选择，触发上面的 onChange 重新按全部 Mac 加载
+            // 选中的节点离开集群后清空选择，回退为全部 Mac
             if !selectedNodeID.isEmpty, !ids.contains(selectedNodeID) {
                 selectedNodeID = ""
             }
@@ -323,6 +365,98 @@ struct UsageStatsView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
+    /// 悬停某个桶时标题跟随该桶，与 detail 的标题口径一致
+    private func deviceHeading(_ buckets: [StatsBucket]) -> String {
+        let hovered = hoveredBucket.flatMap { id in buckets.first { $0.id == id } }
+        return hovered.map { "\($0.label) 设备占比" } ?? "\(range.summaryTitle)设备占比"
+    }
+
+    private func deviceSection(devices: [DeviceUsage], order: [String],
+                               colors: [String: Color], heading: String) -> some View {
+        let total = devices.reduce(0) { $0 + $1.total }
+        return VStack(alignment: .leading, spacing: 6) {
+            Text(heading)
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(theme.textSecondary)
+            if devices.isEmpty {
+                Text("该时段无用量")
+                    .font(.system(size: 9))
+                    .foregroundStyle(theme.textTertiary)
+            }
+            ForEach(devices) { device in
+                deviceCard(device, order: order, colors: colors, clusterTotal: total)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func deviceCard(_ device: DeviceUsage, order: [String],
+                            colors: [String: Color], clusterTotal: Int) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 6) {
+                Image(systemName: "laptopcomputer")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(accent)
+                Text(deviceName(device.nodeID))
+                    .font(.system(size: 10, weight: .bold, design: .rounded))
+                    .foregroundStyle(theme.textPrimary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer()
+                Text(UsageFormat.tokens(device.total))
+                    .font(.system(size: 9, weight: .medium, design: .monospaced))
+                    .foregroundStyle(theme.textSecondary)
+                Text(Self.percentText(device.total, of: clusterTotal))
+                    .font(.system(size: 9, weight: .bold, design: .monospaced))
+                    .foregroundStyle(accent)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(Capsule().fill(accent.opacity(theme.dark ? 0.22 : 0.12)))
+            }
+            // 迷你比例条：按模型着色，与上方模型图例配色一致
+            GeometryReader { geo in
+                HStack(spacing: 0) {
+                    ForEach(order.filter { (device.models[$0] ?? 0) > 0 }, id: \.self) { model in
+                        Rectangle().fill(colors[model] ?? .gray)
+                            .frame(width: geo.size.width * CGFloat(device.models[model] ?? 0)
+                                / CGFloat(max(1, device.total)))
+                    }
+                }
+                .clipShape(Capsule())
+            }
+            .frame(height: 4)
+            ForEach(order.filter { (device.models[$0] ?? 0) > 0 }, id: \.self) { model in
+                let tokens = device.models[model] ?? 0
+                HStack(spacing: 5) {
+                    Circle().fill(colors[model] ?? .gray)
+                        .frame(width: 5, height: 5)
+                    Text(model)
+                        .font(.system(size: 9))
+                        .foregroundStyle(theme.textSecondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer()
+                    Text(UsageFormat.tokens(tokens))
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(theme.textTertiary)
+                    // 该设备内的模型占比，而非全集群占比
+                    Text(Self.percentText(tokens, of: device.total))
+                        .font(.system(size: 9, weight: .medium, design: .monospaced))
+                        .foregroundStyle(theme.textTertiary)
+                        .frame(width: 34, alignment: .trailing)
+                }
+            }
+        }
+        .padding(8)
+        .background(RoundedRectangle(cornerRadius: 8).fill(theme.glassBackground))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(theme.glassBorder, lineWidth: 1))
+    }
+
+    private func deviceName(_ nodeID: String?) -> String {
+        guard let nodeID else { return "本机" }
+        return clusterNodes.first { $0.nodeID == nodeID }?.name ?? "未知设备 \(nodeID.prefix(8))"
+    }
+
     static func percentText(_ tokens: Int, of total: Int) -> String {
         guard total > 0 else { return "0%" }
         return "\(Int((Double(tokens) / Double(total) * 100).rounded()))%"
@@ -337,14 +471,11 @@ struct UsageStatsView: View {
         let since = StatusService.dayKey(
             StatusService.aggregationCalendar.date(byAdding: .day, value: -366, to: Date()) ?? Date())
         let provider = provider
-        let nodeID = effectiveNodeID
         loaded = false
+        // 集群启用时 usage() 返回全节点带 nodeID 的行，节点筛选在内存中完成
         DispatchQueue.global(qos: .userInitiated).async {
-            let result = nodeID.map {
-                UsageStore.shared.clusterUsage(provider: provider, since: since, nodeID: $0)
-            } ?? UsageStore.shared.usage(provider: provider, since: since)
+            let result = UsageStore.shared.usage(provider: provider, since: since)
             DispatchQueue.main.async {
-                guard nodeID == effectiveNodeID else { return }
                 rows = result
                 loaded = true
             }

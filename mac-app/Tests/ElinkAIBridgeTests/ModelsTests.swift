@@ -309,6 +309,88 @@ final class ModelsTests: XCTestCase {
         }
     }
 
+    func testDeviceTotalsAggregateAndSortByTokensDesc() {
+        let now = Date()
+        let calendar = Calendar.current
+        let today = StatusService.dayKey(now)
+        let yesterday = StatusService.dayKey(calendar.date(byAdding: .day, value: -1, to: now)!)
+        let rows = [
+            DailyModelUsage(day: today, provider: "claude", model: "claude-a", tokens: 30, nodeID: "node-a"),
+            DailyModelUsage(day: yesterday, provider: "claude", model: "claude-b", tokens: 10, nodeID: "node-a"),
+            DailyModelUsage(day: today, provider: "claude", model: "claude-a", tokens: 50, nodeID: "node-b"),
+            DailyModelUsage(day: yesterday, provider: "claude", model: "claude-a", tokens: 20, nodeID: "node-b"),
+        ]
+
+        let devices = UsageStats.deviceTotals(rows: rows, range: .week, now: now)
+        XCTAssertEqual(devices.map(\.nodeID), ["node-b", "node-a"])
+        XCTAssertEqual(devices[0].models, ["claude-a": 70])
+        XCTAssertEqual(devices[0].total, 70)
+        XCTAssertEqual(devices[1].models, ["claude-a": 30, "claude-b": 10])
+        XCTAssertEqual(UsageStatsView.percentText(70, of: 110), "64%")
+    }
+
+    func testDeviceTotalsRespectRangeWindow() {
+        let now = Date()
+        let calendar = Calendar.current
+        let today = StatusService.dayKey(now)
+        let old = StatusService.dayKey(calendar.date(byAdding: .day, value: -40, to: now)!)
+        let rows = [
+            DailyModelUsage(day: old, provider: "claude", model: "claude-a", tokens: 100, nodeID: "node-a"),
+            DailyModelUsage(day: today, provider: "claude", model: "claude-a", tokens: 30, nodeID: "node-b"),
+        ]
+
+        // 设备总和必须与图表总量一致（40 天前的行在周/月被排除、年包含）
+        for range in StatsRange.allCases {
+            let devices = UsageStats.deviceTotals(rows: rows, range: range, now: now)
+            let chartTotal = UsageStats.buckets(rows: rows, range: range, now: now)
+                .reduce(0) { $0 + $1.total }
+            XCTAssertEqual(devices.reduce(0) { $0 + $1.total }, chartTotal, "range \(range)")
+        }
+        XCTAssertEqual(UsageStats.deviceTotals(rows: rows, range: .week, now: now).map(\.nodeID),
+                       ["node-b"])
+        XCTAssertEqual(UsageStats.deviceTotals(rows: rows, range: .year, now: now).map(\.nodeID),
+                       ["node-a", "node-b"])
+    }
+
+    func testDeviceTotalsFilteredToHoveredBucketMatchBucketTotal() {
+        let now = Date()
+        let calendar = Calendar.current
+        let today = StatusService.dayKey(now)
+        let yesterday = StatusService.dayKey(calendar.date(byAdding: .day, value: -1, to: now)!)
+        let rows = [
+            DailyModelUsage(day: today, provider: "claude", model: "claude-a", tokens: 30, nodeID: "node-a"),
+            DailyModelUsage(day: yesterday, provider: "claude", model: "claude-a", tokens: 50, nodeID: "node-a"),
+            DailyModelUsage(day: today, provider: "claude", model: "claude-b", tokens: 20, nodeID: "node-b"),
+        ]
+
+        // 悬停某天时，设备总和必须等于该天柱子的总量（与 detail 口径一致）
+        let devices = UsageStats.deviceTotals(rows: rows, range: .week, now: now, bucketID: today)
+        let bucket = UsageStats.buckets(rows: rows, range: .week, now: now).first { $0.id == today }
+        XCTAssertEqual(devices.reduce(0) { $0 + $1.total }, bucket?.total)
+        XCTAssertEqual(devices.map(\.nodeID), ["node-a", "node-b"])
+        XCTAssertEqual(devices[0].models, ["claude-a": 30])
+
+        // 年视图悬停某月：按月前缀过滤
+        let monthKey = String(today.prefix(7))
+        let yearDevices = UsageStats.deviceTotals(rows: rows, range: .year, now: now, bucketID: monthKey)
+        let yearBucket = UsageStats.buckets(rows: rows, range: .year, now: now).first { $0.id == monthKey }
+        XCTAssertEqual(yearDevices.reduce(0) { $0 + $1.total }, yearBucket?.total)
+    }
+
+    func testDeviceTotalsGroupNilNodeSeparatelyAndStableTieBreak() {
+        let now = Date()
+        let today = StatusService.dayKey(now)
+        let rows = [
+            DailyModelUsage(day: today, provider: "claude", model: "claude-a", tokens: 10),
+            DailyModelUsage(day: today, provider: "claude", model: "claude-a", tokens: 20, nodeID: "node-b"),
+            DailyModelUsage(day: today, provider: "claude", model: "claude-b", tokens: 20, nodeID: "node-a"),
+        ]
+
+        let devices = UsageStats.deviceTotals(rows: rows, range: .week, now: now)
+        XCTAssertEqual(devices.map(\.nodeID), ["node-a", "node-b", nil])
+        XCTAssertEqual(devices.last?.models, ["claude-a": 10])
+    }
+
     func testRejectsOldDeviceShape() {
         XCTAssertThrowsError(try DeviceInfo(json: ["device_type": "esp8266"]))
     }
