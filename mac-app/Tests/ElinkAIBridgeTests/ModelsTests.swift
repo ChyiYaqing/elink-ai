@@ -266,6 +266,29 @@ final class ModelsTests: XCTestCase {
         XCTAssertEqual(UsageStatsView.percentText(0, of: 0), "0%")
     }
 
+    func testStatsBucketLabelsFollowAggregationTimeZone() {
+        StatusService.setAggregationTimeZone("Pacific/Kiritimati")
+        defer { StatusService.setAggregationTimeZone(nil) }
+        // 2023-11-14 12:00 UTC，在 UTC+14 已是 11-15，UTC+11 及以西时区仍是 11-14
+        let reference = Date(timeIntervalSince1970: 1_699_963_200)
+
+        let week = UsageStats.buckets(rows: [], range: .week, now: reference)
+        XCTAssertEqual(week.count, 7)
+        XCTAssertEqual(week.last?.id, StatusService.dayKey(reference))
+        for bucket in week {
+            let parts = bucket.id.split(separator: "-").compactMap { Int($0) }
+            XCTAssertEqual(bucket.label, "\(parts[1])/\(parts[2])", "label 与数据键日期不一致: \(bucket.id)")
+        }
+
+        let year = UsageStats.buckets(rows: [], range: .year, now: reference)
+        XCTAssertEqual(year.count, 12)
+        XCTAssertEqual(year.last?.id, String(StatusService.dayKey(reference).prefix(7)))
+        for bucket in year {
+            let month = try? XCTUnwrap(Int(bucket.id.suffix(2)))
+            XCTAssertEqual(bucket.label, "\(month ?? 0)月", "月份标签与数据键不一致: \(bucket.id)")
+        }
+    }
+
     func testRejectsOldDeviceShape() {
         XCTAssertThrowsError(try DeviceInfo(json: ["device_type": "esp8266"]))
     }

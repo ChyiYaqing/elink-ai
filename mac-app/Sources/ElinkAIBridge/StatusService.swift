@@ -168,7 +168,7 @@ final class StatusService {
     /// 启动时后台回填近一年历史，让统计页首次打开就有周/月/年数据
     func backfillHistory() {
         guard let store else { return }
-        let cutoff = Calendar.current.date(
+        let cutoff = Self.aggregationCalendar.date(
             byAdding: .day, value: -366, to: Self.startOfAggregationDay(Date())) ?? .distantPast
         let accumulator = ClaudeUsageAccumulator()
         for file in jsonlFiles(Self.claudeRoot) where (modification(file) ?? .distantPast) >= cutoff {
@@ -274,14 +274,19 @@ final class StatusService {
     }
 
     static func startOfAggregationDay(_ date: Date) -> Date {
-        dayFormatterLock.holding { aggregationCalendar.startOfDay(for: date) }
+        aggregationCalendar.startOfDay(for: date)
+    }
+
+    /// 集群聚合时区下的 Calendar，日期加减、数据键和显示标签必须共用它
+    static var aggregationCalendar: Calendar {
+        dayFormatterLock.holding { aggregationCalendarStorage }
     }
 
     static func setAggregationTimeZone(_ identifier: String?) {
         let timeZone = identifier.flatMap(TimeZone.init(identifier:)) ?? .current
         dayFormatterLock.holding {
             dayFormatter.timeZone = timeZone
-            aggregationCalendar.timeZone = timeZone
+            aggregationCalendarStorage.timeZone = timeZone
         }
     }
 
@@ -295,7 +300,7 @@ final class StatusService {
         return value
     }()
 
-    private static var aggregationCalendar: Calendar = {
+    private static var aggregationCalendarStorage: Calendar = {
         var value = Calendar(identifier: .gregorian)
         value.timeZone = .current
         return value

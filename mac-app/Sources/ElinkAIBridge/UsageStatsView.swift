@@ -29,7 +29,7 @@ struct StatsBucket: Identifiable, Equatable {
 
 enum UsageStats {
     static func buckets(rows: [DailyModelUsage], range: StatsRange, now: Date = Date()) -> [StatsBucket] {
-        let calendar = Calendar.current
+        let calendar = StatusService.aggregationCalendar
         var byDay: [String: [String: Int]] = [:]
         for row in rows {
             byDay[row.day, default: [:]][row.model, default: 0] += row.tokens
@@ -324,7 +324,7 @@ struct UsageStatsView: View {
 
     private func load() {
         let since = StatusService.dayKey(
-            Calendar.current.date(byAdding: .day, value: -366, to: Date()) ?? Date())
+            StatusService.aggregationCalendar.date(byAdding: .day, value: -366, to: Date()) ?? Date())
         let provider = provider
         let nodeID = selectedNodeID.isEmpty ? nil : selectedNodeID
         loaded = false
