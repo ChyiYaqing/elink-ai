@@ -6,6 +6,12 @@ and `Removed`.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## 0.1.13
+
+### Added
+
+- Per-Mac token shares and model usage in cluster statistics, including breakdowns for the hovered day or month
+
 ## 0.1.12
 
 ### Packaging

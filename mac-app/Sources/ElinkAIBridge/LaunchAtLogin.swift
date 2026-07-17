@@ -2,7 +2,7 @@ import Foundation
 
 enum AppInfo {
     static let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
-        ?? "0.1.12"
+        ?? "0.1.13"
     static let repoURL = URL(string: "https://github.com/ChyiYaqing/elink-ai")!
     static let logDirectoryURL = FileManager.default
         .urls(for: .libraryDirectory, in: .userDomainMask)[0]
