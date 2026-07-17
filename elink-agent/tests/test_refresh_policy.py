@@ -27,6 +27,15 @@ def test_small_percentage_change_is_throttled_but_status_is_priority():
     assert decision.refresh and decision.reason == "priority-change"
 
 
+def test_periodic_full_refresh_fires_even_when_content_is_unchanged():
+    policy = RefreshPolicy(min_interval_s=30, full_interval_s=10)
+    value = snapshot()
+    policy.record(value, stale=False, kind="full", now=100)
+    assert not policy.decide(value, stale=False, now=105).refresh
+    decision = policy.decide(value, stale=False, now=111)
+    assert decision.refresh and decision.kind == "full" and decision.reason == "maintenance"
+
+
 def test_reset_minutes_are_grouped_in_five_minute_buckets():
     policy = RefreshPolicy()
     first = snapshot()

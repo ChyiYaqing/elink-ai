@@ -85,50 +85,79 @@ final class HTTPServer {
         receive(connection, accumulated: Data())
     }
 
+    enum ParseOutcome: Equatable {
+        case incomplete
+        case invalid
+        case complete(method: String, path: String, query: [String: String],
+                      headers: [String: String], body: Data)
+
+        static func == (lhs: ParseOutcome, rhs: ParseOutcome) -> Bool {
+            switch (lhs, rhs) {
+            case (.incomplete, .incomplete), (.invalid, .invalid):
+                return true
+            case let (.complete(lMethod, lPath, lQuery, lHeaders, lBody),
+                      .complete(rMethod, rPath, rQuery, rHeaders, rBody)):
+                return lMethod == rMethod && lPath == rPath && lQuery == rQuery
+                    && lHeaders == rHeaders && lBody == rBody
+            default:
+                return false
+            }
+        }
+    }
+
+    static func parseRequest(from buffer: Data) -> ParseOutcome {
+        guard buffer.count <= 1_100_000 else { return .invalid }
+        guard let boundary = buffer.range(of: Data("\r\n\r\n".utf8)) else {
+            return .incomplete
+        }
+        let header = String(decoding: buffer[..<boundary.lowerBound], as: UTF8.self)
+        let lines = header.split(whereSeparator: { $0.isNewline })
+        let requestLine = lines.first?.split(separator: " ") ?? []
+        let method = requestLine.count > 0 ? String(requestLine[0]).uppercased() : "GET"
+        let target = requestLine.count > 1 ? String(requestLine[1]) : "/"
+        let components = URLComponents(string: target)
+        let path = components?.path.isEmpty == false ? components!.path : "/"
+        var query: [String: String] = [:]
+        for item in components?.queryItems ?? [] { query[item.name] = item.value ?? "" }
+        var headers: [String: String] = [:]
+        for line in lines.dropFirst() {
+            let pair = line.split(separator: ":", maxSplits: 1)
+            guard pair.count == 2 else { continue }
+            headers[String(pair[0]).lowercased()] = pair[1]
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        guard let length = Int(headers["content-length"] ?? "0"), length >= 0, length <= 1_000_000 else {
+            return .invalid
+        }
+        let available = buffer.count - boundary.upperBound
+        if available < length {
+            return .incomplete
+        }
+        let body = buffer.subdata(in: boundary.upperBound..<(boundary.upperBound + length))
+        return .complete(method: method, path: path, query: query, headers: headers, body: body)
+    }
+
     private func receive(_ connection: NWConnection, accumulated: Data) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { [weak self] data, _, complete, error in
             guard let self else { return }
             var buffer = accumulated
             if let data { buffer.append(data) }
-            guard buffer.count <= 1_100_000 else { connection.cancel(); return }
-            guard let boundary = buffer.range(of: Data("\r\n\r\n".utf8)) else {
+            switch Self.parseRequest(from: buffer) {
+            case .invalid:
+                connection.cancel()
+            case .incomplete:
                 if complete || error != nil { connection.cancel() }
                 else { self.receive(connection, accumulated: buffer) }
-                return
+            case let .complete(method, path, query, headers, body):
+                self.respond(
+                    connection,
+                    method: method,
+                    path: path,
+                    query: query,
+                    headers: headers,
+                    body: body
+                )
             }
-            let header = String(decoding: buffer[..<boundary.lowerBound], as: UTF8.self)
-            let lines = header.split(whereSeparator: { $0.isNewline })
-            let requestLine = lines.first?.split(separator: " ") ?? []
-            let method = requestLine.count > 0 ? String(requestLine[0]).uppercased() : "GET"
-            let target = requestLine.count > 1 ? String(requestLine[1]) : "/"
-            let components = URLComponents(string: target)
-            let path = components?.path.isEmpty == false ? components!.path : "/"
-            var query: [String: String] = [:]
-            for item in components?.queryItems ?? [] { query[item.name] = item.value ?? "" }
-            var headers: [String: String] = [:]
-            for line in lines.dropFirst() {
-                let pair = line.split(separator: ":", maxSplits: 1)
-                guard pair.count == 2 else { continue }
-                headers[String(pair[0]).lowercased()] = pair[1]
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-            }
-            let length = Int(headers["content-length"] ?? "0") ?? 0
-            guard length <= 1_000_000 else { connection.cancel(); return }
-            let available = buffer.count - boundary.upperBound
-            if available < length {
-                if complete || error != nil { connection.cancel() }
-                else { self.receive(connection, accumulated: buffer) }
-                return
-            }
-            let body = buffer.subdata(in: boundary.upperBound..<(boundary.upperBound + length))
-            self.respond(
-                connection,
-                method: method,
-                path: path,
-                query: query,
-                headers: headers,
-                body: body
-            )
         }
     }
 

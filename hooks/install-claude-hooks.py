@@ -10,6 +10,7 @@ from pathlib import Path
 EVENTS = [
     "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop", "SessionEnd",
     "Notification", "PreCompact", "SubagentStop",
+    "PermissionRequest", "Elicitation",
 ]
 
 

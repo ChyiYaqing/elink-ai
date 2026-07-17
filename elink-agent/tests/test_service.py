@@ -1,3 +1,4 @@
+import json
 import tempfile
 from pathlib import Path
 
@@ -25,3 +26,28 @@ def test_refresh_writes_preview_and_records_policy():
         assert config.output_path.exists()
         assert display.calls == ["full"]
         assert service.policy.last_signature
+
+
+def test_env_bridge_url_override_wins_over_persisted_state():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        state_path = root / "state.json"
+        state_path.write_text(json.dumps({"bridge_url": "http://persisted:8765"}))
+        config = AgentConfig(
+            output_path=root / "frame.png",
+            state_path=state_path,
+            bridge_url="http://environment:8765",
+            bridge_url_env_override="http://environment:8765",
+        )
+        service = AgentService(config, MockDisplay(config.output_path))
+        assert service.config.bridge_url == "http://environment:8765"
+
+
+def test_persisted_bridge_url_applies_without_env_override():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        state_path = root / "state.json"
+        state_path.write_text(json.dumps({"bridge_url": "http://persisted:8765"}))
+        config = AgentConfig(output_path=root / "frame.png", state_path=state_path)
+        service = AgentService(config, MockDisplay(config.output_path))
+        assert service.config.bridge_url == "http://persisted:8765"

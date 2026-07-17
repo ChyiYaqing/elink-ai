@@ -105,7 +105,7 @@ final class StatusService {
     private func readClaude() -> AgentStatus {
         let files = jsonlFiles(Self.claudeRoot)
         let latest = latestModification(files)
-        let start = Calendar.current.startOfDay(for: Date())
+        let start = Self.startOfAggregationDay(Date())
         let accumulator = ClaudeUsageAccumulator()
         for file in files where (modification(file) ?? .distantPast) >= start {
             guard let text = try? String(contentsOf: file, encoding: .utf8) else { continue }
@@ -126,7 +126,7 @@ final class StatusService {
     private func readCodex() -> AgentStatus {
         let files = jsonlFiles(Self.codexRoot)
         let latest = latestModification(files)
-        let start = Calendar.current.startOfDay(for: Date())
+        let start = Self.startOfAggregationDay(Date())
         var daily: [String: [String: Int]] = [:]
         var latestRateLimits: [String: Any]?
         var latestRateLimitsTimestamp = ""
@@ -169,7 +169,7 @@ final class StatusService {
     func backfillHistory() {
         guard let store else { return }
         let cutoff = Calendar.current.date(
-            byAdding: .day, value: -366, to: Calendar.current.startOfDay(for: Date())) ?? .distantPast
+            byAdding: .day, value: -366, to: Self.startOfAggregationDay(Date())) ?? .distantPast
         let accumulator = ClaudeUsageAccumulator()
         for file in jsonlFiles(Self.claudeRoot) where (modification(file) ?? .distantPast) >= cutoff {
             guard let text = try? String(contentsOf: file, encoding: .utf8) else { continue }
@@ -273,9 +273,15 @@ final class StatusService {
         dayFormatterLock.holding { dayFormatter.string(from: date) }
     }
 
+    static func startOfAggregationDay(_ date: Date) -> Date {
+        dayFormatterLock.holding { aggregationCalendar.startOfDay(for: date) }
+    }
+
     static func setAggregationTimeZone(_ identifier: String?) {
+        let timeZone = identifier.flatMap(TimeZone.init(identifier:)) ?? .current
         dayFormatterLock.holding {
-            dayFormatter.timeZone = identifier.flatMap(TimeZone.init(identifier:)) ?? .current
+            dayFormatter.timeZone = timeZone
+            aggregationCalendar.timeZone = timeZone
         }
     }
 
@@ -285,6 +291,12 @@ final class StatusService {
         let value = DateFormatter()
         value.calendar = Calendar(identifier: .gregorian)
         value.dateFormat = "yyyy-MM-dd"
+        value.timeZone = .current
+        return value
+    }()
+
+    private static var aggregationCalendar: Calendar = {
+        var value = Calendar(identifier: .gregorian)
         value.timeZone = .current
         return value
     }()

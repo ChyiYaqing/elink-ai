@@ -21,6 +21,16 @@ final class ModelsTests: XCTestCase {
         XCTAssertEqual(cluster["node_count"] as? Int, 1)
     }
 
+    func testAggregationDayBoundaryStaysConsistentWithDayKeyAcrossTimeZones() {
+        StatusService.setAggregationTimeZone("Pacific/Kiritimati")
+        defer { StatusService.setAggregationTimeZone(nil) }
+        let reference = Date(timeIntervalSince1970: 1_700_000_000)
+        let startOfDay = StatusService.startOfAggregationDay(reference)
+        let key = StatusService.dayKey(reference)
+        XCTAssertEqual(StatusService.dayKey(startOfDay), key)
+        XCTAssertNotEqual(StatusService.dayKey(startOfDay.addingTimeInterval(-1)), key)
+    }
+
     func testSnapshotUsesLatestProviderUsageUpdate() {
         let old = Date(timeIntervalSince1970: 100)
         let latest = Date(timeIntervalSince1970: 200)

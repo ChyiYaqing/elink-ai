@@ -34,16 +34,18 @@ class RefreshPolicy:
             return RefreshDecision(True, force, "manual")
         signature = self._signature(snapshot, stale)
         priority = self._priority_signature(snapshot, stale)
-        if signature == self.last_signature:
-            return RefreshDecision(False)
-        high_priority = priority != self.last_priority_signature
-        if not high_priority and self.last_refresh_at and now - self.last_refresh_at < self.min_interval_s:
-            return RefreshDecision(False, reason="throttled")
         full_due = (
             not self.last_signature
             or self.partial_count >= self.full_every
             or (self.last_full_at and now - self.last_full_at >= self.full_interval_s)
         )
+        if signature == self.last_signature:
+            if full_due:
+                return RefreshDecision(True, "full", "maintenance")
+            return RefreshDecision(False)
+        high_priority = priority != self.last_priority_signature
+        if not high_priority and self.last_refresh_at and now - self.last_refresh_at < self.min_interval_s:
+            return RefreshDecision(False, reason="throttled")
         return RefreshDecision(True, "full" if full_due else "partial",
                                "priority-change" if high_priority else "data-change")
 

@@ -23,6 +23,7 @@ class AgentConfig:
     full_refresh_every: int = 20
     full_refresh_interval_s: int = 21600
     orientation: int = 0
+    bridge_url_env_override: str | None = None
 
     @classmethod
     def load(cls, path: str | os.PathLike[str] | None) -> "AgentConfig":
@@ -51,4 +52,5 @@ class AgentConfig:
         override = os.getenv("ELINK_BRIDGE_URL")
         if override:
             config.bridge_url = override.rstrip("/")
+            config.bridge_url_env_override = config.bridge_url
         return config

@@ -24,4 +24,4 @@ package-dir = {"" = "elink-agent/src"}
 where = ["elink-agent/src"]
 
 [tool.pytest.ini_options]
-testpaths = ["elink-agent/tests"]
+testpaths = ["elink-agent/tests", "hooks/tests"]

@@ -208,7 +208,7 @@ class AgentService:
         if mode in {"dashboard", "claude", "codex"}:
             self.runtime.mode = mode
         bridge = obj.get("bridge_url")
-        if isinstance(bridge, str) and bridge:
+        if isinstance(bridge, str) and bridge and not self.config.bridge_url_env_override:
             self.config.bridge_url = bridge.rstrip("/")
             self.client = BridgeClient(self.config.bridge_url, self.config.request_timeout_s)
 
