@@ -322,18 +322,23 @@ struct UsageStatsView: View {
         return "\(Int((Double(tokens) / Double(total) * 100).rounded()))%"
     }
 
+    /// 选中的节点若已离开集群，则回退为全部 Mac，避免统计停留在已消失节点上
+    private var effectiveNodeID: String? {
+        clusterNodes.contains { $0.nodeID == selectedNodeID } ? selectedNodeID : nil
+    }
+
     private func load() {
         let since = StatusService.dayKey(
             StatusService.aggregationCalendar.date(byAdding: .day, value: -366, to: Date()) ?? Date())
         let provider = provider
-        let nodeID = selectedNodeID.isEmpty ? nil : selectedNodeID
+        let nodeID = effectiveNodeID
         loaded = false
         DispatchQueue.global(qos: .userInitiated).async {
             let result = nodeID.map {
                 UsageStore.shared.clusterUsage(provider: provider, since: since, nodeID: $0)
             } ?? UsageStore.shared.usage(provider: provider, since: since)
             DispatchQueue.main.async {
-                guard nodeID == (selectedNodeID.isEmpty ? nil : selectedNodeID) else { return }
+                guard nodeID == effectiveNodeID else { return }
                 rows = result
                 loaded = true
             }

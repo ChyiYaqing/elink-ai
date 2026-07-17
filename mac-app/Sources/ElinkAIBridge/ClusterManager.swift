@@ -24,6 +24,8 @@ final class ClusterManager: ObservableObject {
     private let discovery = ClusterDiscovery()
     private let lock = NSLock()
     private var credentials: ClusterCredentials
+    // @Published 属性只能在主线程读写；后台线程使用这份锁保护的镜像
+    private var knownPeers: [DiscoveredClusterPeer] = []
     private var liveStatuses: [String: ClusterLiveStatus] = [:]
     private var replayNonces: [String: Date] = [:]
     private var pairing: PairingState?
@@ -57,6 +59,7 @@ final class ClusterManager: ObservableObject {
         }
         discovery.onPeersChanged = { [weak self] peers in
             guard let self else { return }
+            self.lock.holding { self.knownPeers = peers }
             self.discoveredPeers = peers
             if self.enabled { self.syncAll() }
         }
@@ -71,6 +74,8 @@ final class ClusterManager: ObservableObject {
 
     var nodeID: String { lock.holding { credentials.nodeID } }
     var nodeName: String { lock.holding { credentials.nodeName } }
+    private var isClusteredNow: Bool { lock.holding { credentials.isClustered } }
+    private var currentClusterID: String? { lock.holding { credentials.clusterID } }
 
     func start(port: UInt16) {
         self.port = port
@@ -270,7 +275,7 @@ final class ClusterManager: ObservableObject {
     }
 
     func aggregate(local: BridgeSnapshot, now: Date = Date()) -> BridgeSnapshot {
-        guard enabled else { return local }
+        guard isClusteredNow else { return local }
         store.upsertClusterNode(ClusterNodeRecord(
             nodeID: nodeID,
             name: nodeName,
@@ -371,7 +376,7 @@ final class ClusterManager: ObservableObject {
             }
             current.attempts += 1
             pairing = current
-            return current.code == join.code ? current : nil
+            return ClusterCrypto.constantTimeEqual(current.code, join.code) ? current : nil
         }
         guard let state else { return .error("pairing code rejected", status: 403) }
         let value = lock.holding { credentials }
@@ -417,7 +422,7 @@ final class ClusterManager: ObservableObject {
         knownLive[nodeID] = localLive
         let manifest = ClusterManifest(
             protocolVersion: 2,
-            clusterID: clusterID ?? "",
+            clusterID: currentClusterID ?? "",
             senderNodeID: nodeID,
             senderName: nodeName,
             liveStatuses: knownLive.values.filter {
@@ -471,7 +476,7 @@ final class ClusterManager: ObservableObject {
     // MARK: - Client synchronization
 
     private func syncPeer(_ endpoint: String, completion: ((Error?) -> Void)? = nil) {
-        guard enabled, let key = try? ClusterCrypto.clusterKey(lock.holding({ credentials })),
+        guard isClusteredNow, let key = try? ClusterCrypto.clusterKey(lock.holding({ credentials })),
               let url = URL(string: endpoint + "/v2/cluster/manifest") else {
             completion?(BridgeError.message("同步配置无效")); return
         }
@@ -499,7 +504,7 @@ final class ClusterManager: ObservableObject {
                   let (_, manifest) = try? ClusterCrypto.open(
                     ClusterManifest.self, data: data, key: key
                   ), manifest.protocolVersion == 2,
-                  manifest.clusterID == self.clusterID else {
+                  manifest.clusterID == self.currentClusterID else {
                 completion?(BridgeError.message("节点 \(endpoint) 不属于当前同步集群"))
                 return
             }
@@ -587,7 +592,7 @@ final class ClusterManager: ObservableObject {
     }
 
     private func scheduleAnnounce(_ descriptors: [ClusterSnapshotDescriptor]) {
-        guard enabled, !descriptors.isEmpty else { return }
+        guard isClusteredNow, !descriptors.isEmpty else { return }
         announceWork?.cancel()
         let work = DispatchWorkItem { [weak self] in self?.announce(descriptors) }
         announceWork = work
@@ -616,9 +621,11 @@ final class ClusterManager: ObservableObject {
     }
 
     private func knownEndpoints() -> [String] {
-        let currentCluster = clusterID
-        let discovered = discoveredPeers.filter {
-            $0.clusterID == currentCluster && $0.nodeID != nodeID
+        let (currentCluster, currentNode, peers) = lock.holding {
+            (credentials.clusterID, credentials.nodeID, knownPeers)
+        }
+        let discovered = peers.filter {
+            $0.clusterID == currentCluster && $0.nodeID != currentNode
         }.map(\.endpoint)
         let manual = UserDefaults.standard.stringArray(forKey: manualPeersKey) ?? []
         let stored = store.clusterNodes().compactMap(\.endpoint)

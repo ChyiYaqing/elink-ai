@@ -14,6 +14,8 @@ def main() -> None:
         incoming = json.load(sys.stdin)
     except (json.JSONDecodeError, OSError):
         incoming = {}
+    if not isinstance(incoming, dict):
+        incoming = {}
     payload = {"agent": sys.argv[1], "event": sys.argv[2]}
     message = incoming.get("message") or incoming.get("notification")
     if isinstance(message, str):

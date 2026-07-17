@@ -82,6 +82,8 @@ final class HTTPServer {
 
     private func accept(_ connection: NWConnection) {
         connection.start(queue: queue)
+        // 每个连接只处理一次请求即关闭；整体超时防止慢速客户端长期占用连接
+        queue.asyncAfter(deadline: .now() + 30) { connection.cancel() }
         receive(connection, accumulated: Data())
     }
 

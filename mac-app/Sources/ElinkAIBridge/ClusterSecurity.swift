@@ -144,7 +144,7 @@ enum ClusterCrypto {
         )).base64EncodedString()
     }
 
-    private static func constantTimeEqual(_ first: String, _ second: String) -> Bool {
+    static func constantTimeEqual(_ first: String, _ second: String) -> Bool {
         let lhs = Array(first.utf8)
         let rhs = Array(second.utf8)
         guard lhs.count == rhs.count else { return false }

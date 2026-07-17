@@ -37,9 +37,10 @@ final class ClusterTests: XCTestCase {
             ),
         ])
 
+        // 空集来自暂时读不到日志的场景，不能清掉已有快照或推高 revision
         store.record(day: "2026-07-15", provider: "claude", models: [:])
-        XCTAssertEqual(store.clusterManifest().first?.revision, 3)
-        XCTAssertTrue(store.clusterUsage(provider: "claude", since: "2026-07-15").isEmpty)
+        XCTAssertEqual(store.clusterManifest().first?.revision, 2)
+        XCTAssertEqual(store.clusterUsage(provider: "claude", since: "2026-07-15").first?.tokens, 25)
     }
 
     func testRemoteSnapshotsAreIdempotentAndOlderRevisionCannotOverwrite() {
@@ -56,6 +57,23 @@ final class ClusterTests: XCTestCase {
             key: key, revision: 1, observedAt: Date(), models: ["gpt-5": 999]
         )]).isEmpty)
         XCTAssertEqual(store.clusterUsage(provider: "codex", since: "2026-07-15").first?.tokens, 300)
+    }
+
+    func testRemoteSnapshotClaimingLocalOriginIsRejected() {
+        let (store, path) = store()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        store.configureClusterStorage(nodeID: "node-a", nodeName: "Mac A", aggregationEnabled: true)
+        store.record(day: "2026-07-15", provider: "claude", models: ["sonnet": 100])
+
+        let forged = ClusterUsageSnapshot(
+            key: ClusterSnapshotKey(originNodeID: "node-a", day: "2026-07-15", provider: "claude"),
+            revision: 999,
+            observedAt: Date(),
+            models: ["sonnet": 1]
+        )
+        XCTAssertTrue(store.mergeClusterSnapshots([forged]).isEmpty)
+        XCTAssertEqual(store.clusterUsage(provider: "claude", since: "2026-07-15").first?.tokens, 100)
+        XCTAssertEqual(store.clusterManifest().first?.revision, 1)
     }
 
     func testResettingClusterDropsRemoteDataButPreservesLocalHistory() {

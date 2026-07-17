@@ -81,8 +81,8 @@ class AgentHTTPServer:
 
             def _body(self) -> dict:
                 length = int(self.headers.get("Content-Length", "0"))
-                if length > 65536:
-                    raise ValueError("request body too large")
+                if length < 0 or length > 65536:
+                    raise ValueError("invalid request body length")
                 if length == 0:
                     return {}
                 obj = json.loads(self.rfile.read(length))

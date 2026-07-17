@@ -78,33 +78,33 @@ final class UsageStore {
 
     deinit { sqlite3_close(db) }
 
-    /// 覆盖写入某天某 provider 的各模型用量（值为当日重算的总量而非增量）
+    /// 覆盖写入某天某 provider 的各模型用量（值为当日重算的总量而非增量）。
+    /// 空集只会来自暂时读不到日志的场景，直接忽略，避免清掉已有数据并向集群广播空快照。
     func record(day: String, provider: String, models: [String: Int]) {
         let rows = models.filter { $0.value > 0 }
-        if !rows.isEmpty {
-            queue.sync {
-                guard db != nil else { return }
-                let sql = """
-                INSERT INTO daily_model_usage (day, provider, model, tokens)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(day, provider, model) DO UPDATE SET
-                    tokens = excluded.tokens,
-                    updated_at = CURRENT_TIMESTAMP
-                """
-                var statement: OpaquePointer?
-                guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return }
-                defer { sqlite3_finalize(statement) }
-                for (model, tokens) in rows {
-                    sqlite3_reset(statement)
-                    sqlite3_bind_text(statement, 1, day, -1, Self.transient)
-                    sqlite3_bind_text(statement, 2, provider, -1, Self.transient)
-                    sqlite3_bind_text(statement, 3, model, -1, Self.transient)
-                    sqlite3_bind_int64(statement, 4, Int64(tokens))
-                    sqlite3_step(statement)
-                }
+        guard !rows.isEmpty else { return }
+        queue.sync {
+            guard db != nil else { return }
+            let sql = """
+            INSERT INTO daily_model_usage (day, provider, model, tokens)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(day, provider, model) DO UPDATE SET
+                tokens = excluded.tokens,
+                updated_at = CURRENT_TIMESTAMP
+            """
+            var statement: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return }
+            defer { sqlite3_finalize(statement) }
+            for (model, tokens) in rows {
+                sqlite3_reset(statement)
+                sqlite3_bind_text(statement, 1, day, -1, Self.transient)
+                sqlite3_bind_text(statement, 2, provider, -1, Self.transient)
+                sqlite3_bind_text(statement, 3, model, -1, Self.transient)
+                sqlite3_bind_int64(statement, 4, Int64(tokens))
+                sqlite3_step(statement)
             }
         }
-        if let descriptor = recordLocalClusterSnapshot(day: day, provider: provider, models: models) {
+        if let descriptor = recordLocalClusterSnapshot(day: day, provider: provider, models: rows) {
             onClusterUsageChange?([descriptor])
         }
     }
@@ -144,6 +144,8 @@ final class UsageStore {
         let fetchedAt = usage.fetchedAt ?? Date()
         let windows = [("primary", usage.primary), ("weekly", usage.weekly)]
             .filter { $0.1.percent != nil }
+        // 没有任何窗口的响应不能清掉已持久化的缓存；过期数据由 cachedUsage 读取时丢弃
+        guard !windows.isEmpty else { return }
         queue.sync {
             guard db != nil else { return }
             var latestStatement: OpaquePointer?
@@ -450,7 +452,9 @@ final class UsageStore {
     func mergeClusterSnapshots(_ snapshots: [ClusterUsageSnapshot]) -> [ClusterSnapshotDescriptor] {
         let accepted = queue.sync {
             snapshots.compactMap { snapshot -> ClusterSnapshotDescriptor? in
-                guard ["claude", "codex"].contains(snapshot.key.provider),
+                // 本机 origin 的快照只能由本地 record() 产生，拒绝对端伪造覆盖
+                guard snapshot.key.originNodeID != clusterNodeID,
+                      ["claude", "codex"].contains(snapshot.key.provider),
                       snapshot.key.day.count == 10,
                       snapshot.models.count <= 100,
                       snapshot.models.allSatisfy({ !$0.key.isEmpty && $0.value >= 0 }) else { return nil }

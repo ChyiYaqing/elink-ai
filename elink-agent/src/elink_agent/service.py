@@ -139,6 +139,7 @@ class AgentService:
                         backoff = min(60.0, self.config.poll_interval_s * (2 ** min(self._fetch_failures, 5)))
                         self._next_fetch_at = now_wall + backoff
 
+            refresh_kind = None
             with self._lock:
                 stale = (not self.runtime.last_fetch_at
                          or now_wall - self.runtime.last_fetch_at >= self.config.stale_after_s)
@@ -155,19 +156,26 @@ class AgentService:
                     else:
                         ready = now_mono - self._pending_since >= self.config.coalesce_s
                     if ready and now_wall >= self._display_retry_at:
-                        self._refresh(decision.kind, stale)
+                        refresh_kind = decision.kind
                 else:
                     if decision.reason == "unchanged":
                         self._pending_since = None
+            if refresh_kind:
+                self._refresh(refresh_kind, stale)
 
             self._wake.wait(self.config.poll_interval_s)
             self._wake.clear()
 
     def _refresh(self, kind: str, stale: bool) -> None:
+        # 渲染和墨水屏刷新可能阻塞数十秒，不能持锁执行，否则所有 HTTP API 都会被卡住
+        with self._lock:
+            snapshot = self.snapshot
+            mode = self.runtime.mode
+            marker = (mode, self._force, self._pending_since)
         image = self.renderer.render(
-            self.snapshot,
+            snapshot,
             stale=stale,
-            mode=self.runtime.mode,
+            mode=mode,
             updated_at=datetime.now().astimezone(),
         )
         if self.config.orientation == 180:
@@ -175,22 +183,30 @@ class AgentService:
         try:
             self.display.show(image, kind=kind)
         except Exception as error:
-            self.runtime.last_error = f"display: {error}"
-            self._display_retry_at = time.time() + 60
-            self._force = None
-            self._pending_since = None
+            with self._lock:
+                self.runtime.last_error = f"display: {error}"
+                self._display_retry_at = time.time() + 60
+                self._finish_refresh(marker)
             logger.exception("display refresh failed")
             return
         self._save_preview(image)
         now_wall = time.time()
-        self.policy.record(self.snapshot, stale=stale, kind=kind)
-        self.runtime.last_refresh_at = now_wall
-        self.runtime.last_refresh_kind = kind
-        self._display_retry_at = 0.0
-        self._force = None
-        self._pending_since = None
-        self._save_state()
+        with self._lock:
+            self.policy.record(snapshot, stale=stale, kind=kind)
+            self.runtime.last_refresh_at = now_wall
+            self.runtime.last_refresh_kind = kind
+            self._display_retry_at = 0.0
+            self._finish_refresh(marker)
+            self._save_state()
         logger.info("displayed %s refresh", kind)
+
+    def _finish_refresh(self, marker: tuple) -> None:
+        # 刷新期间到达的 set_mode/request_refresh 不能被清掉，保留其失效标记
+        if (self.runtime.mode, self._force, self._pending_since) == marker:
+            self._force = None
+            self._pending_since = None
+        else:
+            self.policy.last_signature = ""
 
     def _save_preview(self, image) -> None:
         path = self.config.output_path
@@ -203,6 +219,8 @@ class AgentService:
         try:
             obj = json.loads(self.config.state_path.read_text())
         except (OSError, ValueError):
+            return
+        if not isinstance(obj, dict):
             return
         mode = obj.get("mode")
         if mode in {"dashboard", "claude", "codex"}:

@@ -175,6 +175,26 @@ final class ModelsTests: XCTestCase {
             try XCTUnwrap(restartedFetcher.claude.primary.resetMinutes)))
     }
 
+    func testWindowlessResponseDoesNotWipePersistedProviderCache() {
+        let path = NSTemporaryDirectory() + "elink-provider-windowless-\(UUID().uuidString).db"
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let store = UsageStore(path: path)
+        let now = Date()
+        store.cacheUsage(provider: "claude", usage: ProviderUsage(
+            primary: UsageWindow(percent: 31, resetAt: now.addingTimeInterval(60 * 60)),
+            weekly: UsageWindow(percent: 62, resetAt: now.addingTimeInterval(6 * 24 * 60 * 60)),
+            fetchedAt: now
+        ))
+        // HTTP 200 但缺少窗口字段的响应不能删掉上一次有效缓存
+        store.cacheUsage(provider: "claude", usage: ProviderUsage(
+            fetchedAt: now.addingTimeInterval(10)
+        ))
+
+        let restored = store.cachedUsage(provider: "claude", now: now.addingTimeInterval(20))
+        XCTAssertEqual(restored?.primary.percent, 31)
+        XCTAssertEqual(restored?.weekly.percent, 62)
+    }
+
     func testUsageStoreDropsOnlyExpiredWindowAndReplacesOldRows() {
         let path = NSTemporaryDirectory() + "elink-provider-expiry-\(UUID().uuidString).db"
         defer { try? FileManager.default.removeItem(atPath: path) }

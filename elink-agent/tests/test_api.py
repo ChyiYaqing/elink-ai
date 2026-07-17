@@ -1,4 +1,5 @@
 import json
+import socket
 import tempfile
 from pathlib import Path
 from urllib.request import Request, urlopen
@@ -30,5 +31,12 @@ def test_device_api_and_mode_change():
             with urlopen(request) as response:
                 assert response.status == 202
             assert service.runtime.mode == "claude"
+
+            raw = (b"POST /v1/display/refresh HTTP/1.1\r\n"
+                   b"Host: localhost\r\nContent-Length: -1\r\n\r\n")
+            with socket.create_connection(("127.0.0.1", port), timeout=5) as conn:
+                conn.sendall(raw)
+                status_line = conn.makefile("rb").readline()
+            assert b"400" in status_line
         finally:
             server.stop()
