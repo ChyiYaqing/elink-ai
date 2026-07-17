@@ -6,6 +6,16 @@ and `Removed`.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## 0.1.11
+
+### Fixed
+
+- E-paper refreshes staying unchanged indefinitely, blocking local APIs while the panel was busy, or dropping refresh and display-mode requests that arrived during an in-progress update
+- Multi-Mac daily usage and chart labels drifting across time zones, and statistics remaining filtered to a Mac after that node left the cluster
+- Transient empty log or quota responses clearing previously recorded usage, along with cluster synchronization races and acceptance of remote snapshots claiming the local Mac's identity
+- Malformed or slow HTTP clients crashing or holding bridge and agent connections open indefinitely
+- Claude Code hooks missing permission and elicitation events, and hook installation failing on empty, null, malformed, or non-object settings and event payloads
+
 ## 0.1.10
 
 ### Packaging
