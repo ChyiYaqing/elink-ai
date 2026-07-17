@@ -6,6 +6,16 @@ and `Removed`.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## 0.1.12
+
+### Packaging
+
+- macOS app and Raspberry Pi agent versions are aligned at 0.1.12 for clearer deployment identification
+
+### Added
+
+- Running Raspberry Pi agent version in the e-paper footer and macOS device status
+
 ## 0.1.11
 
 ### Fixed

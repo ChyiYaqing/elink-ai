@@ -316,7 +316,7 @@ final class ModelsTests: XCTestCase {
     func testParsesDetailedDeviceState() throws {
         let info = try DeviceInfo(json: [
             "device_type": "elink-agent",
-            "version": "0.1.4",
+            "version": "0.1.12",
             "bridge_url": "http://192.168.1.2:8765",
             "mode": "codex",
             "stale": false,
@@ -327,11 +327,11 @@ final class ModelsTests: XCTestCase {
 
         XCTAssertEqual(info.lastFetchAge, 3)
         XCTAssertEqual(info.lastRefreshAge, 42)
-        XCTAssertEqual(info.version, "0.1.4")
+        XCTAssertEqual(info.version, "0.1.12")
         XCTAssertEqual(PreviewPopoverController.segment(for: info.mode), 2)
         let summary = PreviewPopoverController.deviceSummary(info)
         XCTAssertTrue(summary.contains("42秒前送屏"))
-        XCTAssertTrue(summary.contains("v0.1.4"))
+        XCTAssertTrue(summary.contains("v0.1.12"))
     }
 
     func testDeviceSummaryOmitsVersionWhenAgentDoesNotReportOne() throws {
