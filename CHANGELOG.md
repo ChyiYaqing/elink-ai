@@ -6,6 +6,20 @@ and `Removed`.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## 0.1.14
+
+### Changed
+
+- Multi-Mac pairing now uses high-entropy 16-character codes and authenticated key exchange, with explicit errors for clients using the retired pairing protocol
+
+### Fixed
+
+- Raspberry Pi refresh failures stopping polling, dropping queued refreshes, or reporting successful panel updates as failed when only preview or state persistence failed
+- Multi-Mac synchronization races leaving stale credentials or usage data, recording failed pulls as successful, and requiring the statistics view to be reopened before changes appeared
+- Usage history and cluster snapshot writes partially committing or crashing the app on database errors, plus time-zone migrations mishandling equivalent zone aliases and deleted-log residue
+- Claude Code hook settings being written with permissions that were broader than owner-only access
+- Claude and Codex provider cards having uneven heights in the usage panel
+
 ## 0.1.13
 
 ### Added
