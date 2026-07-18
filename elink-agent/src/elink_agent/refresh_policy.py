@@ -34,18 +34,21 @@ class RefreshPolicy:
             return RefreshDecision(True, force, "manual")
         signature = self._signature(snapshot, stale)
         priority = self._priority_signature(snapshot, stale)
-        full_due = (
-            not self.last_signature
-            or self.partial_count >= self.full_every
-            or (self.last_full_at and now - self.last_full_at >= self.full_interval_s)
-        )
+        time_due = bool(self.last_full_at and now - self.last_full_at >= self.full_interval_s)
         if signature == self.last_signature:
-            if full_due:
+            # 未变化分支不能用 partial_count + 1：full 后计数归零会造成无限维护全刷
+            if self.partial_count >= self.full_every or time_due:
                 return RefreshDecision(True, "full", "maintenance")
             return RefreshDecision(False)
         high_priority = priority != self.last_priority_signature
         if not high_priority and self.last_refresh_at and now - self.last_refresh_at < self.min_interval_s:
             return RefreshDecision(False, reason="throttled")
+        # partial_count + 1 即本次刷新的序号：full_every=1 时每次都 full（禁用 partial）
+        full_due = (
+            not self.last_signature
+            or self.partial_count + 1 >= self.full_every
+            or time_due
+        )
         return RefreshDecision(True, "full" if full_due else "partial",
                                "priority-change" if high_priority else "data-change")
 

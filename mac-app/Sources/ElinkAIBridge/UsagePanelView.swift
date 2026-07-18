@@ -404,7 +404,7 @@ struct UsagePanelView: View {
                                 }
                                 Spacer()
                                 Text(code)
-                                    .font(.system(size: 16, weight: .bold, design: .monospaced))
+                                    .font(.system(size: 12, weight: .bold, design: .monospaced))
                                     .foregroundStyle(theme.textPrimary)
                                     .textSelection(.enabled)
                             }
@@ -449,7 +449,7 @@ struct UsagePanelView: View {
                                     Text("加入已有同步集群")
                                         .font(.system(size: 9, weight: .semibold, design: .rounded))
                                         .foregroundStyle(theme.textPrimary)
-                                    Text("输入另一台 Mac 显示的地址和 6 位配对码")
+                                    Text("输入另一台 Mac 显示的地址和配对码")
                                         .font(.system(size: 8, weight: .medium))
                                         .foregroundStyle(theme.textTertiary)
                                 }
@@ -532,8 +532,9 @@ struct UsagePanelView: View {
                         ) { showLeaveClusterConfirmation = true }
                     } else {
                         WideButton(title: "创建同步集群", icon: "plus.circle", theme: theme) {
-                            cluster.createCluster()
-                            clusterMessage = "同步集群已创建，可在此生成配对码"
+                            clusterMessage = cluster.createCluster()
+                                ? "同步集群已创建，可在此生成配对码"
+                                : "创建失败：集群凭据写入失败，请重试"
                         }
 
                         Divider().opacity(0.4)
@@ -651,23 +652,32 @@ struct UsagePanelView: View {
         return transient
     }
 
+    static func preferredPairingPeer(in peers: [DiscoveredClusterPeer]) -> DiscoveredClusterPeer? {
+        peers.first { $0.pairable && $0.pairingCompatible }
+            ?? peers.first { $0.pairable }
+    }
+
     @ViewBuilder
     private func clusterJoinFields(_ theme: PanelTheme, buttonTitle: String) -> some View {
         TextField("集群主机地址，例如 macbook.local:8765", text: $clusterAddress)
             .textFieldStyle(.roundedBorder)
             .font(.system(size: 10, design: .monospaced))
             .onSubmit { joinClusterFromFields() }
-        TextField("6 位配对码（填满后自动加入）", text: $clusterCode)
+        TextField("配对码，例如 ABCD-EFGH-JKMN-PQRS（填满后自动加入）", text: $clusterCode)
             .textFieldStyle(.roundedBorder)
             .font(.system(size: 10, design: .monospaced))
             .onSubmit { joinClusterFromFields() }
             .onChange(of: clusterCode) { value in
-                let digits = String(value.filter(\.isNumber).prefix(6))
-                if digits != value {
-                    clusterCode = digits
+                let cleaned = String(
+                    value.uppercased()
+                        .filter { $0.isLetter || $0.isNumber || $0 == "-" }
+                        .prefix(19)
+                )
+                if cleaned != value {
+                    clusterCode = cleaned
                     return
                 }
-                if digits.count == 6,
+                if ClusterCrypto.normalizedPairingCode(cleaned) != nil,
                    !clusterAddress.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     joinClusterFromFields()
                 }
@@ -675,14 +685,20 @@ struct UsagePanelView: View {
         Text("在集群主机点击“添加 Mac”生成配对码；验证码有效期为两分钟。")
             .font(.system(size: 8, weight: .medium))
             .foregroundStyle(theme.textTertiary)
-        if let peer = cluster.discoveredPeers.first(where: { $0.pairable }) {
-            Button("使用已发现的 \(peer.name)") {
-                clusterAddress = peer.endpoint
-                if clusterCode.count == 6 { joinClusterFromFields() }
+        if let peer = Self.preferredPairingPeer(in: cluster.discoveredPeers) {
+            if peer.pairingCompatible {
+                Button("使用已发现的 \(peer.name)") {
+                    clusterAddress = peer.endpoint
+                    if ClusterCrypto.normalizedPairingCode(clusterCode) != nil { joinClusterFromFields() }
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(theme.textSecondary)
+            } else {
+                Text("发现 \(peer.name)，但其版本过旧，无法配对；请先把它升级到最新版")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(theme.statusWarning)
             }
-            .buttonStyle(.plain)
-            .font(.system(size: 9, weight: .semibold))
-            .foregroundStyle(theme.textSecondary)
         }
         WideButton(title: buttonTitle, icon: "link.badge.plus", theme: theme) {
             joinClusterFromFields()

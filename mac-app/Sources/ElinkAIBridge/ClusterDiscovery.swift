@@ -58,6 +58,8 @@ final class ClusterDiscovery: NSObject, NetServiceBrowserDelegate, NetServiceDel
     private static func txtData(nodeID: String, clusterID: String?, pairable: Bool) -> Data {
         var values: [String: Data] = [
             "version": Data("2".utf8),
+            // 配对协议版本单独广播；旧版本没有该字段，解析时按 2 处理
+            "pairproto": Data(String(DiscoveredClusterPeer.currentPairingProtocol).utf8),
             "node": Data(nodeID.utf8),
             "pairing": Data(pairable ? "1".utf8 : "0".utf8),
         ]
@@ -91,12 +93,15 @@ final class ClusterDiscovery: NSObject, NetServiceBrowserDelegate, NetServiceDel
         guard remoteNode != nodeID else { return }
         let cluster = txt["cluster"].map { String(decoding: $0, as: UTF8.self) }
         let pairable = txt["pairing"].map { String(decoding: $0, as: UTF8.self) == "1" } ?? false
+        let pairingProtocol = txt["pairproto"]
+            .flatMap { Int(String(decoding: $0, as: UTF8.self)) } ?? 2
         let peer = DiscoveredClusterPeer(
             nodeID: remoteNode,
             name: sender.name,
             endpoint: "http://\(host):\(sender.port)",
             clusterID: cluster,
-            pairable: pairable
+            pairable: pairable,
+            pairingProtocol: pairingProtocol
         )
         peers[peer.id] = peer
         notify()

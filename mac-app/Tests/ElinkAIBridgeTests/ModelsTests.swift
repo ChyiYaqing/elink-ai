@@ -31,6 +31,76 @@ final class ModelsTests: XCTestCase {
         XCTAssertNotEqual(StatusService.dayKey(startOfDay.addingTimeInterval(-1)), key)
     }
 
+    func testCapturedDayKeyDoesNotFollowLaterGlobalTimeZoneChanges() throws {
+        let utc = try XCTUnwrap(TimeZone(identifier: "UTC"))
+        let fixedDayKey = StatusService.dayKeyMaker(utc)
+        let reference = Date(timeIntervalSince1970: 1_700_000_000)
+        let expected = fixedDayKey(reference)
+
+        StatusService.setAggregationTimeZone("Pacific/Kiritimati")
+        defer { StatusService.setAggregationTimeZone(nil) }
+
+        XCTAssertEqual(fixedDayKey(reference), expected)
+        XCTAssertNotEqual(StatusService.dayKey(reference), expected)
+    }
+
+    func testUsageMaintenanceRemainsNeededWhileStoredMarkerLagsCurrentTimeZone() {
+        let path = NSTemporaryDirectory() + "elink-maintenance-retry-\(UUID().uuidString).db"
+        defer {
+            StatusService.setAggregationTimeZone(nil)
+            try? FileManager.default.removeItem(atPath: path)
+        }
+        let store = UsageStore(path: path)
+        XCTAssertEqual(store.applyBucketMigration(
+            expectedSource: nil,
+            target: "UTC",
+            oldExplained: nil,
+            targetTotals: UsageHistoryTotals(claude: [:], codex: [:])
+        ), .applied)
+        let service = StatusService(usage: UsageFetcher(cacheStore: store), store: store)
+
+        StatusService.setAggregationTimeZone("UTC")
+        XCTAssertFalse(service.usageMaintenanceNeeded())
+        StatusService.setAggregationTimeZone("Asia/Singapore")
+        XCTAssertTrue(service.usageMaintenanceNeeded())
+        XCTAssertTrue(StatusService.shouldRunUsageMaintenance(
+            applied: "Asia/Singapore", current: "Asia/Singapore", retryPending: true
+        ))
+    }
+
+    func testJSONLFileScanDistinguishesMissingRootFromInvalidRoot() throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("elink-jsonl-root-\(UUID().uuidString)")
+        let missing = root.appendingPathExtension("missing")
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        XCTAssertTrue(try XCTUnwrap(StatusService.jsonlFiles(at: missing)).isEmpty)
+        try "not a directory".write(to: root, atomically: true, encoding: .utf8)
+        XCTAssertNil(StatusService.jsonlFiles(at: root))
+    }
+
+    func testKnownRebucketPlanPreservesResidueWhenTargetDayHasMoreLogUsage() {
+        let plan = UsageStore.knownRebucketPlan(
+            stored: ["2026-07-14": ["sonnet": 150]],
+            oldExplained: ["2026-07-14": ["sonnet": 100]],
+            targetTotals: ["2026-07-14": ["sonnet": 200]]
+        )
+
+        XCTAssertEqual(plan, ["2026-07-14": ["sonnet": 250]])
+    }
+
+    func testLegacyRebucketPlanMovesKnownLogsWithoutDoubleCountingAndPreservesTotal() {
+        let plan = UsageStore.legacyRebucketPlan(
+            stored: ["2026-07-14": ["sonnet": 110]],
+            targetTotals: ["2026-07-15": ["sonnet": 10]]
+        )
+
+        XCTAssertEqual(plan, [
+            "2026-07-14": ["sonnet": 100],
+            "2026-07-15": ["sonnet": 10],
+        ])
+    }
+
     func testSnapshotUsesLatestProviderUsageUpdate() {
         let old = Date(timeIntervalSince1970: 100)
         let latest = Date(timeIntervalSince1970: 200)
@@ -82,10 +152,14 @@ final class ModelsTests: XCTestCase {
         defer { try? FileManager.default.removeItem(atPath: path) }
         let store = UsageStore(path: path)
 
-        store.record(day: "2026-07-13", provider: "claude", models: ["claude-a": 100, "claude-b": 50])
-        store.record(day: "2026-07-14", provider: "claude", models: ["claude-a": 10, "empty": 0])
-        store.record(day: "2026-07-14", provider: "codex", models: ["gpt-a": 7])
-        store.record(day: "2026-07-14", provider: "claude", models: ["claude-a": 25])
+        store.record(day: "2026-07-13", provider: "claude",
+                     models: ["claude-a": 100, "claude-b": 50], expectedBucketTimeZone: nil)
+        store.record(day: "2026-07-14", provider: "claude",
+                     models: ["claude-a": 10, "empty": 0], expectedBucketTimeZone: nil)
+        store.record(day: "2026-07-14", provider: "codex", models: ["gpt-a": 7],
+                     expectedBucketTimeZone: nil)
+        store.record(day: "2026-07-14", provider: "claude", models: ["claude-a": 25],
+                     expectedBucketTimeZone: nil)
 
         XCTAssertEqual(store.usage(provider: "claude", since: "2026-07-14"), [
             DailyModelUsage(day: "2026-07-14", provider: "claude", model: "claude-a", tokens: 25),
@@ -142,7 +216,8 @@ final class ModelsTests: XCTestCase {
         """
         XCTAssertEqual(sqlite3_exec(db, setOldTimestamps, nil, nil, nil), SQLITE_OK)
 
-        store.record(day: "2026-07-14", provider: "claude", models: ["claude-a": 25])
+        store.record(day: "2026-07-14", provider: "claude", models: ["claude-a": 25],
+                     expectedBucketTimeZone: nil)
 
         var rowStatement: OpaquePointer?
         let rowSQL = "SELECT tokens, created_at, updated_at FROM daily_model_usage"
@@ -154,6 +229,242 @@ final class ModelsTests: XCTestCase {
         XCTAssertEqual(String(cString: createdAt), oldTimestamp)
         XCTAssertNotEqual(String(cString: updatedAt), oldTimestamp)
         sqlite3_finalize(rowStatement)
+    }
+
+    func testUsageBucketMigrationCommitsRowsSnapshotsAndMarkerTogether() {
+        let path = NSTemporaryDirectory() + "elink-bucket-migration-\(UUID().uuidString).db"
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let store = UsageStore(path: path)
+        store.configureClusterStorage(nodeID: "node-a", nodeName: "Mac A", aggregationEnabled: false)
+        store.record(day: "2026-07-14", provider: "claude", models: ["sonnet": 150],
+                     expectedBucketTimeZone: nil)
+        XCTAssertEqual(store.applyBucketMigration(
+            expectedSource: nil,
+            target: "UTC",
+            oldExplained: nil,
+            targetTotals: UsageHistoryTotals(
+                claude: ["2026-07-14": ["sonnet": 150]], codex: [:]
+            )
+        ), .applied)
+
+        let result = store.applyBucketMigration(
+            expectedSource: "UTC",
+            target: "Asia/Singapore",
+            oldExplained: UsageHistoryTotals(
+                claude: ["2026-07-14": ["sonnet": 100]], codex: [:]
+            ),
+            targetTotals: UsageHistoryTotals(
+                claude: ["2026-07-15": ["sonnet": 30]], codex: [:]
+            )
+        )
+
+        XCTAssertEqual(result, .applied)
+        XCTAssertEqual(store.usageBucketTimeZone(), "Asia/Singapore")
+        XCTAssertEqual(store.usage(provider: "claude", since: "2026-01-01"), [
+            DailyModelUsage(day: "2026-07-14", provider: "claude", model: "sonnet", tokens: 50),
+            DailyModelUsage(day: "2026-07-15", provider: "claude", model: "sonnet", tokens: 30),
+        ])
+        XCTAssertEqual(store.clusterManifest().map(\.revision).max(), 2)
+    }
+
+    func testRecordRejectsCapturedDayFromSupersededBucketTimeZone() {
+        let path = NSTemporaryDirectory() + "elink-bucket-record-cas-\(UUID().uuidString).db"
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let store = UsageStore(path: path)
+        XCTAssertEqual(store.applyBucketMigration(
+            expectedSource: nil,
+            target: "UTC",
+            oldExplained: nil,
+            targetTotals: UsageHistoryTotals(claude: [:], codex: [:])
+        ), .applied)
+        XCTAssertEqual(store.applyBucketMigration(
+            expectedSource: "UTC",
+            target: "Asia/Singapore",
+            oldExplained: UsageHistoryTotals(claude: [:], codex: [:]),
+            targetTotals: UsageHistoryTotals(claude: [:], codex: [:])
+        ), .applied)
+
+        store.record(day: "2026-07-14", provider: "claude", models: ["sonnet": 100],
+                     expectedBucketTimeZone: "UTC")
+        XCTAssertTrue(store.usage(provider: "claude", since: "2026-01-01").isEmpty)
+
+        store.record(day: "2026-07-15", provider: "claude", models: ["sonnet": 100],
+                     expectedBucketTimeZone: "Asia/Singapore")
+        XCTAssertEqual(store.usage(provider: "claude", since: "2026-01-01"), [
+            DailyModelUsage(day: "2026-07-15", provider: "claude", model: "sonnet", tokens: 100),
+        ])
+    }
+
+    func testUsageBucketMigrationCommitFailureRollsBackRowsSnapshotsAndMarker() {
+        let path = NSTemporaryDirectory() + "elink-bucket-rollback-\(UUID().uuidString).db"
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let store = UsageStore(path: path)
+        store.configureClusterStorage(nodeID: "node-a", nodeName: "Mac A", aggregationEnabled: false)
+        store.record(day: "2026-07-14", provider: "claude", models: ["sonnet": 100],
+                     expectedBucketTimeZone: nil)
+        XCTAssertEqual(store.applyBucketMigration(
+            expectedSource: nil,
+            target: "UTC",
+            oldExplained: nil,
+            targetTotals: UsageHistoryTotals(
+                claude: ["2026-07-14": ["sonnet": 100]], codex: [:]
+            )
+        ), .applied)
+        let revision = store.clusterManifest().first?.revision
+
+        var blocker: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(path, &blocker), SQLITE_OK)
+        defer {
+            sqlite3_exec(blocker, "ROLLBACK", nil, nil, nil)
+            sqlite3_close(blocker)
+        }
+        XCTAssertEqual(sqlite3_exec(blocker, "BEGIN", nil, nil, nil), SQLITE_OK)
+        var statement: OpaquePointer?
+        XCTAssertEqual(sqlite3_prepare_v2(blocker, "SELECT COUNT(*) FROM daily_model_usage", -1,
+                                         &statement, nil), SQLITE_OK)
+        XCTAssertEqual(sqlite3_step(statement), SQLITE_ROW)
+        defer { sqlite3_finalize(statement) }
+
+        let result = store.applyBucketMigration(
+            expectedSource: "UTC",
+            target: "Asia/Singapore",
+            oldExplained: UsageHistoryTotals(
+                claude: ["2026-07-14": ["sonnet": 100]], codex: [:]
+            ),
+            targetTotals: UsageHistoryTotals(
+                claude: ["2026-07-15": ["sonnet": 100]], codex: [:]
+            )
+        )
+
+        XCTAssertEqual(result, .failed)
+        XCTAssertEqual(store.usageBucketTimeZone(), "UTC")
+        XCTAssertEqual(store.usage(provider: "claude", since: "2026-01-01"), [
+            DailyModelUsage(day: "2026-07-14", provider: "claude", model: "sonnet", tokens: 100),
+        ])
+        XCTAssertEqual(store.clusterManifest().first?.revision, revision)
+    }
+
+    func testLegacyBucketInitializationIsExplicitlyMarkedUnknown() {
+        let path = NSTemporaryDirectory() + "elink-bucket-legacy-\(UUID().uuidString).db"
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let store = UsageStore(path: path)
+        store.record(day: "2026-07-14", provider: "claude", models: ["sonnet": 110],
+                     expectedBucketTimeZone: nil)
+
+        XCTAssertEqual(store.applyBucketMigration(
+            expectedSource: nil,
+            target: "Asia/Singapore",
+            oldExplained: nil,
+            targetTotals: UsageHistoryTotals(
+                claude: ["2026-07-15": ["sonnet": 10]], codex: [:]
+            )
+        ), .applied)
+
+        XCTAssertEqual(store.usageBucketTimeZone(), "Asia/Singapore")
+        XCTAssertTrue(store.usageBucketHasLegacyUnknownData())
+        XCTAssertEqual(store.usage(provider: "claude", since: "2026-01-01"), [
+            DailyModelUsage(day: "2026-07-14", provider: "claude", model: "sonnet", tokens: 100),
+            DailyModelUsage(day: "2026-07-15", provider: "claude", model: "sonnet", tokens: 10),
+        ])
+    }
+
+    func testBackfillMergeDoesNotEraseDeletedLogResidueOnSameDay() {
+        let path = NSTemporaryDirectory() + "elink-backfill-residue-\(UUID().uuidString).db"
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let store = UsageStore(path: path)
+        store.record(day: "2026-07-14", provider: "claude", models: ["sonnet": 110],
+                     expectedBucketTimeZone: nil)
+        XCTAssertEqual(store.applyBucketMigration(
+            expectedSource: nil,
+            target: "UTC",
+            oldExplained: nil,
+            targetTotals: UsageHistoryTotals(
+                claude: ["2026-07-14": ["sonnet": 10]], codex: [:]
+            )
+        ), .applied)
+
+        XCTAssertTrue(store.mergeBackfillTotals(
+            expectedTimeZone: "UTC",
+            totals: UsageHistoryTotals(
+                claude: ["2026-07-14": ["sonnet": 10]], codex: [:]
+            )
+        ))
+
+        XCTAssertEqual(store.usage(provider: "claude", since: "2026-01-01"), [
+            DailyModelUsage(day: "2026-07-14", provider: "claude", model: "sonnet", tokens: 110),
+        ])
+    }
+
+    func testRemoteSnapshotCommitFailureIsNotReportedAsAccepted() {
+        let path = NSTemporaryDirectory() + "elink-remote-rollback-\(UUID().uuidString).db"
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let store = UsageStore(path: path)
+        store.configureClusterStorage(nodeID: "node-a", nodeName: "Mac A", aggregationEnabled: true)
+
+        var blocker: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(path, &blocker), SQLITE_OK)
+        defer {
+            sqlite3_exec(blocker, "ROLLBACK", nil, nil, nil)
+            sqlite3_close(blocker)
+        }
+        XCTAssertEqual(sqlite3_exec(blocker, "BEGIN", nil, nil, nil), SQLITE_OK)
+        var statement: OpaquePointer?
+        XCTAssertEqual(sqlite3_prepare_v2(blocker, "SELECT COUNT(*) FROM cluster_usage_snapshots", -1,
+                                         &statement, nil), SQLITE_OK)
+        XCTAssertEqual(sqlite3_step(statement), SQLITE_ROW)
+        defer { sqlite3_finalize(statement) }
+
+        let accepted = store.mergeClusterSnapshots([ClusterUsageSnapshot(
+            key: ClusterSnapshotKey(
+                originNodeID: "node-b", day: "2026-07-15", provider: "claude"
+            ),
+            revision: 1,
+            observedAt: Date(),
+            models: ["opus": 200]
+        )], ifEpoch: store.clusterDataEpoch())
+
+        XCTAssertNil(accepted)
+        XCTAssertTrue(store.clusterManifest().isEmpty)
+    }
+
+    func testRemoteSnapshotBatchRollsBackEarlierRowsWhenLaterWriteFails() {
+        let path = NSTemporaryDirectory() + "elink-remote-batch-rollback-\(UUID().uuidString).db"
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let store = UsageStore(path: path)
+        store.configureClusterStorage(nodeID: "node-a", nodeName: "Mac A", aggregationEnabled: true)
+
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(path, &db), SQLITE_OK)
+        defer { sqlite3_close(db) }
+        let trigger = """
+        CREATE TRIGGER reject_node_c
+        BEFORE INSERT ON cluster_usage_snapshots
+        WHEN NEW.origin_node_id = 'node-c'
+        BEGIN SELECT RAISE(ABORT, 'forced snapshot failure'); END;
+        """
+        XCTAssertEqual(sqlite3_exec(db, trigger, nil, nil, nil), SQLITE_OK)
+
+        let accepted = store.mergeClusterSnapshots([
+            ClusterUsageSnapshot(
+                key: ClusterSnapshotKey(
+                    originNodeID: "node-b", day: "2026-07-15", provider: "claude"
+                ),
+                revision: 1,
+                observedAt: Date(),
+                models: ["sonnet": 100]
+            ),
+            ClusterUsageSnapshot(
+                key: ClusterSnapshotKey(
+                    originNodeID: "node-c", day: "2026-07-15", provider: "claude"
+                ),
+                revision: 1,
+                observedAt: Date(),
+                models: ["opus": 200]
+            ),
+        ], ifEpoch: store.clusterDataEpoch())
+
+        XCTAssertNil(accepted)
+        XCTAssertTrue(store.clusterManifest().isEmpty)
     }
 
     func testUsageStoreRestoresUnexpiredProviderWindowsAfterRestart() throws {
@@ -696,6 +1007,47 @@ final class ModelsTests: XCTestCase {
         XCTAssertNil(result.primary.percent)
         XCTAssertEqual(result.weekly.percent, 52)
         XCTAssertEqual(result.error, "temporary error")
+    }
+
+    func testStaleCachedFallbackDoesNotOverrideFresherStoredUsage() {
+        let now = Date()
+        let old = ProviderUsage(
+            primary: UsageWindow(percent: 40, resetMinutes: 120,
+                                 resetAt: now.addingTimeInterval(7200)),
+            fetchedAt: now.addingTimeInterval(-300)
+        )
+        let staleCached = ProviderUsage(
+            primary: UsageWindow(percent: 12, resetMinutes: 60,
+                                 resetAt: now.addingTimeInterval(3600)),
+            error: "Claude 用量请求失败",
+            fetchedAt: now.addingTimeInterval(-3 * 3600),
+            isCached: true
+        )
+
+        let result = UsageFetcher.keepLastGood(old: old, new: staleCached)
+
+        XCTAssertEqual(result.primary.percent, 40)
+        XCTAssertEqual(result.error, "Claude 用量请求失败")
+        XCTAssertTrue(result.isCached)
+    }
+
+    func testFresherCachedFallbackReplacesOlderStoredUsage() {
+        let now = Date()
+        let old = ProviderUsage(
+            primary: UsageWindow(percent: 40, resetMinutes: 120,
+                                 resetAt: now.addingTimeInterval(7200)),
+            fetchedAt: now.addingTimeInterval(-2 * 3600)
+        )
+        let cached = ProviderUsage(
+            primary: UsageWindow(percent: 55, resetMinutes: 60,
+                                 resetAt: now.addingTimeInterval(3600)),
+            fetchedAt: now.addingTimeInterval(-600),
+            isCached: true
+        )
+
+        let result = UsageFetcher.keepLastGood(old: old, new: cached)
+
+        XCTAssertEqual(result.primary.percent, 55)
     }
 
     func testUsageLogDescriptionIncludesValuesCacheAndError() {

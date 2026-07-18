@@ -7,6 +7,13 @@ let usage = UsageFetcher(cacheStore: usageStore)
 let cluster = ClusterManager(store: usageStore)
 let status = StatusService(usage: usage, store: usageStore, cluster: cluster)
 cluster.localStatusProvider = { status.localSnapshotForSync() }
+// backfill 和时区重分桶共用一条串行队列：并发解析会读到可变的全局时区，产生混合桶。
+// runUsageMaintenance 自查“已应用分桶时区”与当前时区，过期任务自然变成 no-op，
+// 崩溃或跳过的迁移也会在下一次维护（包括下次启动）从正确起点重跑
+let usageMaintenanceQueue = DispatchQueue(label: "ai.elink.usage-maintenance", qos: .utility)
+cluster.onAggregationTimeZoneChange = {
+    usageMaintenanceQueue.async { status.runUsageMaintenance() }
+}
 var routes = cluster.routes()
 routes[HTTPRouteKey("GET", "/")] = { _ in .json(status.snapshot().jsonData()) }
 routes[HTTPRouteKey("GET", "/v1/status")] = { _ in .json(status.snapshot().jsonData()) }
@@ -37,9 +44,12 @@ server.onRequest = { path, ip in
 Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { _ in
     DeviceClient.healPairingIfNeeded(port: port)
 }
-// 回填历史用量到 SQLite；此后每 5 分钟落一次今日数据，即使没有设备轮询也持续记录
-DispatchQueue.global(qos: .utility).async { status.backfillHistory() }
+// 回填历史用量到 SQLite（时区标记不一致时先完成重分桶迁移）；
+// 此后每 5 分钟落一次今日数据，即使没有设备轮询也持续记录
+usageMaintenanceQueue.async { status.runUsageMaintenance() }
 Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { _ in
+    // 迁移因瞬时文件/SQLite 错误失败时 marker 保持旧值，周期检测并重试。
+    usageMaintenanceQueue.async { status.retryUsageMaintenanceIfNeeded() }
     DispatchQueue.global(qos: .utility).async { _ = status.snapshot() }
 }
 do {

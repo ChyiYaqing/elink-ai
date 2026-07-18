@@ -26,7 +26,9 @@ class RuntimeState:
     last_fetch_at: float = 0.0
     last_refresh_at: float = 0.0
     last_refresh_kind: str = "none"
+    # fetch 与 refresh/display 的错误分开保存：fetch 成功不能掩盖仍在重试的刷新故障
     last_error: str | None = None
+    refresh_error: str | None = None
     stale: bool = True
 
 
@@ -116,7 +118,7 @@ class AgentService:
                 "last_refresh_age_s": None if not self.runtime.last_refresh_at else int(now - self.runtime.last_refresh_at),
                 "last_refresh_kind": self.runtime.last_refresh_kind,
                 "partial_count": self.policy.partial_count,
-                "error": self.runtime.last_error,
+                "error": self.runtime.refresh_error or self.runtime.last_error,
             }
 
     def preview_path(self) -> Path:
@@ -163,8 +165,22 @@ class AgentService:
                 else:
                     if decision.reason == "unchanged":
                         self._pending_since = None
+                        # 自动刷新的新内容失败后，数据若回到屏幕已显示的签名，
+                        # 该 display/render 错误已过期，不能永久占据设备状态。
+                        if self.runtime.refresh_error and self.runtime.refresh_error.startswith(
+                            ("display:", "refresh:")
+                        ):
+                            self.runtime.refresh_error = None
+                            self._display_retry_at = 0.0
             if refresh_kind:
-                self._refresh(refresh_kind, stale)
+                # 渲染或写预览/状态文件失败不能杀死轮询线程，记错误后按重试窗口再试
+                try:
+                    self._refresh(refresh_kind, stale)
+                except Exception as error:
+                    logger.exception("refresh failed")
+                    with self._lock:
+                        self.runtime.refresh_error = f"refresh: {error}"
+                        self._display_retry_at = time.time() + 60
 
             self._wake.wait(self.config.poll_interval_s)
             self._wake.clear()
@@ -186,13 +202,20 @@ class AgentService:
         try:
             self.display.show(image, kind=kind)
         except Exception as error:
+            # 失败时保留 _force/_pending_since，重试窗口到期后同一请求会再次执行
             with self._lock:
-                self.runtime.last_error = f"display: {error}"
+                self.runtime.refresh_error = f"display: {error}"
                 self._display_retry_at = time.time() + 60
-                self._finish_refresh(marker)
             logger.exception("display refresh failed")
             return
-        self._save_preview(image)
+        # 屏幕已经刷新成功；预览/状态文件写失败只记错误，照常 record，
+        # 否则签名不更新会导致每个重试周期重复刷屏，磨损墨水屏
+        save_error = None
+        try:
+            self._save_preview(image)
+        except Exception as error:
+            save_error = f"preview: {error}"
+            logger.exception("preview save failed")
         now_wall = time.time()
         with self._lock:
             self.policy.record(snapshot, stale=stale, kind=kind)
@@ -200,7 +223,14 @@ class AgentService:
             self.runtime.last_refresh_kind = kind
             self._display_retry_at = 0.0
             self._finish_refresh(marker)
-            self._save_state()
+            try:
+                self._save_state()
+            except Exception as error:
+                save_error = save_error or f"state: {error}"
+            # 刷新成功：清除上一次的刷新错误（或换成本次非致命的写文件错误）
+            self.runtime.refresh_error = save_error
+        if save_error:
+            logger.warning("refresh succeeded but %s", save_error)
         logger.info("displayed %s refresh", kind)
 
     def _finish_refresh(self, marker: int) -> None:

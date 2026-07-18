@@ -1,3 +1,4 @@
+import Combine
 import SwiftUI
 
 enum StatsRange: String, CaseIterable {
@@ -164,7 +165,13 @@ struct UsageStatsView: View {
         }
         .padding(12)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-        .onAppear(perform: load)
+        .onAppear { load() }
+        // backfill、5 分钟采集或集群同步落库后自动刷新，不必关闭重开统计页
+        .onReceive(
+            NotificationCenter.default
+                .publisher(for: UsageStore.dataDidChangeNotification)
+                .debounce(for: .seconds(1), scheduler: DispatchQueue.main)
+        ) { _ in load(silent: true) }
         .onChange(of: range) { value in
             Log.user("change \(provider) usage statistics range to \(value.rawValue)")
             hoveredBucket = nil
@@ -467,11 +474,11 @@ struct UsageStatsView: View {
         clusterNodes.contains { $0.nodeID == selectedNodeID } ? selectedNodeID : nil
     }
 
-    private func load() {
+    private func load(silent: Bool = false) {
         let since = StatusService.dayKey(
             StatusService.aggregationCalendar.date(byAdding: .day, value: -366, to: Date()) ?? Date())
         let provider = provider
-        loaded = false
+        if !silent { loaded = false }
         // 集群启用时 usage() 返回全节点带 nodeID 的行，节点筛选在内存中完成
         DispatchQueue.global(qos: .userInitiated).async {
             let result = UsageStore.shared.usage(provider: provider, since: since)

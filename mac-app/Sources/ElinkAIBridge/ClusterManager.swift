@@ -11,6 +11,9 @@ final class ClusterManager: ObservableObject {
     @Published private(set) var syncing = false
 
     var localStatusProvider: (() -> BridgeSnapshot)?
+    /// 聚合时区实际变化（入群/退群）后触发；宿主据此调度用量维护任务，
+    /// 迁移起点由持久化的“已应用分桶时区”决定，与凭据的瞬时旧值无关
+    var onAggregationTimeZoneChange: (() -> Void)?
 
     private struct PairingState {
         let code: String
@@ -28,6 +31,9 @@ final class ClusterManager: ObservableObject {
     private var knownPeers: [DiscoveredClusterPeer] = []
     private var liveStatuses: [String: ClusterLiveStatus] = [:]
     private var replayNonces: [String: Date] = [:]
+    // 每次保存凭据（建群/入群/退群）时 +1；在途同步回包若代数不符则丢弃，
+    // 避免旧集群的响应写进新集群的数据库
+    private var credentialsGeneration = 0
     private var pairing: PairingState?
     private var syncTimer: Timer?
     private var pairingTimer: Timer?
@@ -37,15 +43,20 @@ final class ClusterManager: ObservableObject {
     private let manualPeersKey = "elink_cluster_manual_peers_v2"
 
     init(store: UsageStore, credentials: ClusterCredentials? = nil,
-         credentialStore: ClusterCredentialStore? = nil) {
+         credentialStore: ClusterCredentialStore? = nil,
+         session: URLSession? = nil) {
         self.store = store
         let resolvedCredentialStore = credentialStore ?? ClusterCredentialStore(store: store)
         self.credentialStore = resolvedCredentialStore
         self.credentials = credentials ?? resolvedCredentialStore.loadOrCreate()
-        let configuration = URLSessionConfiguration.ephemeral
-        configuration.timeoutIntervalForRequest = 5
-        configuration.timeoutIntervalForResource = 10
-        session = URLSession(configuration: configuration)
+        if let session {
+            self.session = session
+        } else {
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.timeoutIntervalForRequest = 5
+            configuration.timeoutIntervalForResource = 10
+            self.session = URLSession(configuration: configuration)
+        }
         enabled = self.credentials.isClustered
         clusterID = self.credentials.clusterID
         StatusService.setAggregationTimeZone(self.credentials.timezone)
@@ -98,7 +109,11 @@ final class ClusterManager: ObservableObject {
 
     func routes() -> [HTTPRouteKey: HTTPServer.Route] {
         [
-            HTTPRouteKey("POST", "/v2/cluster/pair/join"): { [weak self] in
+            // v2 配对（6 位明文配对码）已废弃；返回明确错误而不是解码失败的笼统 400
+            HTTPRouteKey("POST", "/v2/cluster/pair/join"): { _ in
+                .error("pairing protocol upgraded; update both apps", status: 426)
+            },
+            HTTPRouteKey("POST", "/v3/cluster/pair/join"): { [weak self] in
                 self?.handleJoin($0) ?? .error("cluster unavailable", status: 503)
             },
             HTTPRouteKey("GET", "/v2/cluster/manifest"): { [weak self] in
@@ -113,26 +128,26 @@ final class ClusterManager: ObservableObject {
         ]
     }
 
-    func createCluster() {
+    @discardableResult
+    func createCluster() -> Bool {
         var value = lock.holding { credentials }
-        store.resetRemoteClusterData(localNodeID: value.nodeID)
-        UserDefaults.standard.removeObject(forKey: manualPeersKey)
         value.clusterID = UUID().uuidString.lowercased()
         value.clusterSecret = ClusterCrypto.randomData(count: 32).base64EncodedString()
         value.timezone = TimeZone.current.identifier
-        saveCredentials(value)
+        // 凭据保存与旧数据清理是一个事务；失败时一切保持原样
+        guard saveCredentials(value, resetRemoteData: true) else { return false }
+        UserDefaults.standard.removeObject(forKey: manualPeersKey)
         Log.user("created usage sync cluster")
+        return true
     }
 
     func leaveCluster() {
         var value = lock.holding { credentials }
-        store.resetRemoteClusterData(localNodeID: value.nodeID)
-        UserDefaults.standard.removeObject(forKey: manualPeersKey)
         value.clusterID = nil
         value.clusterSecret = nil
         value.timezone = nil
-        saveCredentials(value)
-        lock.holding { liveStatuses.removeAll() }
+        guard saveCredentials(value, resetRemoteData: true) else { return }
+        UserDefaults.standard.removeObject(forKey: manualPeersKey)
         stopPairing()
         Log.user("left usage sync cluster")
     }
@@ -143,7 +158,7 @@ final class ClusterManager: ObservableObject {
             lastError = "请先创建同步集群"
             return nil
         }
-        let code = String(format: "%06d", Int.random(in: 0...999_999))
+        let code = ClusterCrypto.generatePairingCode()
         lock.holding {
             pairing = PairingState(
                 code: code,
@@ -152,7 +167,7 @@ final class ClusterManager: ObservableObject {
                 attempts: 0
             )
         }
-        pairingCode = code
+        pairingCode = ClusterCrypto.formattedPairingCode(code)
         discovery.update(nodeName: nodeName, clusterID: clusterID, pairable: true)
         pairingTimer?.invalidate()
         pairingTimer = Timer.scheduledTimer(withTimeInterval: 120, repeats: false) { [weak self] _ in
@@ -171,22 +186,26 @@ final class ClusterManager: ObservableObject {
     }
 
     func joinCluster(endpoint: String, code: String, completion: @escaping (Error?) -> Void) {
-        let pairingCode = code.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let base = normalizedEndpoint(endpoint), pairingCode.count == 6,
-              pairingCode.allSatisfy(\.isNumber) else {
-            completion(BridgeError.message("请输入有效的节点地址和 6 位配对码"))
+        guard let base = normalizedEndpoint(endpoint),
+              let pairingCode = ClusterCrypto.normalizedPairingCode(code) else {
+            completion(BridgeError.message("请输入有效的节点地址和 16 位配对码"))
             return
         }
         let privateKey = Curve25519.KeyAgreement.PrivateKey()
-        let value = lock.holding { credentials }
+        let (value, generation) = lock.holding { (credentials, credentialsGeneration) }
+        let clientPublicKey = privateKey.publicKey.rawRepresentation
         let payload = ClusterJoinRequest(
-            code: pairingCode,
+            proof: ClusterCrypto.pairingProof(
+                code: pairingCode,
+                clientPublicKey: clientPublicKey,
+                clientNodeID: value.nodeID
+            ),
             clientNodeID: value.nodeID,
             clientName: value.nodeName,
-            clientPublicKey: privateKey.publicKey.rawRepresentation.base64EncodedString()
+            clientPublicKey: clientPublicKey.base64EncodedString()
         )
         guard let body = try? ClusterCrypto.encoder.encode(payload),
-              let url = URL(string: base + "/v2/cluster/pair/join") else {
+              let url = URL(string: base + "/v3/cluster/pair/join") else {
             completion(ClusterCryptoError.invalidPayload)
             return
         }
@@ -197,6 +216,20 @@ final class ClusterManager: ObservableObject {
         session.dataTask(with: request) { [weak self] data, response, error in
             guard let self else { return }
             if let error { return DispatchQueue.main.async { completion(error) } }
+            // 426 是对方明确宣告的协议升级；404 则可能是旧版本、也可能地址根本
+            // 不是 Elink AI 桥接端口（任何 HTTP 服务都会 404），提示不能只说版本
+            if let http = response as? HTTPURLResponse, http.statusCode == 426 {
+                return DispatchQueue.main.async {
+                    completion(BridgeError.message("对方 Elink AI 版本不兼容，请把两台 Mac 都升级到最新版"))
+                }
+            }
+            if let http = response as? HTTPURLResponse, http.statusCode == 404 {
+                return DispatchQueue.main.async {
+                    completion(BridgeError.message(
+                        "对方没有配对接口：请确认地址是另一台 Mac 的 Elink AI（端口 8765），或将其升级到最新版"
+                    ))
+                }
+            }
             guard let http = response as? HTTPURLResponse, http.statusCode == 200,
                   let data,
                   let joined = try? ClusterCrypto.decoder.decode(ClusterJoinResponse.self, from: data),
@@ -217,11 +250,19 @@ final class ClusterManager: ObservableObject {
                 updated.clusterID = secret.clusterID
                 updated.clusterSecret = secret.clusterSecret
                 updated.timezone = secret.timezone
-                self.store.resetRemoteClusterData(localNodeID: updated.nodeID)
-                UserDefaults.standard.set([base], forKey: self.manualPeersKey)
-                self.stopPairing()
                 DispatchQueue.main.async {
-                    self.saveCredentials(updated)
+                    // 请求发出后若用户已建群、入群或退群，旧响应不能覆盖新凭据
+                    guard self.lock.holding({ self.credentialsGeneration }) == generation else {
+                        completion(BridgeError.message("配对已取消：集群配置已变化"))
+                        return
+                    }
+                    // 换凭据 + 清旧数据是一个事务；失败时旧集群状态原样保留
+                    guard self.saveCredentials(updated, resetRemoteData: true) else {
+                        completion(BridgeError.message("集群凭据保存失败，请重试"))
+                        return
+                    }
+                    UserDefaults.standard.set([base], forKey: self.manualPeersKey)
+                    self.stopPairing()
                     self.syncPeer(base)
                     completion(nil)
                 }
@@ -376,7 +417,12 @@ final class ClusterManager: ObservableObject {
             }
             current.attempts += 1
             pairing = current
-            return ClusterCrypto.constantTimeEqual(current.code, join.code) ? current : nil
+            let expected = ClusterCrypto.pairingProof(
+                code: current.code,
+                clientPublicKey: clientPublic,
+                clientNodeID: join.clientNodeID
+            )
+            return ClusterCrypto.constantTimeEqual(expected, join.proof) ? current : nil
         }
         guard let state else { return .error("pairing code rejected", status: 403) }
         let value = lock.holding { credentials }
@@ -387,7 +433,7 @@ final class ClusterManager: ObservableObject {
         }
         do {
             let key = try ClusterCrypto.pairingKey(
-                privateKey: state.privateKey, peerPublicKey: clientPublic, code: join.code
+                privateKey: state.privateKey, peerPublicKey: clientPublic, code: state.code
             )
             let secret = ClusterJoinSecret(
                 clusterID: clusterID, clusterSecret: clusterSecret, timezone: timezone
@@ -476,7 +522,12 @@ final class ClusterManager: ObservableObject {
     // MARK: - Client synchronization
 
     private func syncPeer(_ endpoint: String, completion: ((Error?) -> Void)? = nil) {
-        guard isClusteredNow, let key = try? ClusterCrypto.clusterKey(lock.holding({ credentials })),
+        let (key, generation) = lock.holding {
+            ((try? ClusterCrypto.clusterKey(credentials)), credentialsGeneration)
+        }
+        // epoch 在 store 队列内与 reset 全序校验，写入前的最后防线
+        let epoch = store.clusterDataEpoch()
+        guard isClusteredNow, let key,
               let url = URL(string: endpoint + "/v2/cluster/manifest") else {
             completion?(BridgeError.message("同步配置无效")); return
         }
@@ -512,8 +563,15 @@ final class ClusterManager: ObservableObject {
                 completion?(BridgeError.message("节点地址 \(endpoint) 指向本机"))
                 return
             }
+            // 响应回来时若已切换集群（凭据代数变化），丢弃整包，避免旧集群数据落库
+            guard self.lock.holding({ self.credentialsGeneration }) == generation else {
+                completion?(BridgeError.message("同步已取消：集群配置已变化"))
+                return
+            }
             let now = Date()
             self.lock.holding {
+                // 代数复核与写入同锁：切换集群后旧响应不能污染内存状态
+                guard self.credentialsGeneration == generation else { return }
                 for live in manifest.liveStatuses {
                     if self.liveStatuses[live.nodeID].map({ $0.observedAt >= live.observedAt }) == true {
                         continue
@@ -521,51 +579,85 @@ final class ClusterManager: ObservableObject {
                     self.liveStatuses[live.nodeID] = live
                 }
             }
-            self.store.upsertClusterNode(ClusterNodeRecord(
+            // lastSyncAt 在所有 pull 成功后才写入，失败的同步不能显示为“已同步”
+            self.store.upsertRemoteClusterNode(ClusterNodeRecord(
                 nodeID: manifest.senderNodeID,
                 name: manifest.senderName,
                 endpoint: endpoint,
                 lastSeenAt: now,
-                lastSyncAt: now
-            ))
+                lastSyncAt: nil
+            ), ifEpoch: epoch)
             for live in manifest.liveStatuses where live.nodeID != manifest.senderNodeID {
-                self.store.upsertClusterNode(ClusterNodeRecord(
+                self.store.upsertRemoteClusterNode(ClusterNodeRecord(
                     nodeID: live.nodeID,
                     name: live.nodeName,
                     endpoint: nil,
                     lastSeenAt: live.observedAt,
                     lastSyncAt: nil
-                ))
+                ), ifEpoch: epoch)
             }
             let local = Dictionary(uniqueKeysWithValues: self.store.clusterManifest().map { ($0.key, $0) })
             let missing = manifest.snapshots.filter {
                 guard let current = local[$0.key] else { return true }
                 return $0.revision > current.revision
             }.map(\.key)
-            if missing.isEmpty {
+            let finish: (Error?) -> Void = { error in
+                var finalError = error
+                if finalError == nil,
+                   self.lock.holding({ self.credentialsGeneration }) != generation {
+                    finalError = BridgeError.message("同步已取消：集群配置已变化")
+                }
+                if finalError == nil {
+                    let accepted = self.store.upsertRemoteClusterNode(ClusterNodeRecord(
+                        nodeID: manifest.senderNodeID,
+                        name: manifest.senderName,
+                        endpoint: endpoint,
+                        lastSeenAt: now,
+                        lastSyncAt: Date()
+                    ), ifEpoch: epoch)
+                    if !accepted {
+                        finalError = BridgeError.message(
+                            "同步状态未写入：集群配置已变化或本地存储失败"
+                        )
+                    }
+                }
                 DispatchQueue.main.async { self.refreshPublishedState() }
-                completion?(nil)
+                completion?(finalError)
+            }
+            if missing.isEmpty {
+                finish(nil)
                 return
             }
             let pulls = DispatchGroup()
+            let pullLock = NSLock()
+            var firstPullError: Error?
             for start in stride(from: 0, to: missing.count, by: 200) {
                 let end = min(start + 200, missing.count)
                 pulls.enter()
-                self.pull(Array(missing[start..<end]), from: endpoint, key: key) {
+                self.pull(Array(missing[start..<end]), from: endpoint, key: key,
+                          generation: generation, epoch: epoch) { error in
+                    if let error {
+                        pullLock.holding {
+                            if firstPullError == nil { firstPullError = error }
+                        }
+                    }
                     pulls.leave()
                 }
             }
-            pulls.notify(queue: .main) { completion?(nil) }
+            pulls.notify(queue: .main) { finish(pullLock.holding { firstPullError }) }
         }.resume()
     }
 
     private func pull(_ keys: [ClusterSnapshotKey], from endpoint: String, key: SymmetricKey,
-                      completion: (() -> Void)? = nil) {
+                      generation: Int, epoch: Int, completion: ((Error?) -> Void)? = nil) {
         do {
             let body = try ClusterCrypto.seal(
                 ClusterPullRequest(keys: keys), key: key, senderNodeID: nodeID
             )
-            guard let url = URL(string: endpoint + "/v2/cluster/pull") else { return }
+            guard let url = URL(string: endpoint + "/v2/cluster/pull") else {
+                completion?(BridgeError.message("节点地址无效"))
+                return
+            }
             var request = URLRequest(url: url)
             request.httpMethod = "POST"
             request.httpBody = body
@@ -574,20 +666,35 @@ final class ClusterManager: ObservableObject {
                 method: "POST", path: "/v2/cluster/pull", body: body,
                 nodeID: nodeID, key: key
             ).forEach { request.setValue($0.value, forHTTPHeaderField: $0.key) }
-            session.dataTask(with: request) { [weak self] data, response, _ in
-                defer { completion?() }
-                guard let self,
-                      let http = response as? HTTPURLResponse, http.statusCode == 200,
-                      let data,
+            session.dataTask(with: request) { [weak self] data, response, error in
+                guard let self else {
+                    completion?(BridgeError.message("同步服务已停止"))
+                    return
+                }
+                if let error { completion?(error); return }
+                guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+                    let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+                    completion?(BridgeError.message("节点 \(endpoint) 拉取失败 HTTP \(status)"))
+                    return
+                }
+                guard let data,
                       let (_, pulled) = try? ClusterCrypto.open(
                         ClusterPullResponse.self, data: data, key: key
-                      ) else { return }
-                _ = self.store.mergeClusterSnapshots(pulled.snapshots)
+                      ) else {
+                    completion?(BridgeError.message("节点 \(endpoint) 拉取响应无法解密"))
+                    return
+                }
+                // ifEpoch 在 store 队列内校验，与 reset 原子互斥；nil 表示整包被拒绝
+                guard self.store.mergeClusterSnapshots(pulled.snapshots, ifEpoch: epoch) != nil else {
+                    completion?(BridgeError.message("同步数据未写入：集群配置已变化或本地存储失败"))
+                    return
+                }
                 DispatchQueue.main.async { self.refreshPublishedState() }
+                completion?(nil)
             }.resume()
         } catch {
             setError(error.localizedDescription)
-            completion?()
+            completion?(error)
         }
     }
 
@@ -645,10 +752,25 @@ final class ClusterManager: ObservableObject {
         return "http://\(formatted):\(port)"
     }
 
-    private func saveCredentials(_ value: ClusterCredentials) {
+    @discardableResult
+    private func saveCredentials(_ value: ClusterCredentials, resetRemoteData: Bool = false) -> Bool {
+        let previousTimeZone = Self.resolvedTimeZone(lock.holding { credentials.timezone })
         do {
-            try credentialStore.save(value)
-            lock.holding { credentials = value }
+            if resetRemoteData {
+                // 换凭据 + 清旧集群数据是一个事务：中途退出不会出现“新密钥配旧数据”
+                try credentialStore.save(value, resettingRemoteDataExcept: value.nodeID)
+            } else {
+                try credentialStore.save(value)
+            }
+            lock.holding {
+                credentials = value
+                credentialsGeneration += 1
+                if resetRemoteData {
+                    // 内存中的旧集群状态同样不能带进新集群
+                    liveStatuses.removeAll()
+                    replayNonces.removeAll()
+                }
+            }
             enabled = value.isClustered
             clusterID = value.clusterID
             store.setClusterAggregationEnabled(value.isClustered)
@@ -660,7 +782,18 @@ final class ClusterManager: ObservableObject {
             )
             lastError = nil
             refreshPublishedState()
-        } catch { setError(error.localizedDescription) }
+            if Self.resolvedTimeZone(value.timezone) != previousTimeZone {
+                onAggregationTimeZoneChange?()
+            }
+            return true
+        } catch {
+            setError(error.localizedDescription)
+            return false
+        }
+    }
+
+    private static func resolvedTimeZone(_ identifier: String?) -> String {
+        (identifier.flatMap(TimeZone.init(identifier:)) ?? .current).identifier
     }
 
     private func refreshPublishedState() {

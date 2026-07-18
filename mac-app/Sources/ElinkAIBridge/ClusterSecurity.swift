@@ -57,6 +57,49 @@ enum ClusterCrypto {
         )
     }
 
+    // 配对码 16 字符（~78 bit 熵），只在两台 Mac 的屏幕间带外传递、绝不上网线：
+    // 它同时充当 ECDH 密钥的盐和入群证明的 HMAC 密钥，主动中间人替换公钥后
+    // 也无法在可行时间内离线暴破出会话密钥
+    static let pairingCodeLength = 16
+    private static let pairingCodeAlphabet = Array("ABCDEFGHJKMNPQRSTVWXYZ23456789")
+
+    static func generatePairingCode() -> String {
+        var result = ""
+        while result.count < pairingCodeLength {
+            for byte in [UInt8](randomData(count: 32)) {
+                guard result.count < pairingCodeLength else { break }
+                // 拒绝采样消除模偏差：256 - 256 % 30 = 240
+                if byte < 240 {
+                    result.append(pairingCodeAlphabet[Int(byte) % pairingCodeAlphabet.count])
+                }
+            }
+        }
+        return result
+    }
+
+    static func normalizedPairingCode(_ value: String) -> String? {
+        let stripped = value.uppercased().filter { $0 != "-" && $0 != " " }
+        guard stripped.count == pairingCodeLength,
+              stripped.allSatisfy({ pairingCodeAlphabet.contains($0) }) else { return nil }
+        return stripped
+    }
+
+    static func formattedPairingCode(_ code: String) -> String {
+        stride(from: 0, to: code.count, by: 4).map { offset in
+            let start = code.index(code.startIndex, offsetBy: offset)
+            let end = code.index(start, offsetBy: min(4, code.count - offset))
+            return String(code[start..<end])
+        }.joined(separator: "-")
+    }
+
+    /// 客户端证明自己知道配对码；把公钥和节点 ID 绑进 HMAC，防止中间人换公钥后重放证明
+    static func pairingProof(code: String, clientPublicKey: Data, clientNodeID: String) -> String {
+        let key = SymmetricKey(data: sha256(Data(code.utf8)))
+        let payload = clientPublicKey + Data(clientNodeID.utf8)
+        return Data(HMAC<SHA256>.authenticationCode(for: payload, using: key))
+            .base64EncodedString()
+    }
+
     static func pairingKey(privateKey: Curve25519.KeyAgreement.PrivateKey,
                            peerPublicKey: Data, code: String) throws -> SymmetricKey {
         let peer = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: peerPublicKey)
@@ -204,6 +247,17 @@ final class ClusterCredentialStore {
     func save(_ value: ClusterCredentials) throws {
         let data = try ClusterCrypto.encoder.encode(value)
         guard store.saveClusterCredentialsData(data) else {
+            throw BridgeError.message("无法将集群凭据写入 usage.db")
+        }
+        try? FileManager.default.removeItem(at: legacyFallbackURL)
+    }
+
+    /// 切换集群时用：换凭据和清旧集群数据在同一个 SQLite 事务里完成
+    func save(_ value: ClusterCredentials, resettingRemoteDataExcept localNodeID: String) throws {
+        let data = try ClusterCrypto.encoder.encode(value)
+        guard store.saveClusterCredentialsData(
+            data, resettingRemoteDataExceptNodeID: localNodeID
+        ) else {
             throw BridgeError.message("无法将集群凭据写入 usage.db")
         }
         try? FileManager.default.removeItem(at: legacyFallbackURL)

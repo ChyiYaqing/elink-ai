@@ -9,6 +9,26 @@ struct DailyModelUsage: Equatable {
     var nodeID: String? = nil
 }
 
+typealias DailyUsageTotals = [String: [String: Int]]
+
+struct UsageHistoryTotals: Equatable {
+    var claude: DailyUsageTotals
+    var codex: DailyUsageTotals
+
+    func values(for provider: String) -> DailyUsageTotals {
+        provider == "claude" ? claude : codex
+    }
+
+    var isEmpty: Bool { claude.isEmpty && codex.isEmpty }
+}
+
+enum UsageBucketMigrationResult: Equatable {
+    case applied
+    case alreadyCurrent
+    case sourceChanged
+    case failed
+}
+
 /// 每日各模型 token 用量的 SQLite 持久化，避免会话日志被清理后丢失历史
 final class UsageStore {
     static let shared = UsageStore()
@@ -18,8 +38,13 @@ final class UsageStore {
     private var db: OpaquePointer?
     private var clusterNodeID: String?
     private var clusterAggregationEnabled = false
+    // 每次 resetRemoteClusterData（切换/退出集群）时 +1。同步回包携带发起时的纪元，
+    // 在同一队列内校验后才落库，彻底关闭“校验后、写入前被 reset 插入”的竞态窗口
+    private var clusterDataEpochValue = 0
     private static let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
     private static let noResetMaxAge: TimeInterval = 6 * 60 * 60
+    private static let bucketTimeZoneMetadataKey = "usage_bucket_timezone"
+    private static let bucketLegacyUnknownMetadataKey = "usage_bucket_legacy_unknown"
     var onClusterUsageChange: (([ClusterSnapshotDescriptor]) -> Void)?
 
     static var defaultPath: String {
@@ -80,33 +105,433 @@ final class UsageStore {
 
     /// 覆盖写入某天某 provider 的各模型用量（值为当日重算的总量而非增量）。
     /// 空集只会来自暂时读不到日志的场景，直接忽略，避免清掉已有数据并向集群广播空快照。
-    func record(day: String, provider: String, models: [String: Int]) {
+    /// preservingResidue 供实时路径使用：当日日志被删除后，已入库的、现存日志
+    /// 解释不了的部分按残差规则保留（逐模型取较大值），与 backfill 语义一致。
+    func record(day: String, provider: String, models: [String: Int],
+                expectedBucketTimeZone: String?, preservingResidue: Bool = false) {
         let rows = models.filter { $0.value > 0 }
         guard !rows.isEmpty else { return }
-        queue.sync {
-            guard db != nil else { return }
-            let sql = """
-            INSERT INTO daily_model_usage (day, provider, model, tokens)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(day, provider, model) DO UPDATE SET
-                tokens = excluded.tokens,
-                updated_at = CURRENT_TIMESTAMP
-            """
+        // daily 表和集群快照必须在同一个事务里换新，避免并发或中断造成两者不一致
+        let descriptor: ClusterSnapshotDescriptor? = queue.sync {
+            guard db != nil,
+                  sqlite3_exec(db, "BEGIN IMMEDIATE", nil, nil, nil) == SQLITE_OK else { return nil }
+            let marker = metadataValueLocked(Self.bucketTimeZoneMetadataKey)
+            guard marker.succeeded, marker.value == expectedBucketTimeZone else {
+                _ = finishTransactionLocked(false)
+                return nil
+            }
+            var effective = rows
+            if preservingResidue {
+                guard let stored = dayModelsLocked(day: day, provider: provider) else {
+                    _ = finishTransactionLocked(false)
+                    return nil
+                }
+                for (model, tokens) in stored where tokens > (effective[model] ?? 0) {
+                    effective[model] = tokens
+                }
+            }
+            var succeeded = replaceDailyRowsLocked(day: day, provider: provider, rows: effective)
+            var result: ClusterSnapshotDescriptor?
+            if succeeded {
+                switch recordLocalSnapshotLocked(day: day, provider: provider, models: effective) {
+                case let .changed(value): result = value
+                case .unchanged: break
+                case .failed: succeeded = false
+                }
+            }
+            return finishTransactionLocked(succeeded) ? result : nil
+        }
+        // descriptor 仅在模型集合真正变化时返回，避免设备高频轮询导致统计页反复重载
+        if let descriptor {
+            onClusterUsageChange?([descriptor])
+            Self.notifyDataChanged()
+        }
+    }
+
+    /// COMMIT 也可能失败；任何一步失败都必须回滚，绝不提交半套数据
+    private func finishTransactionLocked(_ succeeded: Bool) -> Bool {
+        if succeeded, sqlite3_exec(db, "COMMIT", nil, nil, nil) == SQLITE_OK {
+            return true
+        }
+        sqlite3_exec(db, "ROLLBACK", nil, nil, nil)
+        return false
+    }
+
+    /// 覆盖语义写入 daily 表：UPSERT 当前模型集，并删除当日已消失的模型行，
+    /// 否则周/月/年统计会残留旧值。调用方须在 queue 内、已开启事务时调用。
+    private func replaceDailyRowsLocked(day: String, provider: String,
+                                        rows: [String: Int]) -> Bool {
+        let sql = """
+        INSERT INTO daily_model_usage (day, provider, model, tokens)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(day, provider, model) DO UPDATE SET
+            tokens = excluded.tokens,
+            updated_at = CURRENT_TIMESTAMP
+        """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return false }
+        var succeeded = true
+        for (model, tokens) in rows {
+            sqlite3_reset(statement)
+            sqlite3_bind_text(statement, 1, day, -1, Self.transient)
+            sqlite3_bind_text(statement, 2, provider, -1, Self.transient)
+            sqlite3_bind_text(statement, 3, model, -1, Self.transient)
+            sqlite3_bind_int64(statement, 4, Int64(tokens))
+            if sqlite3_step(statement) != SQLITE_DONE { succeeded = false; break }
+        }
+        sqlite3_finalize(statement)
+        guard succeeded else { return false }
+
+        let placeholders = Array(repeating: "?", count: rows.count).joined(separator: ",")
+        let deleteSQL = """
+        DELETE FROM daily_model_usage
+        WHERE day = ? AND provider = ? AND model NOT IN (\(placeholders))
+        """
+        var deleteStatement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, deleteSQL, -1, &deleteStatement, nil) == SQLITE_OK else { return false }
+        defer { sqlite3_finalize(deleteStatement) }
+        sqlite3_bind_text(deleteStatement, 1, day, -1, Self.transient)
+        sqlite3_bind_text(deleteStatement, 2, provider, -1, Self.transient)
+        for (index, model) in rows.keys.enumerated() {
+            sqlite3_bind_text(deleteStatement, Int32(index + 3), model, -1, Self.transient)
+        }
+        return sqlite3_step(deleteStatement) == SQLITE_DONE
+    }
+
+    /// 数据落库后通知界面（统计页）刷新；backfill、5 分钟采集和集群同步都会触发
+    static let dataDidChangeNotification = Notification.Name("ElinkUsageStoreDataDidChange")
+
+    private static func notifyDataChanged() {
+        NotificationCenter.default.post(name: dataDidChangeNotification, object: nil)
+    }
+
+    /// 时区重分桶后已迁移的 day key 整天清空：删除本地行，并把集群快照替换为
+    /// 空集（revision +1），让对端也同步到清空结果。与 record 一样单事务完成。
+    func clearLocalDay(day: String, provider: String) {
+        let descriptor: ClusterSnapshotDescriptor? = queue.sync {
+            guard db != nil,
+                  sqlite3_exec(db, "BEGIN IMMEDIATE", nil, nil, nil) == SQLITE_OK else { return nil }
+            let sql = "DELETE FROM daily_model_usage WHERE day = ? AND provider = ?"
             var statement: OpaquePointer?
-            guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return }
-            defer { sqlite3_finalize(statement) }
-            for (model, tokens) in rows {
-                sqlite3_reset(statement)
+            var succeeded = false
+            if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
                 sqlite3_bind_text(statement, 1, day, -1, Self.transient)
                 sqlite3_bind_text(statement, 2, provider, -1, Self.transient)
-                sqlite3_bind_text(statement, 3, model, -1, Self.transient)
-                sqlite3_bind_int64(statement, 4, Int64(tokens))
-                sqlite3_step(statement)
+                succeeded = sqlite3_step(statement) == SQLITE_DONE
+            }
+            sqlite3_finalize(statement)
+            var result: ClusterSnapshotDescriptor?
+            if succeeded {
+                switch recordLocalSnapshotLocked(day: day, provider: provider, models: [:]) {
+                case let .changed(value): result = value
+                case .unchanged: break
+                case .failed: succeeded = false
+                }
+            }
+            return finishTransactionLocked(succeeded) ? result : nil
+        }
+        if let descriptor {
+            onClusterUsageChange?([descriptor])
+            Self.notifyDataChanged()
+        }
+    }
+
+    /// 本地 daily 表按天/模型读取（不含集群数据），供时区重分桶计算“现存日志
+    /// 解释不了的残差”；残差来自已删除的日志，是无法重建的唯一记录，必须保留
+    func localDailyModelUsage(provider: String) -> [String: [String: Int]] {
+        queue.sync { localDailyModelUsageLocked(provider: provider) ?? [:] }
+    }
+
+    private func localDailyModelUsageLocked(provider: String) -> DailyUsageTotals? {
+        guard db != nil else { return nil }
+        let sql = """
+        SELECT day, model, tokens FROM daily_model_usage WHERE provider = ?
+        """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return nil }
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_text(statement, 1, provider, -1, Self.transient)
+        var totals: DailyUsageTotals = [:]
+        while true {
+            let result = sqlite3_step(statement)
+            if result == SQLITE_DONE { return totals }
+            guard result == SQLITE_ROW,
+                  let day = sqlite3_column_text(statement, 0),
+                  let model = sqlite3_column_text(statement, 1) else { return nil }
+            totals[String(cString: day), default: [:]][String(cString: model)] =
+                Int(sqlite3_column_int64(statement, 2))
+        }
+    }
+
+    func usageBucketTimeZone() -> String? {
+        queue.sync {
+            let result = metadataValueLocked(Self.bucketTimeZoneMetadataKey)
+            return result.succeeded ? result.value : nil
+        }
+    }
+
+    func usageBucketHasLegacyUnknownData() -> Bool {
+        queue.sync {
+            let result = metadataValueLocked(Self.bucketLegacyUnknownMetadataKey)
+            return result.succeeded && result.value == "1"
+        }
+    }
+
+    /// 原子替换全部本地日用量、本机集群快照和分桶时区标记。
+    /// expectedSource 是 CAS 条件：排队期间时区已被其他任务推进时，本任务不得覆盖新状态。
+    func applyBucketMigration(expectedSource: String?, target: String,
+                              oldExplained: UsageHistoryTotals?,
+                              targetTotals: UsageHistoryTotals) -> UsageBucketMigrationResult {
+        guard !target.isEmpty else { return .failed }
+        var descriptors: [ClusterSnapshotDescriptor] = []
+        let result = queue.sync { () -> UsageBucketMigrationResult in
+            guard db != nil,
+                  sqlite3_exec(db, "BEGIN IMMEDIATE", nil, nil, nil) == SQLITE_OK else {
+                return .failed
+            }
+            let marker = metadataValueLocked(Self.bucketTimeZoneMetadataKey)
+            guard marker.succeeded else {
+                _ = finishTransactionLocked(false)
+                return .failed
+            }
+            if marker.value == target {
+                _ = finishTransactionLocked(false)
+                return .alreadyCurrent
+            }
+            guard marker.value == expectedSource,
+                  let storedClaude = localDailyModelUsageLocked(provider: "claude"),
+                  let storedCodex = localDailyModelUsageLocked(provider: "codex") else {
+                _ = finishTransactionLocked(false)
+                return marker.value == expectedSource ? .failed : .sourceChanged
+            }
+            let stored = UsageHistoryTotals(claude: storedClaude, codex: storedCodex)
+            let plan: UsageHistoryTotals
+            if let oldExplained, expectedSource != nil {
+                plan = UsageHistoryTotals(
+                    claude: Self.knownRebucketPlan(
+                        stored: stored.claude,
+                        oldExplained: oldExplained.claude,
+                        targetTotals: targetTotals.claude
+                    ),
+                    codex: Self.knownRebucketPlan(
+                        stored: stored.codex,
+                        oldExplained: oldExplained.codex,
+                        targetTotals: targetTotals.codex
+                    )
+                )
+            } else if oldExplained == nil, expectedSource == nil {
+                plan = UsageHistoryTotals(
+                    claude: Self.legacyRebucketPlan(
+                        stored: stored.claude, targetTotals: targetTotals.claude
+                    ),
+                    codex: Self.legacyRebucketPlan(
+                        stored: stored.codex, targetTotals: targetTotals.codex
+                    )
+                )
+            } else {
+                _ = finishTransactionLocked(false)
+                return .failed
+            }
+
+            var succeeded = replaceLocalUsageLocked(
+                plan: plan, stored: stored, descriptors: &descriptors
+            )
+            if succeeded {
+                succeeded = setMetadataValueLocked(Self.bucketTimeZoneMetadataKey, value: target)
+            }
+            if succeeded, marker.value == nil {
+                succeeded = setMetadataValueLocked(
+                    Self.bucketLegacyUnknownMetadataKey,
+                    value: stored.isEmpty ? "0" : "1"
+                )
+            }
+            guard finishTransactionLocked(succeeded) else {
+                descriptors.removeAll()
+                return .failed
+            }
+            return .applied
+        }
+        if result == .applied {
+            if !descriptors.isEmpty { onClusterUsageChange?(descriptors) }
+            Self.notifyDataChanged()
+        }
+        return result
+    }
+
+    /// 同一时区的历史回填也要保留已删除日志形成的残差；直接 record 覆盖会在
+    /// “当天仍有部分日志”时把残差清掉。这里同样以单事务替换全部本地历史。
+    func mergeBackfillTotals(expectedTimeZone: String, totals: UsageHistoryTotals) -> Bool {
+        var descriptors: [ClusterSnapshotDescriptor] = []
+        let saved = queue.sync { () -> Bool in
+            guard db != nil,
+                  sqlite3_exec(db, "BEGIN IMMEDIATE", nil, nil, nil) == SQLITE_OK else {
+                return false
+            }
+            let marker = metadataValueLocked(Self.bucketTimeZoneMetadataKey)
+            guard marker.succeeded, marker.value == expectedTimeZone,
+                  let storedClaude = localDailyModelUsageLocked(provider: "claude"),
+                  let storedCodex = localDailyModelUsageLocked(provider: "codex") else {
+                _ = finishTransactionLocked(false)
+                return false
+            }
+            let stored = UsageHistoryTotals(claude: storedClaude, codex: storedCodex)
+            let plan = UsageHistoryTotals(
+                claude: Self.knownRebucketPlan(
+                    stored: stored.claude,
+                    oldExplained: totals.claude,
+                    targetTotals: totals.claude
+                ),
+                codex: Self.knownRebucketPlan(
+                    stored: stored.codex,
+                    oldExplained: totals.codex,
+                    targetTotals: totals.codex
+                )
+            )
+            let succeeded = replaceLocalUsageLocked(
+                plan: plan, stored: stored, descriptors: &descriptors
+            )
+            guard finishTransactionLocked(succeeded) else {
+                descriptors.removeAll()
+                return false
+            }
+            return true
+        }
+        if saved {
+            if !descriptors.isEmpty { onClusterUsageChange?(descriptors) }
+            Self.notifyDataChanged()
+        }
+        return saved
+    }
+
+    /// 已知旧时区时，只有 stored - oldExplained 才是无法由现存日志重建的历史残差。
+    static func knownRebucketPlan(stored: DailyUsageTotals,
+                                  oldExplained: DailyUsageTotals,
+                                  targetTotals: DailyUsageTotals) -> DailyUsageTotals {
+        var plan = positiveTotals(targetTotals)
+        for (day, models) in stored {
+            for (model, tokens) in models {
+                let residue = max(0, tokens) - max(0, oldExplained[day]?[model] ?? 0)
+                if residue > 0 {
+                    plan[day, default: [:]][model, default: 0] += residue
+                }
             }
         }
-        if let descriptor = recordLocalClusterSnapshot(day: day, provider: provider, models: rows) {
-            onClusterUsageChange?([descriptor])
+        return plan
+    }
+
+    /// 旧数据库没有分桶时区元数据，已删除日志的原日期无法恢复。这里按 provider/model
+    /// 守恒总量：现存日志按目标时区重建，超出现存日志总量的部分稳定保留在原日期。
+    static func legacyRebucketPlan(stored: DailyUsageTotals,
+                                   targetTotals: DailyUsageTotals) -> DailyUsageTotals {
+        var plan = positiveTotals(targetTotals)
+        var models = Set<String>()
+        stored.values.forEach { models.formUnion($0.keys) }
+        targetTotals.values.forEach { models.formUnion($0.keys) }
+        for model in models {
+            let storedTotal = stored.values.reduce(0) { $0 + max(0, $1[model] ?? 0) }
+            let targetTotal = targetTotals.values.reduce(0) { $0 + max(0, $1[model] ?? 0) }
+            var remaining = max(0, storedTotal - targetTotal)
+            guard remaining > 0 else { continue }
+            for day in stored.keys.sorted() where remaining > 0 {
+                let candidate = max(0, (stored[day]?[model] ?? 0)
+                    - (targetTotals[day]?[model] ?? 0))
+                let retained = min(candidate, remaining)
+                if retained > 0 {
+                    plan[day, default: [:]][model, default: 0] += retained
+                    remaining -= retained
+                }
+            }
         }
+        return plan
+    }
+
+    private static func positiveTotals(_ totals: DailyUsageTotals) -> DailyUsageTotals {
+        var result: DailyUsageTotals = [:]
+        for (day, models) in totals {
+            for (model, tokens) in models where tokens > 0 {
+                result[day, default: [:]][model] = tokens
+            }
+        }
+        return result
+    }
+
+    private func replaceLocalUsageLocked(plan: UsageHistoryTotals,
+                                         stored: UsageHistoryTotals,
+                                         descriptors: inout [ClusterSnapshotDescriptor]) -> Bool {
+        for provider in ["claude", "codex"] {
+            let desired = plan.values(for: provider)
+            let existing = stored.values(for: provider)
+            for day in Set(desired.keys).union(existing.keys).sorted() {
+                let rows = (desired[day] ?? [:]).filter { $0.value > 0 }
+                let wroteDaily = rows.isEmpty
+                    ? deleteDailyRowsLocked(day: day, provider: provider)
+                    : replaceDailyRowsLocked(day: day, provider: provider, rows: rows)
+                guard wroteDaily else { return false }
+                switch recordLocalSnapshotLocked(day: day, provider: provider, models: rows) {
+                case let .changed(value): descriptors.append(value)
+                case .unchanged: break
+                case .failed: return false
+                }
+            }
+        }
+        return true
+    }
+
+    /// 读单日模型行；失败返回 nil（与“空日”区分），供 preservingResidue 判定
+    private func dayModelsLocked(day: String, provider: String) -> [String: Int]? {
+        let sql = "SELECT model, tokens FROM daily_model_usage WHERE day = ? AND provider = ?"
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return nil }
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_text(statement, 1, day, -1, Self.transient)
+        sqlite3_bind_text(statement, 2, provider, -1, Self.transient)
+        var models: [String: Int] = [:]
+        while true {
+            let result = sqlite3_step(statement)
+            if result == SQLITE_DONE { return models }
+            guard result == SQLITE_ROW, let model = sqlite3_column_text(statement, 0) else {
+                return nil
+            }
+            models[String(cString: model)] = Int(sqlite3_column_int64(statement, 1))
+        }
+    }
+
+    private func deleteDailyRowsLocked(day: String, provider: String) -> Bool {
+        let sql = "DELETE FROM daily_model_usage WHERE day = ? AND provider = ?"
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return false }
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_text(statement, 1, day, -1, Self.transient)
+        sqlite3_bind_text(statement, 2, provider, -1, Self.transient)
+        return sqlite3_step(statement) == SQLITE_DONE
+    }
+
+    private func metadataValueLocked(_ key: String) -> (succeeded: Bool, value: String?) {
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(
+            db, "SELECT value FROM usage_metadata WHERE key = ?", -1, &statement, nil
+        ) == SQLITE_OK else { return (false, nil) }
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_text(statement, 1, key, -1, Self.transient)
+        let result = sqlite3_step(statement)
+        if result == SQLITE_DONE { return (true, nil) }
+        guard result == SQLITE_ROW, let value = sqlite3_column_text(statement, 0) else {
+            return (false, nil)
+        }
+        return (true, String(cString: value))
+    }
+
+    private func setMetadataValueLocked(_ key: String, value: String) -> Bool {
+        let sql = """
+        INSERT INTO usage_metadata (key, value) VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return false }
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_text(statement, 1, key, -1, Self.transient)
+        sqlite3_bind_text(statement, 2, value, -1, Self.transient)
+        return sqlite3_step(statement) == SQLITE_DONE
     }
 
     func usage(provider: String, since day: String) -> [DailyModelUsage] {
@@ -269,7 +694,7 @@ final class UsageStore {
         queue.sync {
             clusterNodeID = nodeID
             clusterAggregationEnabled = aggregationEnabled
-            upsertNodeLocked(ClusterNodeRecord(
+            _ = upsertNodeLocked(ClusterNodeRecord(
                 nodeID: nodeID,
                 name: nodeName,
                 endpoint: nil,
@@ -332,49 +757,78 @@ final class UsageStore {
     func saveClusterCredentialsData(_ data: Data) -> Bool {
         let saved = queue.sync {
             guard db != nil, !data.isEmpty else { return false }
-            let sql = """
-            INSERT INTO cluster_credentials (singleton, payload, updated_at)
-            VALUES (1, ?, ?)
-            ON CONFLICT(singleton) DO UPDATE SET
-              payload = excluded.payload,
-              updated_at = excluded.updated_at
-            """
-            var statement: OpaquePointer?
-            guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return false }
-            defer { sqlite3_finalize(statement) }
-            _ = data.withUnsafeBytes { bytes in
-                sqlite3_bind_blob(statement, 1, bytes.baseAddress, Int32(data.count), Self.transient)
-            }
-            sqlite3_bind_double(statement, 2, Date().timeIntervalSince1970)
-            return sqlite3_step(statement) == SQLITE_DONE
+            return upsertCredentialsLocked(data)
         }
         if saved { Self.protectDatabaseFiles(at: databasePath) }
         return saved
     }
 
+    private func upsertCredentialsLocked(_ data: Data) -> Bool {
+        let sql = """
+        INSERT INTO cluster_credentials (singleton, payload, updated_at)
+        VALUES (1, ?, ?)
+        ON CONFLICT(singleton) DO UPDATE SET
+          payload = excluded.payload,
+          updated_at = excluded.updated_at
+        """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return false }
+        defer { sqlite3_finalize(statement) }
+        _ = data.withUnsafeBytes { bytes in
+            sqlite3_bind_blob(statement, 1, bytes.baseAddress, Int32(data.count), Self.transient)
+        }
+        sqlite3_bind_double(statement, 2, Date().timeIntervalSince1970)
+        return sqlite3_step(statement) == SQLITE_DONE
+    }
+
+    func clusterDataEpoch() -> Int {
+        queue.sync { clusterDataEpochValue }
+    }
+
     /// Removes data learned from a previous cluster while preserving this Mac's own history.
     func resetRemoteClusterData(localNodeID: String) {
         queue.sync {
+            clusterDataEpochValue += 1
             guard sqlite3_exec(db, "BEGIN IMMEDIATE", nil, nil, nil) == SQLITE_OK else { return }
-            var succeeded = true
-            for table in ["cluster_model_usage", "cluster_usage_snapshots"] {
-                var statement: OpaquePointer?
-                let sql = "DELETE FROM \(table) WHERE origin_node_id != ?"
-                if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
-                    sqlite3_bind_text(statement, 1, localNodeID, -1, Self.transient)
-                    succeeded = sqlite3_step(statement) == SQLITE_DONE && succeeded
-                } else { succeeded = false }
-                sqlite3_finalize(statement)
-            }
+            _ = finishTransactionLocked(resetRemoteRowsLocked(localNodeID: localNodeID))
+        }
+    }
+
+    /// 凭据与远端数据同库：切换集群时必须一个事务同时“换凭据 + 清旧数据”，
+    /// 否则进程在两步之间退出，重启后会用新集群密钥广播旧集群快照
+    func saveClusterCredentialsData(_ data: Data,
+                                    resettingRemoteDataExceptNodeID localNodeID: String) -> Bool {
+        let saved = queue.sync { () -> Bool in
+            guard db != nil, !data.isEmpty,
+                  sqlite3_exec(db, "BEGIN IMMEDIATE", nil, nil, nil) == SQLITE_OK else { return false }
+            clusterDataEpochValue += 1
+            let succeeded = upsertCredentialsLocked(data)
+                && resetRemoteRowsLocked(localNodeID: localNodeID)
+            return finishTransactionLocked(succeeded)
+        }
+        if saved { Self.protectDatabaseFiles(at: databasePath) }
+        return saved
+    }
+
+    private func resetRemoteRowsLocked(localNodeID: String) -> Bool {
+        var succeeded = true
+        for table in ["cluster_model_usage", "cluster_usage_snapshots"] {
             var statement: OpaquePointer?
-            if sqlite3_prepare_v2(db, "DELETE FROM cluster_nodes WHERE node_id != ?", -1,
-                                  &statement, nil) == SQLITE_OK {
+            let sql = "DELETE FROM \(table) WHERE origin_node_id != ?"
+            if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
                 sqlite3_bind_text(statement, 1, localNodeID, -1, Self.transient)
                 succeeded = sqlite3_step(statement) == SQLITE_DONE && succeeded
             } else { succeeded = false }
             sqlite3_finalize(statement)
-            sqlite3_exec(db, succeeded ? "COMMIT" : "ROLLBACK", nil, nil, nil)
         }
+        var statement: OpaquePointer?
+        if sqlite3_prepare_v2(db, "DELETE FROM cluster_nodes WHERE node_id != ?", -1,
+                              &statement, nil) == SQLITE_OK {
+            sqlite3_bind_text(statement, 1, localNodeID, -1, Self.transient)
+            succeeded = sqlite3_step(statement) == SQLITE_DONE && succeeded
+        } else { succeeded = false }
+        sqlite3_finalize(statement)
+        return succeeded
     }
 
     func clusterUsage(provider: String, since day: String, nodeID: String? = nil) -> [DailyModelUsage] {
@@ -448,20 +902,48 @@ final class UsageStore {
         queue.sync { keys.compactMap(snapshotLocked) }
     }
 
+    /// 返回 nil 表示 epoch 已过期或任一快照持久化失败；空数组表示请求有效但没有新数据
     @discardableResult
-    func mergeClusterSnapshots(_ snapshots: [ClusterUsageSnapshot]) -> [ClusterSnapshotDescriptor] {
-        let accepted = queue.sync {
-            snapshots.compactMap { snapshot -> ClusterSnapshotDescriptor? in
+    func mergeClusterSnapshots(_ snapshots: [ClusterUsageSnapshot],
+                               ifEpoch epoch: Int) -> [ClusterSnapshotDescriptor]? {
+        let accepted = queue.sync { () -> [ClusterSnapshotDescriptor]? in
+            // 纪元校验和写入同在串行队列内，与 resetRemoteClusterData 全序执行
+            guard db != nil,
+                  epoch == clusterDataEpochValue,
+                  sqlite3_exec(db, "BEGIN IMMEDIATE", nil, nil, nil) == SQLITE_OK else {
+                return nil
+            }
+            var result: [ClusterSnapshotDescriptor] = []
+            for snapshot in snapshots {
                 // 本机 origin 的快照只能由本地 record() 产生，拒绝对端伪造覆盖
                 guard snapshot.key.originNodeID != clusterNodeID,
                       ["claude", "codex"].contains(snapshot.key.provider),
                       snapshot.key.day.count == 10,
                       snapshot.models.count <= 100,
-                      snapshot.models.allSatisfy({ !$0.key.isEmpty && $0.value >= 0 }) else { return nil }
-                return writeSnapshotLocked(snapshot, requireNewer: true) ? snapshot.descriptor : nil
+                      snapshot.models.allSatisfy({ !$0.key.isEmpty && $0.value >= 0 }) else { continue }
+                if let existing = snapshotLocked(snapshot.key),
+                   existing.revision >= snapshot.revision {
+                    if existing.revision == snapshot.revision, existing.models != snapshot.models {
+                        Log.warning(
+                            "cluster snapshot conflict origin=\(snapshot.key.originNodeID) revision=\(snapshot.revision)",
+                            category: "cluster"
+                        )
+                    }
+                    continue
+                }
+                guard writeSnapshotBodyLocked(snapshot) else {
+                    _ = finishTransactionLocked(false)
+                    return nil
+                }
+                result.append(snapshot.descriptor)
             }
+            guard finishTransactionLocked(true) else { return nil }
+            return result
         }
-        if !accepted.isEmpty { onClusterUsageChange?(accepted) }
+        if let accepted, !accepted.isEmpty {
+            onClusterUsageChange?(accepted)
+            Self.notifyDataChanged()
+        }
         return accepted
     }
 
@@ -496,26 +978,41 @@ final class UsageStore {
         }
     }
 
-    func upsertClusterNode(_ node: ClusterNodeRecord) {
+    @discardableResult
+    func upsertClusterNode(_ node: ClusterNodeRecord) -> Bool {
         queue.sync { upsertNodeLocked(node) }
     }
 
-    private func recordLocalClusterSnapshot(day: String, provider: String,
-                                            models: [String: Int]) -> ClusterSnapshotDescriptor? {
+    @discardableResult
+    func upsertRemoteClusterNode(_ node: ClusterNodeRecord, ifEpoch epoch: Int) -> Bool {
         queue.sync {
-            guard let nodeID = clusterNodeID else { return nil }
-            let key = ClusterSnapshotKey(originNodeID: nodeID, day: day, provider: provider)
-            let clean = models.filter { $0.value > 0 }
-            let existing = snapshotLocked(key)
-            guard existing?.models != clean else { return nil }
-            let snapshot = ClusterUsageSnapshot(
-                key: key,
-                revision: (existing?.revision ?? 0) + 1,
-                observedAt: Date(),
-                models: clean
-            )
-            return writeSnapshotLocked(snapshot, requireNewer: true) ? snapshot.descriptor : nil
+            guard epoch == clusterDataEpochValue else { return false }
+            return upsertNodeLocked(node)
         }
+    }
+
+    /// “无变化”和“写入失败”必须区分：失败时调用方要回滚整个事务
+    private enum SnapshotWrite {
+        case changed(ClusterSnapshotDescriptor)
+        case unchanged
+        case failed
+    }
+
+    /// 本机快照写入体，不含队列同步和事务；调用方须在 queue 内、已开启事务时调用
+    private func recordLocalSnapshotLocked(day: String, provider: String,
+                                           models: [String: Int]) -> SnapshotWrite {
+        guard let nodeID = clusterNodeID else { return .unchanged }
+        let key = ClusterSnapshotKey(originNodeID: nodeID, day: day, provider: provider)
+        let clean = models.filter { $0.value > 0 }
+        let existing = snapshotLocked(key)
+        guard existing?.models != clean else { return .unchanged }
+        let snapshot = ClusterUsageSnapshot(
+            key: key,
+            revision: (existing?.revision ?? 0) + 1,
+            observedAt: Date(),
+            models: clean
+        )
+        return writeSnapshotBodyLocked(snapshot) ? .changed(snapshot.descriptor) : .failed
     }
 
     private func snapshotLocked(_ key: ClusterSnapshotKey) -> ClusterUsageSnapshot? {
@@ -555,15 +1052,23 @@ final class UsageStore {
         )
     }
 
-    private func writeSnapshotLocked(_ snapshot: ClusterUsageSnapshot, requireNewer: Bool) -> Bool {
+    private func writeSnapshotLocked(_ snapshot: ClusterUsageSnapshot,
+                                     requireNewer: Bool) -> SnapshotWrite {
         if requireNewer, let existing = snapshotLocked(snapshot.key), existing.revision >= snapshot.revision {
             if existing.revision == snapshot.revision, existing.models != snapshot.models {
                 Log.warning("cluster snapshot conflict origin=\(snapshot.key.originNodeID) revision=\(snapshot.revision)",
                             category: "cluster")
             }
-            return false
+            return .unchanged
         }
-        guard sqlite3_exec(db, "BEGIN IMMEDIATE", nil, nil, nil) == SQLITE_OK else { return false }
+        guard sqlite3_exec(db, "BEGIN IMMEDIATE", nil, nil, nil) == SQLITE_OK else { return .failed }
+        let succeeded = writeSnapshotBodyLocked(snapshot)
+        guard finishTransactionLocked(succeeded) else { return .failed }
+        return .changed(snapshot.descriptor)
+    }
+
+    /// 快照三张表的写入体，不含事务；调用方负责 BEGIN/COMMIT
+    private func writeSnapshotBodyLocked(_ snapshot: ClusterUsageSnapshot) -> Bool {
         var succeeded = true
         let upsert = """
         INSERT INTO cluster_usage_snapshots
@@ -584,7 +1089,10 @@ final class UsageStore {
             sqlite3_bind_text(statement, 6, snapshot.descriptor.contentHash, -1, Self.transient)
             succeeded = sqlite3_step(statement) == SQLITE_DONE
         } else { succeeded = false }
+        // finalize 后必须置 nil：失败路径会跳过后续 prepare，尾部的 finalize
+        // 不能再碰这个已释放的指针（sqlite3_finalize(nil) 是安全 no-op）
         sqlite3_finalize(statement)
+        statement = nil
 
         if succeeded {
             let delete = """
@@ -598,6 +1106,7 @@ final class UsageStore {
                 succeeded = sqlite3_step(statement) == SQLITE_DONE
             } else { succeeded = false }
             sqlite3_finalize(statement)
+            statement = nil
         }
 
         let insert = """
@@ -617,7 +1126,6 @@ final class UsageStore {
             }
         } else if succeeded { succeeded = false }
         sqlite3_finalize(statement)
-        sqlite3_exec(db, succeeded ? "COMMIT" : "ROLLBACK", nil, nil, nil)
         return succeeded
     }
 
@@ -632,7 +1140,7 @@ final class UsageStore {
         return sqlite3_step(statement) == SQLITE_ROW ? Int(sqlite3_column_int64(statement, 0)) : 0
     }
 
-    private func upsertNodeLocked(_ node: ClusterNodeRecord) {
+    private func upsertNodeLocked(_ node: ClusterNodeRecord) -> Bool {
         let sql = """
         INSERT INTO cluster_nodes (node_id, name, endpoint, last_seen_at, last_sync_at)
         VALUES (?, ?, ?, ?, ?)
@@ -647,7 +1155,7 @@ final class UsageStore {
             THEN excluded.last_sync_at ELSE cluster_nodes.last_sync_at END
         """
         var statement: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return }
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return false }
         defer { sqlite3_finalize(statement) }
         sqlite3_bind_text(statement, 1, node.nodeID, -1, Self.transient)
         sqlite3_bind_text(statement, 2, node.name, -1, Self.transient)
@@ -657,7 +1165,7 @@ final class UsageStore {
         else { sqlite3_bind_null(statement, 4) }
         if let sync = node.lastSyncAt { sqlite3_bind_double(statement, 5, sync.timeIntervalSince1970) }
         else { sqlite3_bind_null(statement, 5) }
-        sqlite3_step(statement)
+        return sqlite3_step(statement) == SQLITE_DONE
     }
 
     private static func createClusterTables(in db: OpaquePointer?) {
@@ -690,6 +1198,10 @@ final class UsageStore {
           singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
           payload BLOB NOT NULL,
           updated_at REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS usage_metadata (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_cluster_usage_provider_day
           ON cluster_usage_snapshots(provider, day);

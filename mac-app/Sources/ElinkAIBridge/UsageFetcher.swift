@@ -102,6 +102,17 @@ final class UsageFetcher {
         let previousPrimary = old.primary.discardingIfExpired(at: now)
         let previousWeekly = old.weekly.discardingIfExpired(at: now)
         let hadGoodValue = previousPrimary.percent != nil || previousWeekly.percent != nil
+        // 请求失败回退到 statusline 缓存时，不能让更旧的缓存覆盖内存里更新鲜的配额
+        if current.isCached, hadGoodValue,
+           let newFetched = current.fetchedAt, let oldFetched = old.fetchedAt,
+           oldFetched > newFetched {
+            var retained = old
+            retained.primary = previousPrimary
+            retained.weekly = previousWeekly
+            retained.error = new.error
+            retained.isCached = true
+            return retained
+        }
         guard current.primary.percent == nil, current.weekly.percent == nil, hadGoodValue else {
             return current
         }

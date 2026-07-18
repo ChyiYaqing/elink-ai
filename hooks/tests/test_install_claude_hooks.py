@@ -1,7 +1,10 @@
 import json
+import stat
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 SCRIPT = Path(__file__).resolve().parent.parent / "install-claude-hooks.py"
 
@@ -50,6 +53,29 @@ def test_installer_replaces_null_hooks_with_object(tmp_path):
     settings_path.write_text('{"hooks": null}')
     run_installer(settings_path, tmp_path / "helper")
     assert "Stop" in json.loads(settings_path.read_text())["hooks"]
+
+
+def test_installer_preserves_restrictive_file_mode(tmp_path):
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text("{}")
+    settings_path.chmod(0o600)
+    run_installer(settings_path, tmp_path / "helper")
+    assert stat.S_IMODE(settings_path.stat().st_mode) == 0o600
+
+
+def test_installer_creates_new_settings_with_owner_only_mode(tmp_path):
+    settings_path = tmp_path / "settings.json"
+    run_installer(settings_path, tmp_path / "helper")
+    assert stat.S_IMODE(settings_path.stat().st_mode) == 0o600
+
+
+@pytest.mark.parametrize("existing_mode", [0o664, 0o666])
+def test_installer_tightens_writable_settings_to_owner_only(tmp_path, existing_mode):
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text("{}")
+    settings_path.chmod(existing_mode)
+    run_installer(settings_path, tmp_path / "helper")
+    assert stat.S_IMODE(settings_path.stat().st_mode) == 0o600
 
 
 def test_installer_refuses_to_overwrite_malformed_settings(tmp_path):

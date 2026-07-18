@@ -84,7 +84,8 @@ struct ClusterSecurePayload: Codable {
 }
 
 struct ClusterJoinRequest: Codable {
-    let code: String
+    // 配对码不上网线：proof 是用配对码派生密钥对公钥+节点 ID 的 HMAC
+    let proof: String
     let clientNodeID: String
     let clientName: String
     let clientPublicKey: String
@@ -112,10 +113,16 @@ struct ClusterCredentials: Codable, Equatable {
 }
 
 struct DiscoveredClusterPeer: Identifiable, Equatable {
+    /// 当前配对协议版本：v3 起配对码不上网线，与 v2 的 6 位明文配对码互不兼容
+    static let currentPairingProtocol = 3
+
     var id: String { nodeID.isEmpty ? endpoint : nodeID }
     let nodeID: String
     let name: String
     let endpoint: String
     let clusterID: String?
     let pairable: Bool
+    var pairingProtocol: Int = 2
+
+    var pairingCompatible: Bool { pairingProtocol == Self.currentPairingProtocol }
 }

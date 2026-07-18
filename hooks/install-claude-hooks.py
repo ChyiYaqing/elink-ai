@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -53,8 +54,13 @@ def main() -> None:
         command = f"/usr/bin/python3 '{helper_target}' claude {event}"
         entries.append({"matcher": "", "hooks": [{"type": "command", "command": command}]})
     path.parent.mkdir(parents=True, exist_ok=True)
+    # settings 可能包含敏感信息，不继承组/其他用户权限
+    mode = 0o600
     temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(settings, ensure_ascii=False, indent=2) + "\n")
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, "w") as handle:
+        handle.write(json.dumps(settings, ensure_ascii=False, indent=2) + "\n")
+    os.chmod(temporary, mode)
     temporary.replace(path)
     print(f"Updated {path}; restart Claude Code to load hooks.")
 

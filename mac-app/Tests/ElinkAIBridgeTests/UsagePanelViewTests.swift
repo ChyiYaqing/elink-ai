@@ -46,6 +46,23 @@ final class UsagePanelViewTests: XCTestCase {
         )
     }
 
+    func testCompatiblePairingPeerIsPreferredOverEarlierLegacyPeer() {
+        let legacy = DiscoveredClusterPeer(
+            nodeID: "legacy", name: "A Legacy", endpoint: "http://legacy:8765",
+            clusterID: nil, pairable: true, pairingProtocol: 2
+        )
+        let compatible = DiscoveredClusterPeer(
+            nodeID: "current", name: "B Current", endpoint: "http://current:8765",
+            clusterID: nil, pairable: true,
+            pairingProtocol: DiscoveredClusterPeer.currentPairingProtocol
+        )
+
+        XCTAssertEqual(
+            UsagePanelView.preferredPairingPeer(in: [legacy, compatible])?.nodeID,
+            "current"
+        )
+    }
+
     @MainActor
     func testScreenConnectionSettingsAreCollapsedByDefault() {
         XCTAssertFalse(deviceSettingsPlaceholders(
@@ -122,8 +139,14 @@ final class UsagePanelViewTests: XCTestCase {
         let placeholders = host.descendants
             .compactMap { ($0 as? NSTextField)?.placeholderString }
         XCTAssertTrue(
-            placeholders.contains { $0.contains("6 位配对码") },
-            "单节点集群应直接显示配对码输入框，实际输入框：\(placeholders)"
+            placeholders.contains { $0.contains("配对码，例如 ABCD-EFGH-JKMN-PQRS") },
+            "单节点集群应直接显示新版配对码输入框，实际输入框：\(placeholders)"
+        )
+        // 界面上不允许再出现旧版 6 位配对码的文案
+        let texts = host.descendants.compactMap { ($0 as? NSTextField)?.stringValue }
+        XCTAssertFalse(
+            (texts + placeholders).contains { $0.contains("6 位") },
+            "仍有旧版 6 位配对码文案残留"
         )
     }
 }

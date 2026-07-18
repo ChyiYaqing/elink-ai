@@ -36,6 +36,32 @@ def test_periodic_full_refresh_fires_even_when_content_is_unchanged():
     assert decision.refresh and decision.kind == "full" and decision.reason == "maintenance"
 
 
+def test_full_every_one_disables_partial_refresh():
+    policy = RefreshPolicy(min_interval_s=0, full_every=1)
+    policy.record(snapshot(pct=10), stale=False, kind="full", now=100)
+    decision = policy.decide(snapshot(pct=50), stale=False, now=200)
+    assert decision.refresh and decision.kind == "full"
+
+
+def test_full_every_one_does_not_loop_on_unchanged_content():
+    policy = RefreshPolicy(min_interval_s=0, full_every=1, full_interval_s=21600)
+    value = snapshot(pct=10)
+    policy.record(value, stale=False, kind="full", now=100)
+    # full 后计数归零，相同内容不能被误判为维护性全刷（否则每个轮询都全刷）
+    assert not policy.decide(value, stale=False, now=102).refresh
+    assert not policy.decide(value, stale=False, now=104).refresh
+
+
+def test_full_every_counts_the_full_refresh_itself():
+    policy = RefreshPolicy(min_interval_s=0, full_every=2)
+    policy.record(snapshot(pct=10), stale=False, kind="full", now=100)
+    first = policy.decide(snapshot(pct=50), stale=False, now=200)
+    assert first.refresh and first.kind == "partial"
+    policy.record(snapshot(pct=50), stale=False, kind="partial", now=200)
+    second = policy.decide(snapshot(pct=90), stale=False, now=300)
+    assert second.refresh and second.kind == "full"
+
+
 def test_reset_minutes_are_grouped_in_five_minute_buckets():
     policy = RefreshPolicy()
     first = snapshot()
