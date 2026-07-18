@@ -122,14 +122,22 @@ jobs:
           DMG="mac-app/.build/elink-ai-${GITHUB_REF_NAME}.dmg"
           NOTES="$RUNNER_TEMP/release-notes.md"
           TITLE="elink-ai Version $VERSION"
+          IS_PRERELEASE=false
+          PRERELEASE_ARGS=()
+          if [[ "$VERSION" == *-* ]]; then
+            IS_PRERELEASE=true
+            PRERELEASE_ARGS+=(--prerelease)
+          fi
           if "$GH" release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             "$GH" release edit "$GITHUB_REF_NAME" \
               --notes-file "$NOTES" \
-              --title "$TITLE"
+              --title "$TITLE" \
+              --prerelease="$IS_PRERELEASE"
             "$GH" release upload "$GITHUB_REF_NAME" "$DMG" --clobber
           else
             "$GH" release create "$GITHUB_REF_NAME" "$DMG" \
               --verify-tag \
               --notes-file "$NOTES" \
-              --title "$TITLE"
+              --title "$TITLE" \
+              "${PRERELEASE_ARGS[@]}"
           fi

@@ -6,6 +6,16 @@ and `Removed`.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## 0.1.15-rc1
+
+### Packaging
+
+- Release candidates are published through GitHub's prerelease channel while stable tags remain regular releases
+
+### Fixed
+
+- Codex subagent token counts logged before model metadata were attributed to `unknown`; existing usage history is rebuilt once to correct the model attribution
+
 ## 0.1.14
 
 ### Changed
