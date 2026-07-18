@@ -45,6 +45,7 @@ final class UsageStore {
     private static let noResetMaxAge: TimeInterval = 6 * 60 * 60
     private static let bucketTimeZoneMetadataKey = "usage_bucket_timezone"
     private static let bucketLegacyUnknownMetadataKey = "usage_bucket_legacy_unknown"
+    private static let parserVersionMetadataKey = "usage_parser_version"
     var onClusterUsageChange: (([ClusterSnapshotDescriptor]) -> Void)?
 
     static var defaultPath: String {
@@ -270,6 +271,15 @@ final class UsageStore {
         }
     }
 
+    /// 最近一次成功精确重建时的解析器版本；与当前版本不一致说明库里可能
+    /// 残留旧解析器的错误归因（如 subagent 前置事件被记成 unknown）
+    func usageParserVersion() -> String? {
+        queue.sync {
+            let result = metadataValueLocked(Self.parserVersionMetadataKey)
+            return result.succeeded ? result.value : nil
+        }
+    }
+
     func usageBucketHasLegacyUnknownData() -> Bool {
         queue.sync {
             let result = metadataValueLocked(Self.bucketLegacyUnknownMetadataKey)
@@ -360,7 +370,12 @@ final class UsageStore {
 
     /// 同一时区的历史回填也要保留已删除日志形成的残差；直接 record 覆盖会在
     /// “当天仍有部分日志”时把残差清掉。这里同样以单事务替换全部本地历史。
-    func mergeBackfillTotals(expectedTimeZone: String, totals: UsageHistoryTotals) -> Bool {
+    /// exact 供解析器版本升级后的一次性清洗：现存日志覆盖的日期按重算值精确
+    /// 替换（丢弃残差，去掉旧解析器的错误归因），日志不覆盖的日期原样保留；
+    /// recordingParserVersion 在同一事务里登记清洗完成的版本。
+    func mergeBackfillTotals(expectedTimeZone: String, totals: UsageHistoryTotals,
+                             exact: Bool = false,
+                             recordingParserVersion: String? = nil) -> Bool {
         var descriptors: [ClusterSnapshotDescriptor] = []
         let saved = queue.sync { () -> Bool in
             guard db != nil,
@@ -375,21 +390,34 @@ final class UsageStore {
                 return false
             }
             let stored = UsageHistoryTotals(claude: storedClaude, codex: storedCodex)
-            let plan = UsageHistoryTotals(
-                claude: Self.knownRebucketPlan(
-                    stored: stored.claude,
-                    oldExplained: totals.claude,
-                    targetTotals: totals.claude
-                ),
-                codex: Self.knownRebucketPlan(
-                    stored: stored.codex,
-                    oldExplained: totals.codex,
-                    targetTotals: totals.codex
+            let plan: UsageHistoryTotals
+            if exact {
+                plan = UsageHistoryTotals(
+                    claude: Self.exactRebuildPlan(stored: stored.claude, targetTotals: totals.claude),
+                    codex: Self.exactRebuildPlan(stored: stored.codex, targetTotals: totals.codex)
                 )
-            )
-            let succeeded = replaceLocalUsageLocked(
+            } else {
+                plan = UsageHistoryTotals(
+                    claude: Self.knownRebucketPlan(
+                        stored: stored.claude,
+                        oldExplained: totals.claude,
+                        targetTotals: totals.claude
+                    ),
+                    codex: Self.knownRebucketPlan(
+                        stored: stored.codex,
+                        oldExplained: totals.codex,
+                        targetTotals: totals.codex
+                    )
+                )
+            }
+            var succeeded = replaceLocalUsageLocked(
                 plan: plan, stored: stored, descriptors: &descriptors
             )
+            if succeeded, let recordingParserVersion {
+                succeeded = setMetadataValueLocked(
+                    Self.parserVersionMetadataKey, value: recordingParserVersion
+                )
+            }
             guard finishTransactionLocked(succeeded) else {
                 descriptors.removeAll()
                 return false
@@ -401,6 +429,19 @@ final class UsageStore {
             Self.notifyDataChanged()
         }
         return saved
+    }
+
+    /// 解析器升级后的精确重建：重算覆盖到的日期用重算值整日替换，
+    /// 现存日志完全不覆盖的日期无从重算，原样保留
+    static func exactRebuildPlan(stored: DailyUsageTotals,
+                                 targetTotals: DailyUsageTotals) -> DailyUsageTotals {
+        var plan = positiveTotals(targetTotals)
+        for (day, models) in stored where targetTotals[day] == nil {
+            for (model, tokens) in models where tokens > 0 {
+                plan[day, default: [:]][model] = tokens
+            }
+        }
+        return plan
     }
 
     /// 已知旧时区时，只有 stored - oldExplained 才是无法由现存日志重建的历史残差。

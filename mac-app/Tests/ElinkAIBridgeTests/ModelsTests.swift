@@ -57,6 +57,13 @@ final class ModelsTests: XCTestCase {
             oldExplained: nil,
             targetTotals: UsageHistoryTotals(claude: [:], codex: [:])
         ), .applied)
+        // 解析器版本也已登记，否则版本门控会让维护始终显示待执行
+        XCTAssertTrue(store.mergeBackfillTotals(
+            expectedTimeZone: "UTC",
+            totals: UsageHistoryTotals(claude: [:], codex: [:]),
+            exact: true,
+            recordingParserVersion: StatusService.usageParserVersion
+        ))
         let service = StatusService(usage: UsageFetcher(cacheStore: store), store: store)
 
         StatusService.setAggregationTimeZone("UTC")
@@ -145,6 +152,82 @@ final class ModelsTests: XCTestCase {
             dayOne: ["gpt-a": 10, "gpt-b": 20],
             dayTwo: ["gpt-b": 15],
         ])
+    }
+
+    func testCodexLeadingTokenCountsBelongToFirstDeclaredModel() {
+        // 真实 subagent 日志顺序：token_count 先出现，turn_context 的模型声明在后
+        let leadingCount = #"{"timestamp":"1970-01-01T00:10:00.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":40},"last_token_usage":{"total_tokens":40}}}}"#
+        let anotherLeading = #"{"timestamp":"1970-01-01T00:11:00.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":70},"last_token_usage":{"total_tokens":30}}}}"#
+        let lateModel = #"{"timestamp":"1970-01-01T00:12:00.000Z","type":"turn_context","payload":{"model":"gpt-5.6-sol"}}"#
+        let trailingCount = #"{"timestamp":"1970-01-01T00:13:00.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":100},"last_token_usage":{"total_tokens":30}}}}"#
+
+        let daily = StatusService.codexDailyUsage(
+            lines: [leadingCount, anotherLeading, lateModel, trailingCount])
+
+        let day = StatusService.dayKey(Date(timeIntervalSince1970: 600))
+        XCTAssertEqual(daily, [day: ["gpt-5.6-sol": 100]])
+    }
+
+    func testCodexFileWithoutAnyModelStaysUnknown() {
+        let count = #"{"timestamp":"1970-01-01T00:10:00.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":25},"last_token_usage":{"total_tokens":25}}}}"#
+
+        let daily = StatusService.codexDailyUsage(lines: [count])
+
+        let day = StatusService.dayKey(Date(timeIntervalSince1970: 600))
+        XCTAssertEqual(daily, [day: ["unknown": 25]])
+    }
+
+    func testExactRebuildReplacesCoveredDaysAndKeepsUncoveredHistory() {
+        let stored: DailyUsageTotals = [
+            // 日志仍覆盖的一天：旧解析器把 40 记给了 unknown
+            "2026-07-18": ["unknown": 40, "gpt-5.6-sol": 60],
+            // 日志已删除的一天：无从重算，必须原样保留
+            "2026-01-02": ["gpt-old": 500],
+        ]
+        let recomputed: DailyUsageTotals = [
+            "2026-07-18": ["gpt-5.6-sol": 100],
+        ]
+
+        XCTAssertEqual(UsageStore.exactRebuildPlan(stored: stored, targetTotals: recomputed), [
+            "2026-07-18": ["gpt-5.6-sol": 100],
+            "2026-01-02": ["gpt-old": 500],
+        ])
+    }
+
+    func testMergeBackfillExactModeCleansStaleAttributionAndRecordsParserVersion() {
+        let path = NSTemporaryDirectory() + "elink-parser-rebuild-\(UUID().uuidString).db"
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let store = UsageStore(path: path)
+        XCTAssertEqual(store.applyBucketMigration(
+            expectedSource: nil, target: "Asia/Singapore",
+            oldExplained: nil, targetTotals: UsageHistoryTotals(claude: [:], codex: [:])
+        ), .applied)
+        store.record(day: "2026-07-18", provider: "codex",
+                     models: ["unknown": 40, "gpt-5.6-sol": 60],
+                     expectedBucketTimeZone: "Asia/Singapore")
+
+        // 非精确回填：残差规则会把 unknown 40 保留下来
+        XCTAssertTrue(store.mergeBackfillTotals(
+            expectedTimeZone: "Asia/Singapore",
+            totals: UsageHistoryTotals(claude: [:], codex: ["2026-07-18": ["gpt-5.6-sol": 100]])
+        ))
+        XCTAssertEqual(
+            store.usage(provider: "codex", since: "2026-07-18").map { "\($0.model):\($0.tokens)" }.sorted(),
+            ["gpt-5.6-sol:100", "unknown:40"]
+        )
+
+        // 精确重建：unknown 被清洗，解析器版本在同一事务里登记
+        XCTAssertTrue(store.mergeBackfillTotals(
+            expectedTimeZone: "Asia/Singapore",
+            totals: UsageHistoryTotals(claude: [:], codex: ["2026-07-18": ["gpt-5.6-sol": 100]]),
+            exact: true,
+            recordingParserVersion: StatusService.usageParserVersion
+        ))
+        XCTAssertEqual(store.usage(provider: "codex", since: "2026-07-18"), [
+            DailyModelUsage(day: "2026-07-18", provider: "codex",
+                            model: "gpt-5.6-sol", tokens: 100),
+        ])
+        XCTAssertEqual(store.usageParserVersion(), StatusService.usageParserVersion)
     }
 
     func testUsageStoreUpsertsAndQueriesByProviderAndDay() {

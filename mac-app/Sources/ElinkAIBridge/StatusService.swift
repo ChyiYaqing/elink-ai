@@ -246,9 +246,13 @@ final class StatusService {
         computeDailyTotals(in: [timeZone])?[timeZone.identifier]
     }
 
+    /// 解析行为变化时递增：触发一次精确重建，清洗旧解析器写入的错误归因。
+    /// v2：subagent 文件里模型声明前的 token_count 归属文件首个声明的模型。
+    static let usageParserVersion = "2"
+
     /// 启动时后台回填近一年历史，让统计页首次打开就有周/月/年数据
     @discardableResult
-    func backfillHistory(in timeZone: TimeZone? = nil) -> Bool {
+    func backfillHistory(in timeZone: TimeZone? = nil, exact: Bool = false) -> Bool {
         guard let store else { return false }
         let capturedTimeZone = timeZone ?? Self.aggregationCalendar.timeZone
         guard let totals = computeDailyTotals(in: capturedTimeZone) else {
@@ -256,10 +260,15 @@ final class StatusService {
             return false
         }
         guard store.mergeBackfillTotals(
-            expectedTimeZone: capturedTimeZone.identifier, totals: totals
+            expectedTimeZone: capturedTimeZone.identifier, totals: totals,
+            exact: exact,
+            recordingParserVersion: exact ? Self.usageParserVersion : nil
         ) else {
             Log.warning("usage backfill failed; stored history was left unchanged", category: "storage")
             return false
+        }
+        if exact {
+            Log.info("usage history rebuilt for parser v\(Self.usageParserVersion)")
         }
         Log.info("usage backfill: claude \(totals.claude.count) days, codex \(totals.codex.count) days")
         return true
@@ -273,15 +282,18 @@ final class StatusService {
         return Self.shouldRunUsageMaintenance(
             applied: store.usageBucketTimeZone(),
             current: Self.aggregationCalendar.timeZone.identifier,
-            retryPending: lock.holding { historyMaintenanceRetryPending }
+            retryPending: lock.holding { historyMaintenanceRetryPending },
+            parserOutdated: store.usageParserVersion() != Self.usageParserVersion
         )
     }
 
     static func shouldRunUsageMaintenance(applied: String?, current: String,
-                                          retryPending: Bool) -> Bool {
+                                          retryPending: Bool,
+                                          parserOutdated: Bool = false) -> Bool {
         // Foundation 会把 "UTC" 这类别名规范化成 "GMT"；比较必须在规范化后进行，
         // 否则同一时区的不同写法会造成永不收敛的迁移循环
-        retryPending || applied.flatMap(TimeZone.init(identifier:))?.identifier != current
+        retryPending || parserOutdated
+            || applied.flatMap(TimeZone.init(identifier:))?.identifier != current
     }
 
     func retryUsageMaintenanceIfNeeded() {
@@ -298,7 +310,10 @@ final class StatusService {
         let applied = store.usageBucketTimeZone()
         // 与 shouldRunUsageMaintenance 相同的规范化比较，别名时区不触发迁移
         if applied.flatMap(TimeZone.init(identifier:))?.identifier == current {
-            let succeeded = backfillHistory(in: target)
+            // 解析器升级后先做一次精确重建，清洗旧解析器的错误归因；
+            // 时区迁移与版本升级同时发生时，迁移先行，下一轮维护再精确重建
+            let exact = store.usageParserVersion() != Self.usageParserVersion
+            let succeeded = backfillHistory(in: target, exact: exact)
             lock.holding { historyMaintenanceRetryPending = !succeeded }
             UserDefaults.standard.removeObject(forKey: Self.appliedBucketTimeZoneKey)
             return
@@ -403,9 +418,12 @@ final class StatusService {
 
     /// 单个 Codex 会话文件的行 -> (时间戳, 模型, token 增量) 事件序列。
     /// 增量计算与分桶时区无关，解析一次即可按多个时区分桶。
+    /// subagent 会话会先写 token_count、之后才声明模型；模型声明前的事件
+    /// 归属文件首个声明的模型，文件从头到尾没有模型时才落到 "unknown"。
     static func codexUsageEvents(lines: [String]) -> [(date: Date, model: String, tokens: Int)] {
-        var events: [(date: Date, model: String, tokens: Int)] = []
-        var model = "unknown"
+        var events: [(date: Date, model: String?, tokens: Int)] = []
+        var model: String?
+        var firstModel: String?
         var previousTotal: Int?
         for line in lines {
             guard let data = line.data(using: .utf8),
@@ -413,6 +431,7 @@ final class StatusService {
                   let payload = object["payload"] as? [String: Any] else { continue }
             if let value = payload["model"] as? String, !value.isEmpty {
                 model = value
+                if firstModel == nil { firstModel = value }
             }
             guard payload["type"] as? String == "token_count",
                   let info = payload["info"] as? [String: Any],
@@ -434,9 +453,10 @@ final class StatusService {
             previousTotal = cumulative
 
             guard delta > 0, let date = timestamp(object["timestamp"]) else { continue }
-            events.append((date, normalizedModel(model), delta))
+            events.append((date, model, delta))
         }
-        return events
+        return events.map { (date: $0.date, model: normalizedModel($0.model ?? firstModel),
+                             tokens: $0.tokens) }
     }
 
     static func bucketCodexEvents(_ events: [(date: Date, model: String, tokens: Int)],
