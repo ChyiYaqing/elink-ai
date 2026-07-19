@@ -1,0 +1,21 @@
+[package]
+name = "elink-tui"
+# Kept in sync with the repo release version; the update check compares it
+# against the latest GitHub release tag.
+version = "0.1.15-rc1"
+edition = "2021"
+license = "GPL-3.0-only"
+description = "Keyboard-driven terminal dashboard for Claude Code and Codex usage"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4", features = ["derive"] }
+dirs = "5"
+png = "0.17"
+ratatui = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+ureq = { version = "2", features = ["json"] }

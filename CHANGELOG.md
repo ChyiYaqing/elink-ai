@@ -6,6 +6,36 @@ and `Removed`.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## Unreleased
+
+### Added
+
+- `elink-tui`: a keyboard-driven Linux terminal dashboard (Rust) mirroring the
+  macOS cards — working/idle/offline state, today's per-model tokens, and
+  5-hour/weekly quota bars with reset countdowns. It reads `~/.claude` and
+  `~/.codex` locally (with statusline-cache and session-log quota fallbacks)
+  or polls a mac-app bridge remotely, switchable at runtime
+- `elink-tui` local mode accepts the bridge's `POST /v1/event` hook requests,
+  enabling live working/idle transitions and permission-request alerts from
+  the existing hook scripts
+- `elink-tui` caches the last fetched quota in
+  `~/.local/state/elink-ai/quota.json` so usage bars appear immediately after
+  a restart, and quota fetches run off the poll loop so the dashboard stays
+  live during slow networks
+- `elink-tui` usage-history page (`s`): daily token charts and per-model
+  totals over week/month/year ranges, backfilled from existing session logs
+  and persisted to `~/.local/state/elink-ai/history.json`
+- `elink-tui` serves its local snapshot on `GET /v1/status` in the bridge
+  wire format, so a Raspberry Pi agent can use a Linux machine as its data
+  bridge
+- `elink-tui` device page (`d`): live e-paper preview rendered in the
+  terminal, display-mode switching, smart/full refresh, and one-key
+  "use this machine as the data bridge"
+- `elink-tui` update check (`u`) against GitHub Releases with a `gh` CLI
+  fallback for private repositories, a `--compact` one-line output for
+  tmux/waybar status bars, and a terminal title showing the worse weekly
+  quota percentage
+
 ## 0.1.15-rc1
 
 ### Packaging

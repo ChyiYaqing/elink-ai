@@ -1,7 +1,8 @@
 # Repository instructions
 
 Follow the existing code style and keep changes scoped to the user's request.
-Run the relevant Python and/or Swift tests before committing code changes.
+Run the relevant Python, Swift, and/or Rust (`cd elink-tui && cargo test`)
+tests before committing code changes.
 
 ## Release protocol
 

@@ -10,3 +10,4 @@ build/
 last-frame.png
 state.json
 .vscode/
+elink-tui/target/

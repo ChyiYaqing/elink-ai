@@ -160,6 +160,89 @@ are still evolving; the bridge endpoint supports Codex events, but this version
 does not rewrite Codex configuration automatically. Log mtime detection remains
 active for both providers.
 
+## Linux terminal dashboard
+
+`elink-tui/` is a keyboard-driven Rust TUI that mirrors the macOS dashboard in
+a terminal: Claude and Codex cards with working/idle/offline state, today's
+per-model tokens, and 5-hour/weekly quota bars with reset countdowns. It runs
+in two modes:
+
+- **local** (default): reads `~/.claude` and `~/.codex` on the Linux machine
+  and fetches quota directly, with the same statusline-cache and session-log
+  fallbacks as the macOS app. No Mac required.
+- **remote**: polls an existing mac-app bridge over the LAN.
+
+```bash
+cd elink-tui
+cargo build --release
+./target/release/elink-tui                          # local mode
+./target/release/elink-tui --bridge http://mac:8765 # remote mode
+./target/release/elink-tui --once                   # print one JSON snapshot
+./target/release/elink-tui --compact                # print one cached summary
+```
+
+Everything is keyboard-only: `q` quit, `r` refresh, `Tab`/`←`/`→` switch the
+focused card, `1`/`2` jump to a card, `↑`/`↓` scroll the model list, `s` local
+usage history, `d` device page, `u` update check, `m` toggle local/remote, `?`
+help.
+Optional settings live in `~/.config/elink-ai/tui.toml`:
+
+```toml
+mode = "local"                     # or "remote"
+bridge_url = "http://mac:8765"
+
+[refresh]
+status_poll_s = 2
+quota_fetch_s = 120
+
+[hooks]
+listen = "127.0.0.1:8765"          # "" disables the hook listener
+
+[device]
+url = "http://pi:8766"             # enables the e-paper device page
+```
+
+In local mode the TUI listens for the same `POST /v1/event` hook requests as
+the mac-app bridge, so `python3 hooks/install-claude-hooks.py` gives it live
+working/idle transitions and permission-request (`⚠ input`) alerts; without
+hooks, state falls back to session-file timestamps. The last fetched quota is
+cached in `~/.local/state/elink-ai/quota.json` (`0600`) so a restart shows
+usage bars immediately.
+
+In local mode, pressing `s` opens a usage-history page with daily token charts
+and per-model totals over the last week, month (`w`/`m`), or twelve months
+(`y`). History is backfilled from existing session logs on first launch and
+kept in `~/.local/state/elink-ai/history.json`; remote mode does not mix in this
+machine's local history.
+
+The listener also serves the latest local snapshot on `GET /v1/status` in the
+standard bridge format, so a Raspberry Pi agent (or another consumer) can use
+a Linux machine as its data bridge — set `listen = "0.0.0.0:8765"` to expose
+it beyond localhost, and only on a trusted LAN, matching the ports-8765/8766
+security guidance below.
+
+With `[device] url = "http://pi:8766"` configured, `d` opens a device page
+showing the agent's status and the exact e-paper frame (rendered with
+half-block characters), with keys for display mode (`1`/`2`/`3`), smart/full
+refresh (`p`/`f`), and pointing the device at this machine's bridge (`b`).
+The `b` action is enabled only while local mode has a fresh snapshot and a
+successfully bound, non-loopback listener; otherwise the TUI explains why it
+cannot advertise this machine to the device.
+`u` checks GitHub for a newer release (falling back to an existing
+`gh auth login` session for private repositories), and the terminal title
+shows the worse weekly quota percentage — the menu-bar equivalent. For a
+tmux status line or waybar module, `elink-tui --compact` prints a one-line
+summary such as `C● 43%/68% | X○ 12%/22%` and exits.
+Compact mode scans current local sessions and reads the persisted quota cache;
+it does not contact provider APIs, start history backfill, or mutate history.
+
+Run tests with:
+
+```bash
+cd elink-tui
+cargo test
+```
+
 ## Install on Raspberry Pi
 
 First edit `install/config.example.toml` or edit the installed copy afterward,
