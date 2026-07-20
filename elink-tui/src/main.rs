@@ -27,8 +27,9 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let config = Config::load(&cli)?;
     if let Some(AppCommand::Cluster { command }) = &cli.command {
-        let cluster = elink_tui::cluster::ClusterService::load(
-            config.cluster_state.clone(),
+        let cluster = elink_tui::cluster::ClusterService::load_with_legacy(
+            config.usage_db.clone(),
+            Some(&config.cluster_state),
             config.cluster_node_name.as_deref(),
         )?;
         println!("{}", cluster.run_command(command)?);
@@ -57,9 +58,11 @@ fn run_once(config: &Config, compact: bool) -> Result<()> {
                 .map_err(|error| anyhow!(error))?
                 .snapshot_for_compact(),
             LocalCollectionMode::Fresh => {
-                let history = std::sync::Arc::new(source::local::history::History::new(
-                    config.history_cache.clone(),
-                ));
+                let history =
+                    std::sync::Arc::new(source::local::history::History::new_with_legacy(
+                        config.usage_db.clone(),
+                        &config.history_cache,
+                    ));
                 source::local::LocalSource::new(config, history)
                     .map_err(|error| anyhow!(error))?
                     .collect(true)

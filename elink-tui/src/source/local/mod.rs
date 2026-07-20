@@ -1,4 +1,5 @@
 pub mod creds;
+pub mod db;
 pub mod history;
 pub mod hooks;
 pub mod quota;
@@ -6,6 +7,7 @@ pub mod sessions;
 pub mod store;
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -32,14 +34,20 @@ pub struct LocalSource {
     claude_home: PathBuf,
     codex_home: PathBuf,
     backfill_started: bool,
+    /// The bucket timezone the running backfill was scanned under; a change
+    /// (e.g. joining a cluster in another zone) re-runs it to rebucket days.
+    backfill_tz: Option<String>,
+    backfill_generation: Arc<AtomicU64>,
+    backfill_running: Arc<AtomicBool>,
     cluster: Arc<ClusterService>,
 }
 
 impl LocalSource {
     pub fn new(config: &Config, history: Arc<History>) -> Result<Self, String> {
         let cluster = Arc::new(
-            ClusterService::load(
-                config.cluster_state.clone(),
+            ClusterService::load_with_legacy(
+                config.usage_db.clone(),
+                Some(&config.cluster_state),
                 config.cluster_node_name.as_deref(),
             )
             .map_err(|error| error.to_string())?,
@@ -49,8 +57,9 @@ impl LocalSource {
 
     pub fn for_compact(config: &Config) -> Result<Self, String> {
         let cluster = Arc::new(
-            ClusterService::load(
-                config.cluster_state.clone(),
+            ClusterService::load_with_legacy(
+                config.usage_db.clone(),
+                Some(&config.cluster_state),
                 config.cluster_node_name.as_deref(),
             )
             .map_err(|error| error.to_string())?,
@@ -67,15 +76,19 @@ impl LocalSource {
     }
 
     fn build(config: &Config, history: Option<Arc<History>>, cluster: Arc<ClusterService>) -> Self {
-        let timezone = cluster.bucket_timezone();
+        let timezone = cluster.effective_timezone();
         Self {
-            scanner: SessionScanner::new_in(&config.claude_home, &config.codex_home, timezone),
+            scanner: SessionScanner::new_in(
+                &config.claude_home,
+                &config.codex_home,
+                Some(timezone),
+            ),
             quota: Arc::new(QuotaFetcher::new(
                 config.claude_home.clone(),
                 config.codex_home.clone(),
                 config.statusline_cache.clone(),
                 config.quota_fetch_s,
-                store::QuotaStore::new(config.quota_cache.clone()),
+                store::QuotaStore::new_with_legacy(config.usage_db.clone(), &config.quota_cache),
             )),
             hooks: Arc::new(HookRegistry::default()),
             history,
@@ -85,28 +98,77 @@ impl LocalSource {
             claude_home: config.claude_home.clone(),
             codex_home: config.codex_home.clone(),
             backfill_started: false,
+            backfill_tz: None,
+            backfill_generation: Arc::new(AtomicU64::new(0)),
+            backfill_running: Arc::new(AtomicBool::new(false)),
             cluster,
         }
     }
 
-    /// Backfills up to a year of daily history from old session logs once,
-    /// off the poll thread; the stats page fills in when it completes.
-    fn start_backfill_once(&mut self) {
-        if self.backfill_started {
-            return;
-        }
+    /// The IANA zone used for daily buckets: the cluster zone when joined,
+    /// otherwise this Linux host's local zone.
+    fn bucket_timezone_id(&self) -> String {
+        self.cluster.effective_timezone().name().to_string()
+    }
+
+    /// Backfills up to a year of daily history from old session logs off the
+    /// poll thread; the stats page fills in when it completes. Re-runs when the
+    /// bucket timezone changes (joining/leaving a cluster in another zone) so
+    /// the stored days are rebucketed under the new zone — the mac-app's
+    /// rebucket trigger, driven by the persisted `usage_bucket_timezone`.
+    fn ensure_backfill(&mut self) {
         let Some(history) = self.history.as_ref().map(Arc::clone) else {
             return;
         };
+        let timezone = self.cluster.effective_timezone();
+        let timezone_id = timezone.name().to_string();
+        let same_target = self.backfill_tz.as_deref() == Some(timezone_id.as_str());
+        if same_target
+            && (self.backfill_running.load(Ordering::Acquire)
+                || history.bucket_timezone().as_deref() == Some(timezone_id.as_str())
+                    && history.backfilled())
+        {
+            return;
+        }
+        if self.backfill_tz.is_some() && !same_target {
+            // SessionScanner caches day buckets; a timezone change must drop
+            // those caches before the next live scan.
+            self.scanner =
+                SessionScanner::new_in(&self.claude_home, &self.codex_home, Some(timezone));
+        }
         self.backfill_started = true;
+        self.backfill_tz = Some(timezone_id.clone());
+        let generation = self.backfill_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let generation_guard = Arc::clone(&self.backfill_generation);
+        self.backfill_running.store(true, Ordering::Release);
+        let running = Arc::clone(&self.backfill_running);
         let claude_home = self.claude_home.clone();
         let codex_home = self.codex_home.clone();
-        let timezone = self.cluster.bucket_timezone();
         std::thread::spawn(move || {
             let cutoff = epoch_now() - BACKFILL_DAYS * 86_400;
             let (claude, codex) =
-                sessions::full_daily_totals_in(&claude_home, &codex_home, cutoff, timezone);
-            history.merge_backfill(claude, codex);
+                sessions::full_daily_totals_in(&claude_home, &codex_home, cutoff, Some(timezone));
+            let old_explained = history.bucket_timezone().and_then(|source| {
+                if source == timezone_id {
+                    return None;
+                }
+                source.parse().ok().map(|source_timezone| {
+                    sessions::full_daily_totals_in(
+                        &claude_home,
+                        &codex_home,
+                        cutoff,
+                        Some(source_timezone),
+                    )
+                })
+            });
+            if generation_guard.load(Ordering::Acquire) != generation {
+                return;
+            }
+            let today = chrono::Utc::now().with_timezone(&timezone).date_naive();
+            let _ = history.apply_backfill(&timezone_id, claude, codex, old_explained, today);
+            if generation_guard.load(Ordering::Acquire) == generation {
+                running.store(false, Ordering::Release);
+            }
         });
     }
 
@@ -190,16 +252,17 @@ impl LocalSource {
 
     fn snapshot(&mut self, update_history: bool) -> Result<Snapshot, String> {
         if update_history {
-            self.start_backfill_once();
+            self.ensure_backfill();
         }
         let outcome = self.scanner.scan();
         let now = epoch_now();
 
         if update_history {
             let today = self.cluster.day_key(now);
+            let timezone = self.bucket_timezone_id();
             if let Some(history) = &self.history {
-                history.record_day("claude", &today, &outcome.claude.models);
-                history.record_day("codex", &today, &outcome.codex.models);
+                history.record_day_in("claude", &today, &outcome.claude.models, &timezone);
+                history.record_day_in("codex", &today, &outcome.codex.models, &timezone);
                 history.flush_if_dirty(now, self.cluster.today());
             }
         }
@@ -303,6 +366,7 @@ mod tests {
             claude_home: root.join("claude"),
             codex_home: root.join("codex"),
             statusline_cache: root.join("statusline.json"),
+            usage_db: root.join("usage.db"),
             quota_cache: root.join("quota.json"),
             history_cache: root.join("history.json"),
             cluster_state: root.join("cluster.json"),

@@ -75,8 +75,9 @@ elink-tui cluster join --endpoint http://host:8765 --code XXXX-XXXX-XXXX-XXXX
 
 配置文件 `~/.config/elink-ai/tui.toml`(CLI 覆盖文件,全部可选):
 `mode`、`bridge_url`、`[refresh] status_poll_s=2 / quota_fetch_s=120`、
-`[paths] claude_home / codex_home / statusline_cache / quota_cache /
-history_cache / cluster_state`、`[cluster] node_name`、`[hooks] listen`、
+`[paths] claude_home / codex_home / statusline_cache / usage_db`（旧版
+`quota_cache` / `history_cache` / `cluster_state` 仅作导入源）、
+`[cluster] node_name`、`[hooks] listen`、
 `[device] url`。
 
 本地模式要点(忠实移植 Swift 逻辑):
@@ -172,17 +173,17 @@ Codex 日志配额、keep-last-good 全部 fallback)、远程 bridge 轮询、`r
    `POST /v1/event`,完整移植 `recordEvent`/`overlay` 语义(5 分钟注意标志、
    10 分钟 working 覆盖、60 秒 idle 降级),现有 `hooks/` 脚本无需改动。
 2. ~~**配额缓存跨重启持久化**~~ **已实现(2026-07-19)**:
-   `src/source/local/store.rs` 序列化到 `~/.local/state/elink-ai/quota.json`
+   `src/source/local/store.rs` 持久化到共享 `~/.local/state/elink-ai/usage.db`
    (目录 0700 / 文件 0600),读取时按 mac-app 语义丢弃过期窗口、无 reset
    时间超 6 小时不信任;空结果不覆盖、旧观察不回写。同批把配额抓取挪到
    独立线程(`fetching` 防重入),worker 轮询不再被慢网络阻塞。
-3. ~~**用量历史统计页**~~ **已实现(2026-07-19,轻量版)**:
-   `src/source/local/history.rs` 按天分桶落盘
-   `~/.local/state/elink-ai/history.json`(366 天保留,30 秒节流写盘),
+3. ~~**用量历史统计页**~~ **已实现(2026-07-19,2026-07-20 对齐存储语义)**:
+   `src/source/local/history.rs` 按天分桶落盘到共享 `usage.db`
+   (366 天保留,30 秒节流写盘),
    启动后后台线程从现有会话日志回填近一年;`s` 键统计页按 `w`/`m`/`y` 切
-   周(柱状)/月(sparkline)/年(按月柱状),含区间总量与按模型明细。未移植
-   时区迁移/残差守恒机制(mac-app `runUsageMaintenance`)；单机使用本机时区，
-   入群后的新扫描使用集群时区，但不会重写入群前已有的历史桶。
+   周(柱状)/月(sparkline)/年(按月柱状),含区间总量、按模型明细、按节点筛选与
+   节点占比。时区变化会原子重分桶，并按 mac-app 语义保留现存日志无法解释的
+   残差；旧 JSON 数据在 SQLite 表为空时一次性导入。
 4. ~~**作为数据源服务端**~~ **已实现(2026-07-19)**:hook 监听端点同时伺服
    `GET /v1/status`(bridge 线格式,`Serialize for Snapshot` 输出
    `five_hour_*`/`primary_*` 字段名),已用 `elink_agent.models.StatusSnapshot`
@@ -208,10 +209,11 @@ Codex 日志配额、keep-last-good 全部 fallback)、远程 bridge 轮询、`r
    `manifest`/`pull`/`announce` 交换带 revision/content hash 的绝对快照，远端
    仅接受更高 revision，Dashboard 和历史页按节点求和，实时状态按 90 秒在线
    窗口聚合，配额使用 freshest-wins + 10 分钟无错误优先规则。凭据、peer、节点
-   和快照持久化到 `~/.local/state/elink-ai/cluster.json`(0600)，切换集群时保留
+   和快照持久化到共享 `~/.local/state/elink-ai/usage.db`(0600)，切换集群时保留
    本节点快照并原子清除远端数据。`elink-tui cluster create/join/leave/add-peer/
-   status` 管理集群，TUI `c` 页显示节点并用 `p` 开放两分钟配对窗口。Linux
-   不做 Bonjour，节点通过配对记录或 `add-peer` 手动发现。至此 PLAN 中列出的
+   status` 管理集群，TUI `c` 页显示节点并用 `p` 开放两分钟配对窗口。监听地址
+   可被局域网访问时通过兼容 mac-app 的 mDNS 自动发现同集群节点，跨网段仍可用
+   `add-peer`。至此 PLAN 中列出的
    Linux 功能性差距均已完成。
 8. ~~**更新检查**~~ **已实现(2026-07-19)**:`src/update.rs` 后台线程查
    GitHub `/releases`(匿名 API 优先,私有仓库 404 时回退到用户已有的
@@ -226,7 +228,5 @@ Codex 日志配额、keep-last-good 全部 fallback)、远程 bridge 轮询、`r
   `~/.claude/.credentials.json`,已覆盖)
 - 登录自启(macOS `SMAppService`;Linux 交给用户的 systemd user unit /
   终端复用器,TUI 是前台程序)
-- Bonjour 设备发现、DHCP/bridge 自愈(菜单栏 app 的设备运维功能)
+- 墨水屏设备的 Bonjour/DHCP 自动配对与 bridge 自愈(集群节点 mDNS 已覆盖)
 - SwiftUI 面板交互细节(悬停提示、动画)与日志文件入口(TUI 无日志文件)
-- mac-app SQLite 历史库的时区迁移/残差守恒维护；TUI 在入群后使用集群时区
-  扫描与分桶，但不会重写入群前已有的轻量 JSON 历史

@@ -1,7 +1,7 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -10,16 +10,19 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::prelude::*;
-use chrono::{Local, Utc};
+use chrono::Utc;
 use chrono_tz::Tz;
 use clap::Subcommand;
 use ring::rand::{SecureRandom, SystemRandom};
 use ring::{aead, agreement, digest, hkdf, hmac};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
+use rusqlite::types::Value as SqlValue;
+use rusqlite::{Connection, OptionalExtension};
+
 use crate::model::{Cluster, ModelUsage, ProviderStatus, Snapshot};
+use crate::source::local::db::open_db;
 use crate::source::local::history::{DayTotals, History};
-use crate::source::local::store::write_restricted;
 use crate::util::epoch_now;
 
 const PROTOCOL_VERSION: u32 = 2;
@@ -279,9 +282,15 @@ pub struct ClusterView {
 
 pub struct ClusterService {
     path: PathBuf,
+    conn: Mutex<Connection>,
     state: Mutex<RuntimeState>,
+    /// Endpoints learned from mDNS discovery, unioned with stored peers/nodes
+    /// when syncing. Kept separate so discovery never mutates persisted state.
+    discovered: Mutex<BTreeSet<String>>,
     force_sync: AtomicBool,
     worker_started: AtomicBool,
+    discovery_started: AtomicBool,
+    discovery_enabled: AtomicBool,
 }
 
 pub struct ClusterHttpRequest {
@@ -332,17 +341,35 @@ impl ClusterHttpResponse {
 
 impl ClusterService {
     pub fn load(path: PathBuf, configured_name: Option<&str>) -> Result<Self> {
-        let mut stored = match fs::read(&path) {
-            Ok(data) => serde_json::from_slice::<StoredClusterState>(&data)
-                .with_context(|| format!("invalid cluster state {}", path.display()))?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                StoredClusterState::default()
+        Self::load_with_legacy(path, None, configured_name)
+    }
+
+    pub fn load_with_legacy(
+        path: PathBuf,
+        legacy_path: Option<&Path>,
+        configured_name: Option<&str>,
+    ) -> Result<Self> {
+        let conn = open_db(&path)
+            .with_context(|| format!("cannot open cluster database {}", path.display()))?;
+        let mut stored = load_state(&conn)
+            .with_context(|| format!("invalid cluster state in {}", path.display()))?;
+        if stored.credentials.node_id.is_empty() {
+            if let Some(legacy) = legacy_path.filter(|legacy| *legacy != path) {
+                match fs::read(legacy) {
+                    Ok(data) => {
+                        stored = serde_json::from_slice::<StoredClusterState>(&data).with_context(
+                            || format!("invalid legacy cluster state {}", legacy.display()),
+                        )?;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("cannot read legacy cluster state {}", legacy.display())
+                        })
+                    }
+                }
             }
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("cannot read cluster state {}", path.display()))
-            }
-        };
+        }
         if stored.credentials.node_id.is_empty() {
             stored.credentials.node_id = random_uuid()?;
         }
@@ -358,6 +385,7 @@ impl ClusterService {
         stored.peers.dedup();
         let service = Self {
             path,
+            conn: Mutex::new(conn),
             state: Mutex::new(RuntimeState {
                 stored,
                 live_statuses: HashMap::new(),
@@ -367,8 +395,11 @@ impl ClusterService {
                 generation: 0,
                 last_error: None,
             }),
+            discovered: Mutex::new(BTreeSet::new()),
             force_sync: AtomicBool::new(false),
             worker_started: AtomicBool::new(false),
+            discovery_started: AtomicBool::new(false),
+            discovery_enabled: AtomicBool::new(false),
         };
         {
             let state = service.lock();
@@ -470,6 +501,56 @@ impl ClusterService {
         self.force_sync.store(true, Ordering::Release);
     }
 
+    /// The local node identity, used by discovery to filter out this machine's
+    /// own advertisement.
+    pub fn local_node_id(&self) -> String {
+        self.lock().stored.credentials.node_id.clone()
+    }
+
+    /// Records an endpoint learned from mDNS discovery and requests an
+    /// immediate sync when it is newly seen. Never persisted: a peer that
+    /// stops advertising simply ages out of the sync set on the next restart.
+    pub fn note_discovered_endpoint(&self, endpoint: &str) {
+        let Ok(endpoint) = normalize_endpoint(endpoint) else {
+            return;
+        };
+        let inserted = {
+            let mut discovered = self
+                .discovered
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            discovered.insert(endpoint)
+        };
+        if inserted {
+            self.force_sync.store(true, Ordering::Release);
+        }
+    }
+
+    pub fn forget_discovered_endpoint(&self, endpoint: &str) {
+        let Ok(endpoint) = normalize_endpoint(endpoint) else {
+            return;
+        };
+        self.discovered
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&endpoint);
+    }
+
+    /// Stored peers and node endpoints unioned with mDNS-discovered endpoints.
+    fn all_endpoints(&self) -> Vec<String> {
+        let mut endpoints = known_endpoints(&self.lock().stored);
+        endpoints.extend(
+            self.discovered
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .cloned(),
+        );
+        endpoints.sort();
+        endpoints.dedup();
+        endpoints
+    }
+
     pub fn bucket_timezone(&self) -> Option<Tz> {
         self.lock()
             .stored
@@ -479,8 +560,12 @@ impl ClusterService {
             .and_then(|value| Tz::from_str(value).ok())
     }
 
+    pub fn effective_timezone(&self) -> Tz {
+        self.bucket_timezone().unwrap_or_else(local_timezone)
+    }
+
     pub fn day_key(&self, timestamp: i64) -> String {
-        crate::source::local::sessions::day_key_in(timestamp, self.bucket_timezone())
+        crate::source::local::sessions::day_key_in(timestamp, Some(self.effective_timezone()))
     }
 
     pub fn view(&self) -> ClusterView {
@@ -535,10 +620,203 @@ impl ClusterService {
     }
 
     fn save_locked(&self, state: &RuntimeState) -> Result<()> {
-        let text = serde_json::to_string(&state.stored)?;
-        write_restricted(&self.path, &text)
-            .with_context(|| format!("cannot write cluster state {}", self.path.display()))
+        let mut conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        save_state(&mut conn, &state.stored)
+            .with_context(|| format!("cannot write cluster state to {}", self.path.display()))
     }
+}
+
+/// Reads the full cluster state from the `usage.db` tables into the in-memory
+/// model. All persistence funnels through here and `save_state`, so the rest
+/// of the module is unchanged from the JSON-backed version.
+fn load_state(conn: &Connection) -> Result<StoredClusterState> {
+    let credentials = match conn
+        .query_row(
+            "SELECT payload FROM cluster_credentials WHERE singleton = 1",
+            [],
+            |row| match row.get::<_, SqlValue>(0)? {
+                SqlValue::Text(value) => Ok(value.into_bytes()),
+                SqlValue::Blob(value) => Ok(value),
+                other => Err(rusqlite::Error::InvalidColumnType(
+                    0,
+                    "payload".to_string(),
+                    other.data_type(),
+                )),
+            },
+        )
+        .optional()?
+    {
+        Some(payload) => serde_json::from_slice::<ClusterCredentials>(&payload)
+            .context("invalid cluster credentials payload")?,
+        None => ClusterCredentials {
+            node_id: String::new(),
+            node_name: String::new(),
+            cluster_id: None,
+            cluster_secret: None,
+            timezone: None,
+        },
+    };
+
+    let peers = {
+        let mut statement = conn.prepare("SELECT endpoint FROM cluster_peers")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    let nodes = {
+        let mut statement = conn.prepare(
+            "SELECT node_id, name, endpoint, last_seen_at, last_sync_at FROM cluster_nodes",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(ClusterNodeRecord {
+                node_id: row.get(0)?,
+                name: row.get(1)?,
+                endpoint: row.get(2)?,
+                last_seen_at: row.get(3)?,
+                last_sync_at: row.get(4)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    // Group model rows by their snapshot key, then attach to descriptors.
+    let mut models: HashMap<(String, String, String), BTreeMap<String, i64>> = HashMap::new();
+    {
+        let mut statement = conn.prepare(
+            "SELECT origin_node_id, day, provider, model, tokens FROM cluster_model_usage",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?;
+        for row in rows {
+            let (origin, day, provider, model, tokens) = row?;
+            models
+                .entry((origin, day, provider))
+                .or_default()
+                .insert(model, tokens);
+        }
+    }
+
+    let snapshots = {
+        let mut statement = conn.prepare(
+            "SELECT origin_node_id, day, provider, revision, observed_at
+             FROM cluster_usage_snapshots",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, f64>(4)?,
+            ))
+        })?;
+        let mut snapshots = Vec::new();
+        for row in rows {
+            let (origin_node_id, day, provider, revision, observed_at) = row?;
+            let key = (origin_node_id.clone(), day.clone(), provider.clone());
+            snapshots.push(ClusterUsageSnapshot {
+                key: ClusterSnapshotKey {
+                    origin_node_id,
+                    day,
+                    provider,
+                },
+                revision,
+                observed_at,
+                models: models.remove(&key).unwrap_or_default(),
+            });
+        }
+        snapshots
+    };
+
+    Ok(StoredClusterState {
+        version: 1,
+        credentials,
+        peers,
+        snapshots,
+        nodes,
+    })
+}
+
+/// Replaces the persisted cluster state with the in-memory model in one
+/// transaction (matching the whole-file rewrite the JSON backend performed).
+fn save_state(conn: &mut Connection, stored: &StoredClusterState) -> Result<()> {
+    let transaction = conn.transaction()?;
+    let payload = serde_json::to_string(&stored.credentials)?;
+    transaction.execute(
+        "INSERT INTO cluster_credentials (singleton, payload, updated_at)
+         VALUES (1, ?1, ?2)
+         ON CONFLICT(singleton) DO UPDATE SET
+            payload = excluded.payload, updated_at = excluded.updated_at",
+        (&payload, epoch_now() as f64),
+    )?;
+
+    transaction.execute("DELETE FROM cluster_peers", [])?;
+    for endpoint in &stored.peers {
+        transaction.execute(
+            "INSERT OR IGNORE INTO cluster_peers (endpoint) VALUES (?1)",
+            [endpoint],
+        )?;
+    }
+
+    transaction.execute("DELETE FROM cluster_nodes", [])?;
+    for node in &stored.nodes {
+        transaction.execute(
+            "INSERT INTO cluster_nodes (node_id, name, endpoint, last_seen_at, last_sync_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            (
+                &node.node_id,
+                &node.name,
+                &node.endpoint,
+                node.last_seen_at,
+                node.last_sync_at,
+            ),
+        )?;
+    }
+
+    transaction.execute("DELETE FROM cluster_usage_snapshots", [])?;
+    transaction.execute("DELETE FROM cluster_model_usage", [])?;
+    for snapshot in &stored.snapshots {
+        transaction.execute(
+            "INSERT INTO cluster_usage_snapshots
+                (origin_node_id, day, provider, revision, observed_at, content_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            (
+                &snapshot.key.origin_node_id,
+                &snapshot.key.day,
+                &snapshot.key.provider,
+                snapshot.revision,
+                snapshot.observed_at,
+                content_hash(&snapshot.models),
+            ),
+        )?;
+        for (model, tokens) in &snapshot.models {
+            transaction.execute(
+                "INSERT INTO cluster_model_usage
+                    (origin_node_id, day, provider, model, tokens)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                (
+                    &snapshot.key.origin_node_id,
+                    &snapshot.key.day,
+                    &snapshot.key.provider,
+                    model,
+                    tokens,
+                ),
+            )?;
+        }
+    }
+
+    transaction.commit()?;
+    Ok(())
 }
 
 fn reset_remote_data(state: &mut RuntimeState) {
@@ -579,6 +857,10 @@ fn local_timezone_name() -> String {
         }
     }
     "UTC".to_string()
+}
+
+fn local_timezone() -> Tz {
+    Tz::from_str(&local_timezone_name()).unwrap_or(chrono_tz::UTC)
 }
 
 fn normalize_endpoint(value: &str) -> Result<String> {
@@ -1158,6 +1440,25 @@ impl ClusterService {
         Ok((node_id, key))
     }
 
+    /// Publishes this node over mDNS and browses for cluster peers on the LAN,
+    /// feeding their endpoints to the sync worker. `port` is the bridge HTTP
+    /// port peers reach us on. A no-op on the second call.
+    pub fn start_discovery(self: &Arc<Self>, port: u16) {
+        self.discovery_enabled.store(true, Ordering::Release);
+        if self.discovery_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        crate::discovery::spawn(Arc::clone(self), port);
+    }
+
+    pub fn pause_discovery(&self) {
+        self.discovery_enabled.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn discovery_enabled(&self) -> bool {
+        self.discovery_enabled.load(Ordering::Acquire)
+    }
+
     pub fn start_sync_worker(self: &Arc<Self>, interval: Duration) {
         if self.worker_started.swap(true, Ordering::AcqRel) {
             return;
@@ -1192,13 +1493,8 @@ impl ClusterService {
     }
 
     fn announce(&self, agent: &ureq::Agent, descriptors: Vec<ClusterSnapshotDescriptor>) {
-        let (credentials, endpoints) = {
-            let state = self.lock();
-            (
-                state.stored.credentials.clone(),
-                known_endpoints(&state.stored),
-            )
-        };
+        let credentials = self.lock().stored.credentials.clone();
+        let endpoints = self.all_endpoints();
         let Ok(key) = cluster_key(&credentials) else {
             return;
         };
@@ -1232,7 +1528,7 @@ impl ClusterService {
     }
 
     fn sync_all(&self, agent: &ureq::Agent) {
-        let endpoints = known_endpoints(&self.lock().stored);
+        let endpoints = self.all_endpoints();
         let mut first_error = None;
         for endpoint in endpoints {
             if let Err(error) = self.sync_peer(agent, &endpoint) {
@@ -1508,10 +1804,15 @@ impl ClusterService {
                 .as_deref()
                 .and_then(|value| Tz::from_str(value).ok()),
         );
+        let history_current = history.is_some_and(|history| {
+            history.bucket_timezone().as_deref() == credentials.timezone.as_deref()
+        });
         let mut claude_days = history
+            .filter(|_| history_current)
             .map(|history| history.provider_days("claude"))
             .unwrap_or_default();
         let mut codex_days = history
+            .filter(|_| history_current)
             .map(|history| history.provider_days("codex"))
             .unwrap_or_default();
         claude_days.insert(
@@ -1526,6 +1827,7 @@ impl ClusterService {
             "claude",
             &claude_days,
             now,
+            history_current,
         );
         changed.extend(update_local_snapshots(
             &mut state.stored.snapshots,
@@ -1533,6 +1835,7 @@ impl ClusterService {
             "codex",
             &codex_days,
             now,
+            history_current,
         ));
         state.pending_announcements.extend(changed.clone());
         let local_live = ClusterLiveStatus {
@@ -1637,11 +1940,95 @@ impl ClusterService {
         days
     }
 
+    /// Stable node list for statistics filters. Snapshot origins are included
+    /// even when their node record has not arrived yet, and the local node is
+    /// always present.
+    pub fn stats_nodes(&self) -> Vec<ClusterNodeRecord> {
+        let state = self.lock();
+        let local_id = state.stored.credentials.node_id.clone();
+        let local_name = state.stored.credentials.node_name.clone();
+        let mut nodes: HashMap<String, ClusterNodeRecord> = state
+            .stored
+            .nodes
+            .iter()
+            .cloned()
+            .map(|node| (node.node_id.clone(), node))
+            .collect();
+        nodes.entry(local_id.clone()).or_insert(ClusterNodeRecord {
+            node_id: local_id,
+            name: local_name,
+            endpoint: None,
+            last_seen_at: None,
+            last_sync_at: None,
+        });
+        for snapshot in &state.stored.snapshots {
+            nodes
+                .entry(snapshot.key.origin_node_id.clone())
+                .or_insert_with(|| ClusterNodeRecord {
+                    node_id: snapshot.key.origin_node_id.clone(),
+                    name: snapshot.key.origin_node_id.clone(),
+                    endpoint: None,
+                    last_seen_at: None,
+                    last_sync_at: None,
+                });
+        }
+        let mut nodes: Vec<_> = nodes.into_values().collect();
+        nodes.sort_by(|left, right| {
+            left.name
+                .to_ascii_lowercase()
+                .cmp(&right.name.to_ascii_lowercase())
+                .then_with(|| left.node_id.cmp(&right.node_id))
+        });
+        nodes
+    }
+
+    pub fn provider_days_for_node(
+        &self,
+        provider: &str,
+        node_id: &str,
+        fallback: &History,
+    ) -> DayTotals {
+        let state = self.lock();
+        if !state.stored.credentials.clustered() {
+            return if state.stored.credentials.node_id == node_id {
+                fallback.provider_days(provider)
+            } else {
+                DayTotals::new()
+            };
+        }
+        let mut days = DayTotals::new();
+        for snapshot in &state.stored.snapshots {
+            if snapshot.key.provider != provider || snapshot.key.origin_node_id != node_id {
+                continue;
+            }
+            let day = days.entry(snapshot.key.day.clone()).or_default();
+            for (model, tokens) in &snapshot.models {
+                if *tokens > 0 {
+                    day.insert(model.clone(), *tokens as u64);
+                }
+            }
+        }
+        days
+    }
+
+    pub fn provider_node_days(
+        &self,
+        provider: &str,
+        fallback: &History,
+    ) -> Vec<(ClusterNodeRecord, DayTotals)> {
+        self.stats_nodes()
+            .into_iter()
+            .map(|node| {
+                let days = self.provider_days_for_node(provider, &node.node_id, fallback);
+                (node, days)
+            })
+            .collect()
+    }
+
     pub fn today(&self) -> chrono::NaiveDate {
-        let now = Utc::now();
-        self.bucket_timezone()
-            .map(|timezone| now.with_timezone(&timezone).date_naive())
-            .unwrap_or_else(|| Local::now().date_naive())
+        Utc::now()
+            .with_timezone(&self.effective_timezone())
+            .date_naive()
     }
 }
 
@@ -1718,22 +2105,33 @@ fn update_local_snapshots(
     provider: &str,
     days: &DayTotals,
     now: i64,
+    authoritative: bool,
 ) -> Vec<ClusterSnapshotDescriptor> {
     let mut changed = Vec::new();
-    for (day, models) in days {
+    let mut desired = days.clone();
+    if authoritative {
+        for snapshot in snapshots.iter() {
+            if snapshot.key.origin_node_id == node_id && snapshot.key.provider == provider {
+                desired.entry(snapshot.key.day.clone()).or_default();
+            }
+        }
+    }
+    for (day, models) in &desired {
         let models: BTreeMap<String, i64> = models
             .iter()
             .filter(|(_, tokens)| **tokens > 0)
             .map(|(model, tokens)| (model.clone(), i64::try_from(*tokens).unwrap_or(i64::MAX)))
             .collect();
-        if models.is_empty() {
-            continue;
-        }
         let key = ClusterSnapshotKey {
             origin_node_id: node_id.to_string(),
             day: day.clone(),
             provider: provider.to_string(),
         };
+        if models.is_empty()
+            && (!authoritative || !snapshots.iter().any(|snapshot| snapshot.key == key))
+        {
+            continue;
+        }
         if let Some(snapshot) = snapshots.iter_mut().find(|snapshot| snapshot.key == key) {
             if snapshot.models == models {
                 continue;
@@ -1908,6 +2306,170 @@ mod tests {
             claude: provider(model, tokens, percent, fetched_at),
             codex: ProviderStatus::default(),
         }
+    }
+
+    #[test]
+    fn discovered_endpoints_join_the_sync_set_normalized() {
+        let service = service("node-a");
+        service.add_peer("http://10.0.0.2:8765").unwrap();
+        // A bare host gains the default port; a duplicate of the manual peer
+        // must not double up.
+        service.note_discovered_endpoint("10.0.0.9");
+        service.note_discovered_endpoint("http://10.0.0.2:8765");
+        let endpoints = service.all_endpoints();
+        assert!(endpoints.contains(&"http://10.0.0.2:8765".to_string()));
+        assert!(endpoints.contains(&"http://10.0.0.9:8765".to_string()));
+        assert_eq!(
+            endpoints
+                .iter()
+                .filter(|endpoint| endpoint.as_str() == "http://10.0.0.2:8765")
+                .count(),
+            1
+        );
+        service.forget_discovered_endpoint("10.0.0.9:8765");
+        assert!(!service
+            .all_endpoints()
+            .contains(&"http://10.0.0.9:8765".to_string()));
+    }
+
+    #[test]
+    fn imports_legacy_json_state_into_usage_database() {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "elink-tui-cluster-import-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let legacy = root.join("cluster.json");
+        let mut stored = StoredClusterState::default();
+        stored.credentials.node_id = "legacy-node".to_string();
+        stored.credentials.node_name = "Legacy Linux".to_string();
+        std::fs::write(&legacy, serde_json::to_vec(&stored).unwrap()).unwrap();
+
+        let service =
+            ClusterService::load_with_legacy(root.join("usage.db"), Some(&legacy), None).unwrap();
+        assert_eq!(service.view().node_id, "legacy-node");
+        drop(service);
+
+        // SQLite is authoritative after the first import.
+        stored.credentials.node_id = "changed-backup".to_string();
+        std::fs::write(&legacy, serde_json::to_vec(&stored).unwrap()).unwrap();
+        let reloaded =
+            ClusterService::load_with_legacy(root.join("usage.db"), Some(&legacy), None).unwrap();
+        assert_eq!(reloaded.view().node_id, "legacy-node");
+    }
+
+    #[test]
+    fn reads_mac_style_blob_credentials() {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "elink-tui-cluster-blob-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let path = root.join("usage.db");
+        let connection = open_db(&path).unwrap();
+        let credentials = ClusterCredentials {
+            node_id: "blob-node".to_string(),
+            node_name: "Mac compatible".to_string(),
+            cluster_id: None,
+            cluster_secret: None,
+            timezone: None,
+        };
+        connection
+            .execute(
+                "INSERT INTO cluster_credentials (singleton, payload, updated_at)
+                 VALUES (1, ?1, ?2)",
+                (serde_json::to_vec(&credentials).unwrap(), 1.0),
+            )
+            .unwrap();
+        drop(connection);
+
+        let service = ClusterService::load(path, None).unwrap();
+        assert_eq!(service.view().node_id, "blob-node");
+    }
+
+    #[test]
+    fn statistics_can_filter_and_total_each_cluster_node() {
+        let service = service("node-a");
+        service.create_cluster().unwrap();
+        let local_id = service.local_node_id();
+        {
+            let mut state = service.lock();
+            state.stored.snapshots.extend([
+                ClusterUsageSnapshot {
+                    key: ClusterSnapshotKey {
+                        origin_node_id: local_id.clone(),
+                        day: "2026-07-20".to_string(),
+                        provider: "claude".to_string(),
+                    },
+                    revision: 1,
+                    observed_at: 1.0,
+                    models: BTreeMap::from([("sonnet".to_string(), 40)]),
+                },
+                ClusterUsageSnapshot {
+                    key: ClusterSnapshotKey {
+                        origin_node_id: "node-b".to_string(),
+                        day: "2026-07-20".to_string(),
+                        provider: "claude".to_string(),
+                    },
+                    revision: 1,
+                    observed_at: 1.0,
+                    models: BTreeMap::from([("opus".to_string(), 60)]),
+                },
+            ]);
+            state.stored.nodes.push(ClusterNodeRecord {
+                node_id: "node-b".to_string(),
+                name: "Remote".to_string(),
+                endpoint: None,
+                last_seen_at: None,
+                last_sync_at: None,
+            });
+        }
+        let history = History::new(service.path.clone());
+
+        let remote = service.provider_days_for_node("claude", "node-b", &history);
+        assert_eq!(remote["2026-07-20"]["opus"], 60);
+        let totals = service.provider_days("claude", &history);
+        assert_eq!(totals["2026-07-20"].values().sum::<u64>(), 100);
+        assert_eq!(service.provider_node_days("claude", &history).len(), 2);
+    }
+
+    #[test]
+    fn authoritative_rebucket_clears_obsolete_local_snapshot_days() {
+        let mut snapshots = vec![ClusterUsageSnapshot {
+            key: ClusterSnapshotKey {
+                origin_node_id: "node-a".to_string(),
+                day: "2026-07-19".to_string(),
+                provider: "claude".to_string(),
+            },
+            revision: 1,
+            observed_at: 1.0,
+            models: BTreeMap::from([("sonnet".to_string(), 80)]),
+        }];
+        let days = DayTotals::from([(
+            "2026-07-20".to_string(),
+            HashMap::from([("sonnet".to_string(), 80)]),
+        )]);
+
+        let changed = update_local_snapshots(&mut snapshots, "node-a", "claude", &days, 2, true);
+
+        assert_eq!(changed.len(), 2);
+        assert!(snapshots
+            .iter()
+            .find(|snapshot| snapshot.key.day == "2026-07-19")
+            .unwrap()
+            .models
+            .is_empty());
+        assert_eq!(
+            snapshots
+                .iter()
+                .find(|snapshot| snapshot.key.day == "2026-07-20")
+                .unwrap()
+                .models["sonnet"],
+            80
+        );
     }
 
     #[test]

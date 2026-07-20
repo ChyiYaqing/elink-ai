@@ -2,6 +2,7 @@ pub mod app;
 pub mod cluster;
 pub mod config;
 pub mod device;
+pub mod discovery;
 pub mod model;
 pub mod source;
 pub mod ui;

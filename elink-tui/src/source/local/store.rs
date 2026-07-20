@@ -1,67 +1,151 @@
-use std::ffi::OsString;
-use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::fs;
+use std::io;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use rusqlite::Connection;
+use serde::Deserialize;
 
+use super::db::open_db;
 use super::quota::{ProviderUsage, UsageWindow};
 
 const NO_RESET_MAX_AGE_SECONDS: i64 = 6 * 60 * 60;
-const MAX_TEMP_FILE_ATTEMPTS: usize = 16;
-static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Serialize, Deserialize, Default)]
-struct StoredWindow {
+#[derive(Deserialize, Default)]
+struct LegacyWindow {
     percent: Option<f64>,
     reset_at: Option<i64>,
 }
 
-#[derive(Serialize, Deserialize)]
-struct StoredProvider {
-    primary: StoredWindow,
-    weekly: StoredWindow,
+#[derive(Deserialize)]
+struct LegacyProvider {
+    primary: LegacyWindow,
+    weekly: LegacyWindow,
     fetched_at: Option<i64>,
 }
 
-/// JSON quota cache so a restart shows the last known windows immediately
-/// (mirrors UsageStore.cacheUsage/cachedUsage). The state directory is 0700
-/// and the file 0600, matching the repo's usage.db permissions.
+/// Quota window cache in the shared `usage.db` (`provider_usage_cache` table,
+/// mirroring the mac-app's `UsageStore`) so a restart shows the last known
+/// windows immediately. Both windows of a provider share one `fetched_at`.
 pub struct QuotaStore {
-    path: PathBuf,
+    conn: Mutex<Connection>,
 }
 
 impl QuotaStore {
     pub fn new(path: PathBuf) -> Self {
-        Self { path }
+        let conn = open_db(&path)
+            .unwrap_or_else(|_| open_db(Path::new(":memory:")).expect("in-memory sqlite"));
+        Self {
+            conn: Mutex::new(conn),
+        }
+    }
+
+    pub fn new_with_legacy(path: PathBuf, legacy_path: &Path) -> Self {
+        let store = Self::new(path);
+        store.import_legacy(legacy_path);
+        store
+    }
+
+    /// Imports the former JSON cache only into an empty SQLite cache. The
+    /// source file is deliberately retained as a recoverable backup.
+    fn import_legacy(&self, path: &Path) {
+        let empty = self
+            .conn()
+            .query_row("SELECT COUNT(*) FROM provider_usage_cache", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .is_ok_and(|count| count == 0);
+        if !empty {
+            return;
+        }
+        let Some(json) = fs::read(path)
+            .ok()
+            .and_then(|data| serde_json::from_slice::<serde_json::Value>(&data).ok())
+        else {
+            return;
+        };
+        for provider in ["claude", "codex"] {
+            let Some(stored) = json
+                .get(provider)
+                .cloned()
+                .and_then(|value| serde_json::from_value::<LegacyProvider>(value).ok())
+            else {
+                continue;
+            };
+            self.save(
+                provider,
+                &ProviderUsage {
+                    primary: UsageWindow {
+                        percent: stored.primary.percent,
+                        reset_at: stored.primary.reset_at,
+                    },
+                    weekly: UsageWindow {
+                        percent: stored.weekly.percent,
+                        reset_at: stored.weekly.reset_at,
+                    },
+                    fetched_at: stored.fetched_at,
+                    ..ProviderUsage::default()
+                },
+            );
+        }
+    }
+
+    fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Expired windows are dropped on read: `reset_at <= now` discards the
     /// window, and a window without a reset time is trusted for six hours.
     pub fn load(&self, provider: &str, now: i64) -> Option<ProviderUsage> {
-        let data = fs::read(&self.path).ok()?;
-        let json: Value = serde_json::from_slice(&data).ok()?;
-        let stored: StoredProvider = serde_json::from_value(json.get(provider)?.clone()).ok()?;
-        let fetched_at = stored.fetched_at?;
-        let window = |window: StoredWindow| -> UsageWindow {
-            let usable = match window.reset_at {
+        let conn = self.conn();
+        let mut statement = conn
+            .prepare(
+                "SELECT window_type, percent, reset_at, fetched_at
+                 FROM provider_usage_cache WHERE provider = ?1",
+            )
+            .ok()?;
+        let mut primary = UsageWindow::default();
+        let mut weekly = UsageWindow::default();
+        let mut fetched_at: Option<i64> = None;
+        let rows = statement
+            .query_map([provider], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<f64>>(1)?,
+                    row.get::<_, Option<f64>>(2)?,
+                    row.get::<_, Option<f64>>(3)?,
+                ))
+            })
+            .ok()?;
+        for row in rows {
+            let (window_type, percent, reset_at, row_fetched) = row.ok()?;
+            let reset_at = reset_at.map(|value| value as i64);
+            let row_fetched = row_fetched.map(|value| value as i64);
+            fetched_at = fetched_at.max(row_fetched);
+            let window = UsageWindow { percent, reset_at };
+            match window_type.as_str() {
+                "primary" => primary = window,
+                "weekly" => weekly = window,
+                _ => {}
+            }
+        }
+        let fetched_at = fetched_at?;
+        let usable = |window: UsageWindow| -> UsageWindow {
+            let keep = match window.reset_at {
                 Some(reset_at) => reset_at > now,
                 None => now - fetched_at <= NO_RESET_MAX_AGE_SECONDS,
             };
-            if usable {
-                UsageWindow {
-                    percent: window.percent,
-                    reset_at: window.reset_at,
-                }
+            if keep {
+                window
             } else {
                 UsageWindow::default()
             }
         };
-        let primary = window(stored.primary);
-        let weekly = window(stored.weekly);
+        let primary = usable(primary);
+        let weekly = usable(weekly);
         if primary.percent.is_none() && weekly.percent.is_none() {
             return None;
         }
@@ -81,88 +165,61 @@ impl QuotaStore {
         if usage.primary.percent.is_none() && usage.weekly.percent.is_none() {
             return;
         }
-        let mut json: Value = fs::read(&self.path)
+        let mut conn = self.conn();
+        let existing_fetched_at: Option<i64> = conn
+            .query_row(
+                "SELECT MAX(fetched_at) FROM provider_usage_cache WHERE provider = ?1",
+                [provider],
+                |row| row.get::<_, Option<f64>>(0),
+            )
             .ok()
-            .and_then(|data| serde_json::from_slice(&data).ok())
-            .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
-        if !json.is_object() {
-            json = Value::Object(serde_json::Map::new());
-        }
-        let existing_fetched_at = json
-            .get(provider)
-            .and_then(|value| value.get("fetched_at"))
-            .and_then(Value::as_i64);
+            .flatten()
+            .map(|value| value as i64);
         if let (Some(existing), Some(new)) = (existing_fetched_at, usage.fetched_at) {
             if existing > new {
                 return;
             }
         }
-        let stored = StoredProvider {
-            primary: StoredWindow {
-                percent: usage.primary.percent,
-                reset_at: usage.primary.reset_at,
-            },
-            weekly: StoredWindow {
-                percent: usage.weekly.percent,
-                reset_at: usage.weekly.reset_at,
-            },
-            fetched_at: usage.fetched_at,
-        };
-        let Ok(value) = serde_json::to_value(&stored) else {
+        let fetched_at = usage.fetched_at.unwrap_or_else(crate::util::epoch_now) as f64;
+        let Ok(transaction) = conn.transaction() else {
             return;
         };
-        json[provider] = value;
-        let Ok(text) = serde_json::to_string(&json) else {
+        if transaction
+            .execute(
+                "DELETE FROM provider_usage_cache WHERE provider = ?1",
+                [provider],
+            )
+            .is_err()
+        {
             return;
-        };
-        let _ = write_restricted(&self.path, &text);
-    }
-}
-
-/// Writes a private cache through a same-directory temporary file, then
-/// atomically replaces the destination. Existing parent directories retain
-/// their permissions; only directories created here are set to 0700.
-pub(crate) fn write_restricted(path: &Path, text: &str) -> io::Result<()> {
-    write_restricted_with_counter(path, text, &TEMP_FILE_COUNTER)
-}
-
-fn write_restricted_with_counter(path: &Path, text: &str, counter: &AtomicU64) -> io::Result<()> {
-    if let Some(directory) = path.parent().filter(|path| !path.as_os_str().is_empty()) {
-        ensure_private_directory(directory)?;
-    }
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true).mode(0o600);
-    let mut opened = None;
-    for attempt in 0..MAX_TEMP_FILE_ATTEMPTS {
-        let temporary = temporary_path(path, counter.fetch_add(1, Ordering::Relaxed))?;
-        match options.open(&temporary) {
-            Ok(file) => {
-                opened = Some((temporary, file));
-                break;
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                if attempt + 1 == MAX_TEMP_FILE_ATTEMPTS {
-                    return Err(error);
-                }
-            }
-            Err(error) => return Err(error),
         }
+        for (window_type, window) in [("primary", &usage.primary), ("weekly", &usage.weekly)] {
+            let Some(percent) = window.percent else {
+                continue;
+            };
+            if transaction
+                .execute(
+                    "INSERT INTO provider_usage_cache
+                        (provider, window_type, percent, reset_at, fetched_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![
+                        provider,
+                        window_type,
+                        percent,
+                        window.reset_at.map(|value| value as f64),
+                        fetched_at,
+                    ],
+                )
+                .is_err()
+            {
+                return;
+            }
+        }
+        let _ = transaction.commit();
     }
-    let (temporary, mut file) = opened.expect("temporary-file attempts must be positive");
-    let result = (|| {
-        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))?;
-        file.write_all(text.as_bytes())?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(&temporary, path)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
 }
 
-fn ensure_private_directory(directory: &Path) -> io::Result<()> {
+pub(crate) fn ensure_private_directory(directory: &Path) -> io::Result<()> {
     if directory.as_os_str().is_empty() {
         return Ok(());
     }
@@ -195,32 +252,26 @@ fn ensure_private_directory(directory: &Path) -> io::Result<()> {
     }
 }
 
-fn temporary_path(path: &Path, counter: u64) -> io::Result<PathBuf> {
-    let file_name = path.file_name().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "cache path has no file name")
-    })?;
-    let mut name = OsString::from(".");
-    name.push(file_name);
-    name.push(format!(".{}-{}.tmp", std::process::id(), counter));
-    Ok(path.with_file_name(name))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     const NOW: i64 = 1_783_933_200;
 
-    fn temp_store() -> QuotaStore {
+    fn temp_store_path() -> PathBuf {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let unique = format!(
             "elink-tui-store-{}-{}",
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
         );
-        QuotaStore::new(std::env::temp_dir().join(unique).join("quota.json"))
+        std::env::temp_dir().join(unique).join("usage.db")
+    }
+
+    fn temp_store() -> QuotaStore {
+        QuotaStore::new(temp_store_path())
     }
 
     fn usage(percent: f64, reset_at: Option<i64>, fetched_at: i64) -> ProviderUsage {
@@ -289,60 +340,64 @@ mod tests {
     }
 
     #[test]
-    fn save_preserves_existing_parent_mode_and_replaces_atomically() {
-        let store = temp_store();
-        let directory = store.path.parent().unwrap();
-        fs::create_dir_all(directory).unwrap();
-        fs::set_permissions(directory, fs::Permissions::from_mode(0o750)).unwrap();
-
+    fn save_reload_persists_the_latest_window() {
+        let path = temp_store_path();
+        let store = QuotaStore::new(path.clone());
         store.save("claude", &usage(10.0, Some(NOW + 600), NOW));
-        let first_inode = fs::metadata(&store.path).unwrap().ino();
         store.save("claude", &usage(20.0, Some(NOW + 600), NOW + 1));
+        drop(store);
 
+        let reloaded = QuotaStore::new(path);
         assert_eq!(
-            fs::metadata(directory).unwrap().permissions().mode() & 0o777,
-            0o750
+            reloaded.load("claude", NOW).expect("kept").primary.percent,
+            Some(20.0)
         );
-        let metadata = fs::metadata(&store.path).unwrap();
-        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
-        assert_ne!(metadata.ino(), first_inode);
     }
 
     #[test]
-    fn save_creates_private_parent_and_leaves_no_temporary_file() {
-        let store = temp_store();
-        let directory = store.path.parent().unwrap();
-
+    fn save_creates_private_parent_and_database_file() {
+        let path = temp_store_path();
+        let store = QuotaStore::new(path.clone());
         store.save("claude", &usage(10.0, Some(NOW + 600), NOW));
 
+        let directory = path.parent().unwrap();
         assert_eq!(
             fs::metadata(directory).unwrap().permissions().mode() & 0o777,
             0o700
         );
         assert_eq!(
-            fs::metadata(&store.path).unwrap().permissions().mode() & 0o777,
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        let names: Vec<_> = fs::read_dir(directory)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .collect();
-        assert_eq!(names, vec![store.path.file_name().unwrap()]);
     }
 
     #[test]
-    fn occupied_temporary_name_is_preserved_and_write_retries() {
-        let store = temp_store();
-        let directory = store.path.parent().unwrap();
-        fs::create_dir_all(directory).unwrap();
-        let counter = AtomicU64::new(0);
-        let occupied = temporary_path(&store.path, 0).unwrap();
-        fs::write(&occupied, "occupied").unwrap();
+    fn imports_legacy_json_without_overwriting_newer_sqlite_rows() {
+        let path = temp_store_path();
+        let legacy = path.parent().unwrap().join("quota.json");
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(
+            &legacy,
+            format!(
+                r#"{{"claude":{{"primary":{{"percent":43.0,"reset_at":{}}},"weekly":{{"percent":null,"reset_at":null}},"fetched_at":{}}}}}"#,
+                NOW + 600,
+                NOW
+            ),
+        )
+        .unwrap();
 
-        write_restricted_with_counter(&store.path, "replacement", &counter)
-            .expect("a colliding temporary name should be retried");
+        let store = QuotaStore::new_with_legacy(path.clone(), &legacy);
+        assert_eq!(
+            store.load("claude", NOW).unwrap().primary.percent,
+            Some(43.0)
+        );
+        store.save("claude", &usage(50.0, Some(NOW + 600), NOW + 1));
+        drop(store);
 
-        assert_eq!(fs::read_to_string(&store.path).unwrap(), "replacement");
-        assert_eq!(fs::read_to_string(occupied).unwrap(), "occupied");
+        let reloaded = QuotaStore::new_with_legacy(path, &legacy);
+        assert_eq!(
+            reloaded.load("claude", NOW).unwrap().primary.percent,
+            Some(50.0)
+        );
     }
 }

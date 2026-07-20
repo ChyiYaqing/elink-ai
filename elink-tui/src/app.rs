@@ -59,6 +59,7 @@ pub struct App {
     pub should_quit: bool,
     pub view: View,
     pub stats_range: StatsRange,
+    pub stats_node_id: Option<String>,
     pub history: Arc<History>,
     pub device: Option<DeviceLink>,
     pub update_available: Option<UpdateInfo>,
@@ -94,6 +95,7 @@ impl App {
             should_quit: false,
             view: View::Dashboard,
             stats_range: StatsRange::Week,
+            stats_node_id: None,
             history: local.history,
             device: device_url.clone().map(DeviceLink::spawn),
             update_available: None,
@@ -119,6 +121,15 @@ impl App {
                 self.received_at = Some(Instant::now());
                 self.snapshot_kind = Some(update.kind);
                 self.error = None;
+                if self.stats_node_id.as_ref().is_some_and(|selected| {
+                    !self
+                        .cluster
+                        .stats_nodes()
+                        .iter()
+                        .any(|node| &node.node_id == selected)
+                }) {
+                    self.stats_node_id = None;
+                }
                 self.clamp_scroll();
             }
             Err(error) => self.error = Some(error),
@@ -206,6 +217,7 @@ impl App {
             KeyCode::Char('w') if self.view == View::Stats => self.stats_range = StatsRange::Week,
             KeyCode::Char('m') if self.view == View::Stats => self.stats_range = StatsRange::Month,
             KeyCode::Char('y') if self.view == View::Stats => self.stats_range = StatsRange::Year,
+            KeyCode::Char('n') if self.view == View::Stats => self.cycle_stats_node(),
             KeyCode::Char('r') => {
                 let _ = commands.send(Command::Refresh);
                 self.set_hint("refreshing…");
@@ -315,6 +327,31 @@ impl App {
         self.hint = Some((text.to_string(), Instant::now()));
     }
 
+    fn cycle_stats_node(&mut self) {
+        let nodes = self.cluster.stats_nodes();
+        if nodes.len() <= 1 {
+            self.stats_node_id = None;
+            self.set_hint("no additional cluster nodes");
+            return;
+        }
+        let next = match self
+            .stats_node_id
+            .as_ref()
+            .and_then(|selected| nodes.iter().position(|node| &node.node_id == selected))
+        {
+            None => Some(nodes[0].node_id.clone()),
+            Some(index) if index + 1 < nodes.len() => Some(nodes[index + 1].node_id.clone()),
+            Some(_) => None,
+        };
+        let label = next
+            .as_ref()
+            .and_then(|node_id| nodes.iter().find(|node| &node.node_id == node_id))
+            .map(|node| node.name.as_str())
+            .unwrap_or("all nodes");
+        self.stats_node_id = next;
+        self.set_hint(&format!("stats source: {label}"));
+    }
+
     fn bridge_blocker(&self) -> Option<BridgeBlocker> {
         if self.kind != SourceKind::Local {
             return Some(BridgeBlocker::RemoteMode);
@@ -368,21 +405,27 @@ mod tests {
     use super::*;
     use crate::model::ProviderStatus;
 
+    fn temp_db(label: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let unique = format!(
+            "elink-tui-app-test-{label}-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        std::env::temp_dir().join(unique).join("usage.db")
+    }
+
     fn test_app(kind: SourceKind, listen: &str, listener_bound: bool) -> App {
-        let history = Arc::new(History::new(
-            std::env::temp_dir().join("elink-tui-app-test-history.json"),
-        ));
+        let history = Arc::new(History::new(temp_db("history")));
         App::new(
             kind,
             true,
             LocalData {
                 history,
                 cluster: Arc::new(
-                    ClusterService::load(
-                        std::env::temp_dir().join("elink-tui-app-test-cluster.json"),
-                        Some("test-node"),
-                    )
-                    .expect("load cluster state"),
+                    ClusterService::load(temp_db("cluster"), Some("test-node"))
+                        .expect("load cluster state"),
                 ),
             },
             None,

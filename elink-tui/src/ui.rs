@@ -141,7 +141,7 @@ fn footer(app: &App) -> Paragraph<'static> {
         View::Dashboard => {
             " q quit  r refresh  ⇥ focus  s stats  c cluster  d device  u update  m mode  ? help"
         }
-        View::Stats => " s back  w/m/y range  ⇥ focus  q quit  ? help",
+        View::Stats => " s back  w/m/y range  n source  ⇥ focus  q quit  ? help",
         View::Device => " d back  1/2/3 mode  p smart  f full  b bridge→here  q quit",
         View::Cluster => " c back  p pair  r sync  q quit  ? help",
     };
@@ -373,14 +373,50 @@ fn draw_stats(frame: &mut Frame, area: Rect, app: &App) {
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(area)
     };
     let today = app.cluster.today();
+    let nodes = app.cluster.stats_nodes();
+    let source_name = app
+        .stats_node_id
+        .as_ref()
+        .and_then(|selected| nodes.iter().find(|node| &node.node_id == selected))
+        .map(|node| node.name.as_str())
+        .unwrap_or("all");
     for (index, (name, provider)) in [("Claude", "claude"), ("Codex", "codex")]
         .into_iter()
         .enumerate()
     {
-        let days = app.cluster.provider_days(provider, &app.history);
+        let days = match app.stats_node_id.as_deref() {
+            Some(node_id) => app
+                .cluster
+                .provider_days_for_node(provider, node_id, &app.history),
+            None => app.cluster.provider_days(provider, &app.history),
+        };
         let stats = range_stats(&days, app.stats_range, today);
-        draw_stats_card(frame, areas[index], app, index, name, &stats);
+        let node_totals: Vec<(String, u64)> = if app.stats_node_id.is_none() && nodes.len() > 1 {
+            app.cluster
+                .provider_node_days(provider, &app.history)
+                .into_iter()
+                .map(|(node, days)| {
+                    let total = range_stats(&days, app.stats_range, today).total;
+                    (node.name, total)
+                })
+                .filter(|(_, total)| *total > 0)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let content = StatsCardContent {
+            source_name,
+            stats: &stats,
+            node_totals: &node_totals,
+        };
+        draw_stats_card(frame, areas[index], app, index, name, content);
     }
+}
+
+struct StatsCardContent<'a> {
+    source_name: &'a str,
+    stats: &'a RangeStats,
+    node_totals: &'a [(String, u64)],
 }
 
 fn draw_cluster(frame: &mut Frame, area: Rect, app: &App) {
@@ -473,8 +509,13 @@ fn draw_stats_card(
     app: &App,
     index: usize,
     name: &str,
-    stats: &RangeStats,
+    content: StatsCardContent<'_>,
 ) {
+    let StatsCardContent {
+        source_name,
+        stats,
+        node_totals,
+    } = content;
     let border_style = if app.focus == index {
         Style::new().fg(Color::Cyan)
     } else {
@@ -485,7 +526,7 @@ fn draw_stats_card(
         .title(Line::from(vec![
             Span::styled(format!(" {name} "), Style::new().bold()),
             Span::styled(
-                format!("history · {}", app.stats_range.label()),
+                format!("history · {} · {source_name}", app.stats_range.label()),
                 Style::new().dim(),
             ),
         ]));
@@ -527,7 +568,15 @@ fn draw_stats_card(
 
     let width = inner.width as usize;
     let mut lines: Vec<Line> = Vec::new();
-    let visible = (rows[2].height as usize).min(stats.models.len());
+    let available = rows[2].height as usize;
+    let node_rows = if node_totals.is_empty() {
+        0
+    } else {
+        node_totals.len() + 2
+    };
+    let visible = available
+        .saturating_sub(node_rows.min(available))
+        .min(stats.models.len());
     for usage in stats.models.iter().take(visible) {
         lines.push(two_column(
             &format!("  {}", truncated(&usage.model, width.saturating_sub(14))),
@@ -535,6 +584,29 @@ fn draw_stats_card(
             width,
             Style::new(),
         ));
+    }
+    if !node_totals.is_empty() && lines.len() + 2 <= available {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(" Nodes", Style::new().bold()));
+        let cluster_total = node_totals
+            .iter()
+            .fold(0u64, |sum, (_, total)| sum.saturating_add(*total));
+        for (node, total) in node_totals
+            .iter()
+            .take(available.saturating_sub(lines.len()))
+        {
+            let percent = if cluster_total == 0 {
+                0.0
+            } else {
+                *total as f64 * 100.0 / cluster_total as f64
+            };
+            lines.push(two_column(
+                &format!("  {}", truncated(node, width.saturating_sub(20))),
+                &format!("{}  {percent:.0}%", format_tokens(*total)),
+                width,
+                Style::new().dim(),
+            ));
+        }
     }
     frame.render_widget(Paragraph::new(lines), rows[2]);
 }
@@ -772,6 +844,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ("↑ ↓ / k j", "scroll model list"),
         ("s", "toggle usage history stats"),
         ("w / m / y", "stats range: week / month / year"),
+        ("n", "stats source: all / cluster node"),
         ("d", "e-paper device page"),
         ("c", "encrypted cluster sync page"),
         ("u", "check for updates"),

@@ -18,13 +18,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - `elink-tui` local mode accepts the bridge's `POST /v1/event` hook requests,
   enabling live working/idle transitions and permission-request alerts from
   the existing hook scripts
-- `elink-tui` caches the last fetched quota in
-  `~/.local/state/elink-ai/quota.json` so usage bars appear immediately after
+- `elink-tui` caches the last fetched quota in its private SQLite usage store
+  so usage bars appear immediately after
   a restart, and quota fetches run off the poll loop so the dashboard stays
   live during slow networks
 - `elink-tui` usage-history page (`s`): daily token charts and per-model
   totals over week/month/year ranges, backfilled from existing session logs
-  and persisted to `~/.local/state/elink-ai/history.json`
+  and persisted to `~/.local/state/elink-ai/usage.db`
 - `elink-tui` serves its local snapshot on `GET /v1/status` in the bridge
   wire format, so a Raspberry Pi agent can use a Linux machine as its data
   bridge
@@ -35,6 +35,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   fallback for private repositories, a `--compact` one-line output for
   tmux/waybar status bars, and a terminal title showing the worse weekly
   quota percentage
+- `elink-tui` cluster statistics can cycle between all nodes and a single
+  node, with per-node token shares in the aggregate view
+- `elink-tui` advertises and discovers same-cluster mac-app/TUI peers over the
+  shared `_elink-ai._tcp` mDNS service when its bridge listens on the LAN
+
+### Changed
+
+- `elink-tui` quota, history, timezone metadata, and encrypted cluster state
+  now share `~/.local/state/elink-ai/usage.db`; previous JSON stores are
+  imported once without deleting the recoverable source files
+- Usage-history timezone changes now rebucket data and advance the timezone
+  marker atomically while conserving usage no longer reconstructable from logs
 
 ## 0.1.15-rc1
 

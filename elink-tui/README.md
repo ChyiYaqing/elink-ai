@@ -138,9 +138,7 @@ quota_fetch_s = 120                 # provider 配额刷新间隔，最小 60 �
 claude_home = "~/.claude"
 codex_home = "~/.codex"
 statusline_cache = "~/.cache/statusline/last.json"
-quota_cache = "~/.local/state/elink-ai/quota.json"
-history_cache = "~/.local/state/elink-ai/history.json"
-cluster_state = "~/.local/state/elink-ai/cluster.json"
+usage_db = "~/.local/state/elink-ai/usage.db"
 
 [cluster]
 node_name = "linux-workstation"      # 可选，默认为主机名
@@ -154,6 +152,8 @@ url = "http://pi:8766"             # 配置后启用墨水屏设备页
 
 `--config PATH` 可选择另一份配置；`--bridge URL` 会覆盖配置中的 bridge 地址并
 强制使用远程模式。配置中存在未知字段或非法值时，程序会直接报告错误。
+旧版配置中的 `quota_cache`、`history_cache`、`cluster_state` 仍可保留；它们只
+作为旧 JSON 的一次性导入来源，成功导入后以 `usage_db` 为准，原文件不会删除。
 
 ## 快捷键
 
@@ -169,14 +169,15 @@ url = "http://pi:8766"             # 配置后启用墨水屏设备页
 | `s` | 打开或关闭本地/集群聚合历史统计页 |
 | `c` | 打开加密集群状态与配对页 |
 | `w` / `m` / `y` | 在统计页切换周、月、年范围 |
+| `n` | 在统计页轮换全部节点和单个节点；全部节点视图显示各节点占比 |
 | `d` | 打开墨水屏设备页 |
 | `u` | 检查 GitHub 最新稳定版本 |
 | `m` | 在 Dashboard 中切换本地/远程模式 |
 | `?` | 打开或关闭帮助 |
 | `Esc` | 关闭帮助或返回 Dashboard |
 
-历史统计仅在本地数据模式可用；加入集群后会合并各节点快照。首次启动后，程序
-会在后台从现有会话日志回填最近 366 天数据。
+历史统计仅在本地数据模式可用；加入集群后会合并各节点快照，并可按节点筛选。
+首次启动后，程序会在后台从现有会话日志回填最近 366 天数据。
 
 ### 墨水屏设备页
 
@@ -269,18 +270,19 @@ elink-tui cluster add-peer --endpoint http://192.168.1.11:8765
 elink-tui cluster leave
 ```
 
-Linux 端不使用 Bonjour；成功配对的地址会自动保存，也可以用 `add-peer` 添加
-VPN 或固定地址。节点每 15 秒对账一次，本地快照变化时还会发送 `announce`
-触发对端同步。
+当 `[hooks].listen` 可被局域网访问时，TUI 会用与 mac-app 相同的
+`_elink-ai._tcp` mDNS/Bonjour 服务自动发现同一集群节点；VPN、跨网段或 mDNS
+不可用时仍可用 `add-peer` 添加固定地址。节点每 15 秒对账一次，本地快照变化
+时还会发送 `announce` 触发对端同步。
 
 协议安全机制包括：X25519 临时密钥交换、配对码 HMAC proof、HKDF、
 AES-256-GCM、请求时间戳与 nonce 的 HMAC-SHA256 签名，以及重放拒绝。配对码
 不会通过网络发送，窗口最多保留两分钟并限制五次尝试。集群身份、共享密钥、
-节点和快照保存在 `cluster.json`，文件权限为 `0600`。
+节点和快照保存在共享 `usage.db`，文件权限为 `0600`。
 
 当前协议使用集群共享密钥，不能单独吊销一个节点。需要排除旧节点时，应离开并
-重新创建集群，然后重新配对可信节点。入群后新扫描的数据使用集群时区分桶；
-入群前已存在的轻量 JSON 历史不会自动重新分桶。
+重新创建集群，然后重新配对可信节点。加入/离开集群导致时区变化时，程序会在
+同一 SQLite 事务中重新分桶；已删除日志留下的不可重建用量按模型守恒保留。
 
 ## 墨水屏设备控制
 
@@ -323,9 +325,10 @@ Waybar 自定义模块示例：
 | `~/.claude/projects/**/*.jsonl` | Claude 会话用量与活动状态 |
 | `~/.codex/sessions/**` | Codex 会话用量、活动状态及配额回退 |
 | `~/.cache/statusline/last.json` | Claude 配额回退 |
-| `~/.local/state/elink-ai/quota.json` | 最近成功的 provider 配额，文件权限为 `0600` |
-| `~/.local/state/elink-ai/history.json` | 最近 366 天的本地历史统计 |
-| `~/.local/state/elink-ai/cluster.json` | 集群凭据、节点和同步快照，文件权限为 `0600` |
+| `~/.local/state/elink-ai/usage.db` | 配额缓存、最近 366 天历史、分桶时区、集群凭据/节点/快照，文件权限为 `0600` |
+
+旧版 `quota.json`、`history.json`、`cluster.json` 会在对应 SQLite 表为空时导入；
+导入源保留不动，便于恢复。
 
 程序不会通过 `/v1/status` 暴露 OAuth Token 或原始会话日志。配额过期后会被
 丢弃，不会作为 `0%` 展示。

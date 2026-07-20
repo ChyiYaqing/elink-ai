@@ -195,6 +195,9 @@ bridge_url = "http://mac:8765"
 status_poll_s = 2
 quota_fetch_s = 120
 
+[paths]
+usage_db = "~/.local/state/elink-ai/usage.db"
+
 [hooks]
 listen = "127.0.0.1:8765"          # "" disables the hook listener
 
@@ -206,14 +209,15 @@ In local mode the TUI listens for the same `POST /v1/event` hook requests as
 the mac-app bridge, so `python3 hooks/install-claude-hooks.py` gives it live
 working/idle transitions and permission-request (`⚠ input`) alerts; without
 hooks, state falls back to session-file timestamps. The last fetched quota is
-cached in `~/.local/state/elink-ai/quota.json` (`0600`) so a restart shows
-usage bars immediately.
+cached in the private `~/.local/state/elink-ai/usage.db` SQLite store (`0600`)
+so a restart shows usage bars immediately.
 
 In local mode, pressing `s` opens a usage-history page with daily token charts
 and per-model totals over the last week, month (`w`/`m`), or twelve months
-(`y`). History is backfilled from existing session logs on first launch and
-kept in `~/.local/state/elink-ai/history.json`; remote mode does not mix in this
-machine's local history.
+(`y`). In a cluster, `n` cycles between all nodes and one node, while the
+aggregate view shows per-node shares. History is backfilled from existing
+session logs on first launch and kept in the same `usage.db`; remote mode does
+not mix in this machine's local history.
 
 The listener also serves the latest local snapshot on `GET /v1/status` in the
 standard bridge format, so a Raspberry Pi agent (or another consumer) can use

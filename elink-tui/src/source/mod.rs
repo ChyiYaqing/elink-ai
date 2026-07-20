@@ -54,10 +54,14 @@ pub struct SourceHandle {
 pub fn spawn(config: Config, initial: SourceKind) -> Result<SourceHandle, String> {
     let (command_tx, command_rx) = mpsc::channel::<Command>();
     let (update_tx, update_rx) = mpsc::channel::<Update>();
-    let history = Arc::new(History::new(config.history_cache.clone()));
+    let history = Arc::new(History::new_with_legacy(
+        config.usage_db.clone(),
+        &config.history_cache,
+    ));
     let cluster = Arc::new(
-        ClusterService::load(
-            config.cluster_state.clone(),
+        ClusterService::load_with_legacy(
+            config.usage_db.clone(),
+            Some(&config.cluster_state),
             config.cluster_node_name.as_deref(),
         )
         .map_err(|error| error.to_string())?,
@@ -65,6 +69,7 @@ pub fn spawn(config: Config, initial: SourceKind) -> Result<SourceHandle, String
     cluster.start_sync_worker(Duration::from_secs(15));
     let worker_history = Arc::clone(&history);
     let worker_cluster = Arc::clone(&cluster);
+    let discovery_cluster = Arc::clone(&cluster);
     let local_bridge_ready = Arc::new(AtomicBool::new(false));
     let worker_bridge_ready = Arc::clone(&local_bridge_ready);
     thread::spawn(move || {
@@ -79,6 +84,7 @@ pub fn spawn(config: Config, initial: SourceKind) -> Result<SourceHandle, String
             let result = match kind {
                 SourceKind::Remote => {
                     collector.disable_hook_listener();
+                    discovery_cluster.pause_discovery();
                     worker_bridge_ready.store(false, Ordering::Release);
                     match &config.bridge_url {
                         Some(url) => remote::fetch(&agent, url),
@@ -98,6 +104,13 @@ pub fn spawn(config: Config, initial: SourceKind) -> Result<SourceHandle, String
                         collector.disable_hook_listener();
                         false
                     };
+                    if ready {
+                        if let Some(port) = lan_bridge_port(&config.hook_listen) {
+                            discovery_cluster.start_discovery(port);
+                        }
+                    } else {
+                        discovery_cluster.pause_discovery();
+                    }
                     worker_bridge_ready.store(ready, Ordering::Release);
                     result
                 }
@@ -147,6 +160,20 @@ fn apply_commands(
     false
 }
 
+/// The bridge port to advertise over mDNS, only when the hook listener binds a
+/// routable (non-loopback) address peers can actually reach. Advertising a
+/// loopback-only bridge would point peers at a port they cannot connect to.
+fn lan_bridge_port(listen: &str) -> Option<u16> {
+    let (host, port) = listen.rsplit_once(':')?;
+    let host = host.trim_matches(['[', ']']);
+    let port: u16 = port.parse().ok()?;
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback());
+    (!loopback).then_some(port)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,5 +197,17 @@ mod tests {
         assert!(!quit);
         assert!(force);
         assert_eq!(kind, SourceKind::Local);
+    }
+
+    #[test]
+    fn lan_bridge_port_only_advertises_routable_listeners() {
+        assert_eq!(lan_bridge_port("0.0.0.0:8765"), Some(8765));
+        assert_eq!(lan_bridge_port("192.168.1.10:9000"), Some(9000));
+        assert_eq!(lan_bridge_port("[::]:8765"), Some(8765));
+        assert_eq!(lan_bridge_port("127.0.0.1:8765"), None);
+        assert_eq!(lan_bridge_port("localhost:8765"), None);
+        assert_eq!(lan_bridge_port("[::1]:8765"), None);
+        assert_eq!(lan_bridge_port(""), None);
+        assert_eq!(lan_bridge_port("0.0.0.0:not-a-port"), None);
     }
 }
