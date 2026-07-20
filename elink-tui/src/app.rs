@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use crate::cluster::ClusterService;
 use crate::device::{self, DeviceCommand, DeviceLink};
 use crate::model::Snapshot;
 use crate::source::local::history::{History, StatsRange};
@@ -38,6 +39,12 @@ pub enum View {
     Dashboard,
     Stats,
     Device,
+    Cluster,
+}
+
+pub struct LocalData {
+    pub history: Arc<History>,
+    pub cluster: Arc<ClusterService>,
 }
 
 pub struct App {
@@ -55,6 +62,7 @@ pub struct App {
     pub history: Arc<History>,
     pub device: Option<DeviceLink>,
     pub update_available: Option<UpdateInfo>,
+    pub cluster: Arc<ClusterService>,
     device_url: Option<String>,
     hook_listen: String,
     local_bridge_ready: Arc<AtomicBool>,
@@ -68,7 +76,7 @@ impl App {
     pub fn new(
         kind: SourceKind,
         bridge_configured: bool,
-        history: Arc<History>,
+        local: LocalData,
         device_url: Option<String>,
         hook_listen: String,
         local_bridge_ready: Arc<AtomicBool>,
@@ -86,9 +94,10 @@ impl App {
             should_quit: false,
             view: View::Dashboard,
             stats_range: StatsRange::Week,
-            history,
+            history: local.history,
             device: device_url.clone().map(DeviceLink::spawn),
             update_available: None,
+            cluster: local.cluster,
             device_url,
             hook_listen,
             local_bridge_ready,
@@ -101,7 +110,7 @@ impl App {
 
     pub fn apply(&mut self, update: Update) {
         self.kind = update.kind;
-        if self.kind == SourceKind::Remote && self.view == View::Stats {
+        if self.kind == SourceKind::Remote && matches!(self.view, View::Stats | View::Cluster) {
             self.set_view(View::Dashboard);
         }
         match update.result {
@@ -164,6 +173,10 @@ impl App {
             self.on_device_key(key);
             return;
         }
+        if self.view == View::Cluster {
+            self.on_cluster_key(key);
+            return;
+        }
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('?') => self.show_help = true,
@@ -178,6 +191,13 @@ impl App {
                 }
             }
             KeyCode::Char('d') => self.open_device(),
+            KeyCode::Char('c') => {
+                if self.kind == SourceKind::Local {
+                    self.set_view(View::Cluster);
+                } else {
+                    self.set_hint("cluster management is available in local mode");
+                }
+            }
             KeyCode::Char('u') => {
                 crate::update::spawn_check(Arc::clone(&self.update_slot));
                 self.set_hint("checking for updates…");
@@ -254,6 +274,23 @@ impl App {
                     }
                     None => self.set_hint("enable the [hooks] listener to serve as a bridge"),
                 }
+            }
+            _ => {}
+        }
+    }
+
+    fn on_cluster_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('?') => self.show_help = true,
+            KeyCode::Esc | KeyCode::Char('c') => self.set_view(View::Dashboard),
+            KeyCode::Char('p') => match self.cluster.start_pairing() {
+                Ok(code) => self.set_hint(&format!("pairing code: {code}")),
+                Err(error) => self.set_hint(&error.to_string()),
+            },
+            KeyCode::Char('r') => {
+                self.cluster.request_sync();
+                self.set_hint("cluster sync requested");
             }
             _ => {}
         }
@@ -338,7 +375,16 @@ mod tests {
         App::new(
             kind,
             true,
-            history,
+            LocalData {
+                history,
+                cluster: Arc::new(
+                    ClusterService::load(
+                        std::env::temp_dir().join("elink-tui-app-test-cluster.json"),
+                        Some("test-node"),
+                    )
+                    .expect("load cluster state"),
+                ),
+            },
             None,
             listen.to_string(),
             Arc::new(AtomicBool::new(listener_bound)),

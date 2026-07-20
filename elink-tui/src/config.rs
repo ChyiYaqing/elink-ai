@@ -2,9 +2,10 @@ use std::fs;
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use serde::Deserialize;
 
+use crate::cluster::ClusterCommand;
 use crate::source::SourceKind;
 use crate::util::expand_tilde;
 
@@ -27,6 +28,17 @@ pub struct Cli {
     /// Collect one snapshot, print a one-line summary (for tmux/waybar), exit
     #[arg(long, conflicts_with = "once")]
     pub compact: bool,
+    #[command(subcommand)]
+    pub command: Option<AppCommand>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AppCommand {
+    /// Manage encrypted multi-node usage synchronization
+    Cluster {
+        #[command(subcommand)]
+        command: ClusterCommand,
+    },
 }
 
 #[derive(Deserialize, Default)]
@@ -38,6 +50,13 @@ struct FileConfig {
     paths: FilePaths,
     hooks: FileHooks,
     device: FileDevice,
+    cluster: FileCluster,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct FileCluster {
+    node_name: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -67,6 +86,7 @@ struct FilePaths {
     statusline_cache: Option<String>,
     quota_cache: Option<String>,
     history_cache: Option<String>,
+    cluster_state: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -80,6 +100,8 @@ pub struct Config {
     pub statusline_cache: PathBuf,
     pub quota_cache: PathBuf,
     pub history_cache: PathBuf,
+    pub cluster_state: PathBuf,
+    pub cluster_node_name: Option<String>,
     /// Address for the local `POST /v1/event` hook listener (the mac-app
     /// bridge port, so the repo's hook scripts work unchanged). Empty
     /// disables it.
@@ -164,6 +186,17 @@ impl Config {
                 .as_deref()
                 .map(expand_tilde)
                 .unwrap_or_else(|| expand_tilde("~/.local/state/elink-ai/history.json")),
+            cluster_state: file
+                .paths
+                .cluster_state
+                .as_deref()
+                .map(expand_tilde)
+                .unwrap_or_else(|| expand_tilde("~/.local/state/elink-ai/cluster.json")),
+            cluster_node_name: file
+                .cluster
+                .node_name
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
             hook_listen: file
                 .hooks
                 .listen
@@ -198,6 +231,7 @@ mod tests {
                 config: Some(path.clone()),
                 once: false,
                 compact: false,
+                command: None,
             };
 
             let result = Config::load(&cli);

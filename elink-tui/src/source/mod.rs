@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use crate::cluster::ClusterService;
 use crate::config::Config;
 use crate::model::Snapshot;
 use local::history::History;
@@ -45,22 +46,33 @@ pub struct SourceHandle {
     pub history: Arc<History>,
     /// True only while the bound listener has a current local snapshot.
     pub local_bridge_ready: Arc<AtomicBool>,
+    pub cluster: Arc<ClusterService>,
 }
 
 /// Runs collection on a background thread so slow quota fetches never block
 /// the UI loop. Snapshots stream back over the update channel.
-pub fn spawn(config: Config, initial: SourceKind) -> SourceHandle {
+pub fn spawn(config: Config, initial: SourceKind) -> Result<SourceHandle, String> {
     let (command_tx, command_rx) = mpsc::channel::<Command>();
     let (update_tx, update_rx) = mpsc::channel::<Update>();
     let history = Arc::new(History::new(config.history_cache.clone()));
+    let cluster = Arc::new(
+        ClusterService::load(
+            config.cluster_state.clone(),
+            config.cluster_node_name.as_deref(),
+        )
+        .map_err(|error| error.to_string())?,
+    );
+    cluster.start_sync_worker(Duration::from_secs(15));
     let worker_history = Arc::clone(&history);
+    let worker_cluster = Arc::clone(&cluster);
     let local_bridge_ready = Arc::new(AtomicBool::new(false));
     let worker_bridge_ready = Arc::clone(&local_bridge_ready);
     thread::spawn(move || {
         let agent = ureq::AgentBuilder::new()
             .timeout(Duration::from_secs(3))
             .build();
-        let mut collector = local::LocalSource::new(&config, worker_history);
+        let mut collector =
+            local::LocalSource::with_cluster(&config, worker_history, worker_cluster);
         let mut kind = initial;
         let mut force = false;
         loop {
@@ -106,12 +118,13 @@ pub fn spawn(config: Config, initial: SourceKind) -> SourceHandle {
             }
         }
     });
-    SourceHandle {
+    Ok(SourceHandle {
         commands: command_tx,
         updates: update_rx,
         history,
         local_bridge_ready,
-    }
+        cluster,
+    })
 }
 
 /// Coalesces commands already queued while collection was blocked. Repeated

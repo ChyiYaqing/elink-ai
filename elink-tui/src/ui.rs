@@ -33,6 +33,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         View::Dashboard => draw_cards(frame, rows[next], app),
         View::Stats => draw_stats(frame, rows[next], app),
         View::Device => draw_device(frame, rows[next], app),
+        View::Cluster => draw_cluster(frame, rows[next], app),
     }
     frame.render_widget(footer(app), rows[next + 1]);
 
@@ -138,10 +139,11 @@ fn banner(app: &App) -> Paragraph<'static> {
 fn footer(app: &App) -> Paragraph<'static> {
     let keybar = match app.view {
         View::Dashboard => {
-            " q quit  r refresh  ⇥ focus  s stats  d device  u update  m mode  ? help"
+            " q quit  r refresh  ⇥ focus  s stats  c cluster  d device  u update  m mode  ? help"
         }
         View::Stats => " s back  w/m/y range  ⇥ focus  q quit  ? help",
         View::Device => " d back  1/2/3 mode  p smart  f full  b bridge→here  q quit",
+        View::Cluster => " c back  p pair  r sync  q quit  ? help",
     };
     let mut spans = vec![Span::styled(keybar, Style::new().dim())];
     if let Some(hint) = app.hint() {
@@ -370,15 +372,99 @@ fn draw_stats(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(area)
     };
-    let today = chrono::Local::now().date_naive();
+    let today = app.cluster.today();
     for (index, (name, provider)) in [("Claude", "claude"), ("Codex", "codex")]
         .into_iter()
         .enumerate()
     {
-        let days = app.history.provider_days(provider);
+        let days = app.cluster.provider_days(provider, &app.history);
         let stats = range_stats(&days, app.stats_range, today);
         draw_stats_card(frame, areas[index], app, index, name, &stats);
     }
+}
+
+fn draw_cluster(frame: &mut Frame, area: Rect, app: &App) {
+    let view = app.cluster.view();
+    let block = Block::bordered()
+        .title(" Encrypted cluster sync ")
+        .border_style(Style::new().fg(Color::Cyan));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let mut lines = vec![
+        two_column(
+            "State",
+            if view.enabled { "joined" } else { "standalone" },
+            inner.width as usize,
+            Style::new().bold(),
+        ),
+        Line::raw(format!(" Node      {} ({})", view.node_name, view.node_id)),
+        Line::raw(format!(
+            " Cluster   {}",
+            view.cluster_id.as_deref().unwrap_or("—")
+        )),
+        Line::raw(format!(
+            " Timezone  {}",
+            view.timezone.as_deref().unwrap_or("—")
+        )),
+        Line::raw(""),
+    ];
+    if let Some(code) = &view.pairing_code {
+        lines.push(Line::styled(
+            format!(
+                " Pairing code  {code}  ({}s)",
+                view.pairing_seconds.unwrap_or_default()
+            ),
+            Style::new().fg(Color::Yellow).bold(),
+        ));
+        lines.push(Line::raw(
+            " Give this code and the listener address to the joining node.",
+        ));
+        lines.push(Line::raw(""));
+    } else if view.enabled {
+        lines.push(Line::styled(
+            " Press p to open a two-minute pairing window.",
+            Style::new().dim(),
+        ));
+        lines.push(Line::raw(""));
+    } else {
+        lines.push(Line::styled(
+            " Run `elink-tui cluster create`, then restart the TUI.",
+            Style::new().fg(Color::Yellow),
+        ));
+        lines.push(Line::styled(
+            " To join: `elink-tui cluster join --endpoint URL --code CODE`.",
+            Style::new().dim(),
+        ));
+        lines.push(Line::raw(""));
+    }
+    lines.push(Line::styled(" Nodes", Style::new().bold()));
+    if view.nodes.is_empty() {
+        lines.push(Line::styled("  no known nodes", Style::new().dim()));
+    } else {
+        for node in view
+            .nodes
+            .iter()
+            .take(inner.height.saturating_sub(lines.len() as u16) as usize)
+        {
+            let seen = node
+                .last_seen_at
+                .map(|seen| format!("{} ago", format_age(epoch_now() - seen as i64)))
+                .unwrap_or_else(|| "never seen".to_string());
+            lines.push(two_column(
+                &format!("  {}", node.name),
+                &seen,
+                inner.width as usize,
+                Style::new(),
+            ));
+        }
+    }
+    if let Some(error) = view.last_error {
+        lines.push(Line::styled(
+            truncated(&format!(" ⚠ {error}"), inner.width as usize),
+            Style::new().fg(Color::Red),
+        ));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_stats_card(
@@ -671,7 +757,7 @@ pub fn preview_lines(preview: &Preview, cells_wide: u16, cells_high: u16) -> Vec
 
 fn draw_help(frame: &mut Frame, area: Rect) {
     let width = 46.min(area.width);
-    let height = 17.min(area.height);
+    let height = 18.min(area.height);
     let popup = Rect {
         x: area.x + (area.width.saturating_sub(width)) / 2,
         y: area.y + (area.height.saturating_sub(height)) / 2,
@@ -687,6 +773,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ("s", "toggle usage history stats"),
         ("w / m / y", "stats range: week / month / year"),
         ("d", "e-paper device page"),
+        ("c", "encrypted cluster sync page"),
         ("u", "check for updates"),
         ("m", "toggle local / remote mode"),
         ("?", "toggle this help"),

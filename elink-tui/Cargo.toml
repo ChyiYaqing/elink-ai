@@ -11,10 +11,12 @@ description = "Keyboard-driven terminal dashboard for Claude Code and Codex usag
 anyhow = "1"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+chrono-tz = "0.10"
 clap = { version = "4", features = ["derive"] }
 dirs = "5"
 png = "0.17"
 ratatui = "0.29"
+ring = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"

@@ -122,7 +122,7 @@ impl QuotaStore {
 /// Writes a private cache through a same-directory temporary file, then
 /// atomically replaces the destination. Existing parent directories retain
 /// their permissions; only directories created here are set to 0700.
-pub(super) fn write_restricted(path: &Path, text: &str) -> io::Result<()> {
+pub(crate) fn write_restricted(path: &Path, text: &str) -> io::Result<()> {
     write_restricted_with_counter(path, text, &TEMP_FILE_COUNTER)
 }
 

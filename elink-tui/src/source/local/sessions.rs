@@ -3,7 +3,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Local, Utc};
+use chrono_tz::Tz;
 use serde_json::Value;
 
 use crate::model::ModelUsage;
@@ -24,6 +25,15 @@ pub fn full_daily_totals(
     codex_home: &Path,
     cutoff_epoch: i64,
 ) -> (DayTotals, DayTotals) {
+    full_daily_totals_in(claude_home, codex_home, cutoff_epoch, None)
+}
+
+pub fn full_daily_totals_in(
+    claude_home: &Path,
+    codex_home: &Path,
+    cutoff_epoch: i64,
+    timezone: Option<Tz>,
+) -> (DayTotals, DayTotals) {
     let mut messages = ClaudeMessages::new();
     for (path, mtime, _) in jsonl_files(&claude_home.join("projects")) {
         if epoch(mtime) < cutoff_epoch {
@@ -32,7 +42,7 @@ pub fn full_daily_totals(
         let text = fs::read_to_string(&path).unwrap_or_default();
         parse_claude_lines(&text, &mut messages);
     }
-    let claude = claude_daily_totals(&messages);
+    let claude = claude_daily_totals_in(&messages, timezone);
 
     let mut codex = DayTotals::new();
     for (path, mtime, _) in jsonl_files(&codex_home.join("sessions")) {
@@ -42,7 +52,7 @@ pub fn full_daily_totals(
         let text = fs::read_to_string(&path).unwrap_or_default();
         for (timestamp, model, tokens) in parse_codex_lines(&text).events {
             *codex
-                .entry(day_key(timestamp))
+                .entry(day_key_in(timestamp, timezone))
                 .or_default()
                 .entry(model)
                 .or_insert(0) += tokens;
@@ -334,27 +344,26 @@ pub struct SessionScanner {
     codex_files: FileIndex,
     claude_cache: HashMap<PathBuf, CacheEntry<ClaudeMessages>>,
     codex_cache: HashMap<PathBuf, CacheEntry<CodexParsed>>,
+    timezone: Option<Tz>,
 }
 
 impl SessionScanner {
     pub fn new(claude_home: &Path, codex_home: &Path) -> Self {
+        Self::new_in(claude_home, codex_home, None)
+    }
+
+    pub fn new_in(claude_home: &Path, codex_home: &Path, timezone: Option<Tz>) -> Self {
         Self {
             claude_files: FileIndex::new(claude_home.join("projects")),
             codex_files: FileIndex::new(codex_home.join("sessions")),
             claude_cache: HashMap::new(),
             codex_cache: HashMap::new(),
+            timezone,
         }
     }
 
     pub fn scan(&mut self) -> ScanOutcome {
-        let now = Local::now();
-        let today = now.format("%Y-%m-%d").to_string();
-        let start_of_day = now
-            .date_naive()
-            .and_hms_opt(0, 0, 0)
-            .and_then(|midnight| midnight.and_local_timezone(Local).earliest())
-            .map(|midnight| midnight.timestamp())
-            .unwrap_or(0);
+        let (today, start_of_day) = current_day(self.timezone);
 
         let (claude_files, claude_rebuilt) = self.claude_files.files(start_of_day);
         if claude_rebuilt {
@@ -380,7 +389,7 @@ impl SessionScanner {
             }
         }
         prune(&mut self.claude_cache, &today_files);
-        let claude_totals = claude_daily_totals(&messages)
+        let claude_totals = claude_daily_totals_in(&messages, self.timezone)
             .remove(&today)
             .unwrap_or_default();
 
@@ -398,7 +407,7 @@ impl SessionScanner {
         for (path, mtime, len) in &today_files {
             let parsed = cached_parse(&mut self.codex_cache, path, *mtime, *len, parse_codex_lines);
             for (timestamp, model, tokens) in &parsed.events {
-                if day_key(*timestamp) == today {
+                if day_key_in(*timestamp, self.timezone) == today {
                     *codex_totals.entry(model.clone()).or_insert(0) += tokens;
                 }
             }
@@ -520,10 +529,17 @@ pub fn parse_claude_lines(text: &str, messages: &mut ClaudeMessages) {
 }
 
 pub fn claude_daily_totals(messages: &ClaudeMessages) -> HashMap<String, HashMap<String, u64>> {
+    claude_daily_totals_in(messages, None)
+}
+
+pub fn claude_daily_totals_in(
+    messages: &ClaudeMessages,
+    timezone: Option<Tz>,
+) -> HashMap<String, HashMap<String, u64>> {
     let mut totals: HashMap<String, HashMap<String, u64>> = HashMap::new();
     for message in messages.values() {
         *totals
-            .entry(day_key(message.timestamp))
+            .entry(day_key_in(message.timestamp, timezone))
             .or_default()
             .entry(message.model.clone())
             .or_insert(0) += message.tokens;
@@ -656,9 +672,46 @@ fn normalized_model_string(value: Option<String>) -> String {
 }
 
 pub fn day_key(timestamp: i64) -> String {
+    day_key_in(timestamp, None)
+}
+
+pub fn day_key_in(timestamp: i64, timezone: Option<Tz>) -> String {
     DateTime::from_timestamp(timestamp, 0)
-        .map(|value| value.with_timezone(&Local).format("%Y-%m-%d").to_string())
+        .map(|value: DateTime<Utc>| match timezone {
+            Some(timezone) => value
+                .with_timezone(&timezone)
+                .format("%Y-%m-%d")
+                .to_string(),
+            None => value.with_timezone(&Local).format("%Y-%m-%d").to_string(),
+        })
         .unwrap_or_default()
+}
+
+fn current_day(timezone: Option<Tz>) -> (String, i64) {
+    match timezone {
+        Some(timezone) => {
+            let now = Utc::now().with_timezone(&timezone);
+            let today = now.format("%Y-%m-%d").to_string();
+            let start = now
+                .date_naive()
+                .and_hms_opt(0, 0, 0)
+                .and_then(|midnight| midnight.and_local_timezone(timezone).earliest())
+                .map(|midnight| midnight.timestamp())
+                .unwrap_or(0);
+            (today, start)
+        }
+        None => {
+            let now = Local::now();
+            let today = now.format("%Y-%m-%d").to_string();
+            let start = now
+                .date_naive()
+                .and_hms_opt(0, 0, 0)
+                .and_then(|midnight| midnight.and_local_timezone(Local).earliest())
+                .map(|midnight| midnight.timestamp())
+                .unwrap_or(0);
+            (today, start)
+        }
+    }
 }
 
 pub fn sorted_models(totals: HashMap<String, u64>) -> Vec<ModelUsage> {

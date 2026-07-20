@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+use crate::cluster::{ClusterHttpRequest, ClusterService};
 use crate::model::ProviderStatus;
 
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
@@ -157,6 +158,7 @@ pub fn spawn_listener(
     address: &str,
     registry: Arc<HookRegistry>,
     status: SharedStatus,
+    cluster: Arc<ClusterService>,
 ) -> std::io::Result<ListenerHandle> {
     let listener = TcpListener::bind(address)?;
     let local = listener.local_addr()?;
@@ -168,7 +170,7 @@ pub fn spawn_listener(
     let worker = thread::spawn(move || {
         while !worker_shutdown.load(Ordering::Acquire) {
             match listener.accept() {
-                Ok((stream, _)) => {
+                Ok((stream, peer)) => {
                     if stream.set_nonblocking(false).is_err() {
                         continue;
                     }
@@ -177,9 +179,10 @@ pub fn spawn_listener(
                     };
                     let registry = Arc::clone(&registry);
                     let status = Arc::clone(&status);
+                    let cluster = Arc::clone(&cluster);
                     thread::spawn(move || {
                         let _guard = guard;
-                        let _ = handle(stream, &registry, &status);
+                        let _ = handle(stream, &registry, &status, &cluster, peer, local.port());
                     });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -202,12 +205,15 @@ fn handle(
     mut stream: TcpStream,
     registry: &HookRegistry,
     status: &SharedStatus,
+    cluster: &ClusterService,
+    peer: SocketAddr,
+    local_port: u16,
 ) -> std::io::Result<()> {
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     let request = read_request(&mut stream, Instant::now() + REQUEST_DEADLINE)?;
-    let response: (u16, &str, String) = match request {
-        Some((method, path, body)) if method == "POST" && path == "/v1/event" => {
-            match serde_json::from_slice::<Value>(&body) {
+    let response: (u16, &str, Vec<u8>) = match request {
+        Some(request) if request.method == "POST" && request.path == "/v1/event" => {
+            match serde_json::from_slice::<Value>(&request.body) {
                 Ok(event) => {
                     registry.record(
                         event.get("agent").and_then(Value::as_str).unwrap_or(""),
@@ -215,39 +221,62 @@ fn handle(
                         event.get("message").and_then(Value::as_str),
                         crate::util::epoch_now(),
                     );
-                    (200, "OK", r#"{"ok":true}"#.to_string())
+                    (200, "OK", br#"{"ok":true}"#.to_vec())
                 }
-                Err(_) => (400, "Bad Request", r#"{"ok":false}"#.to_string()),
+                Err(_) => (400, "Bad Request", br#"{"ok":false}"#.to_vec()),
             }
         }
-        Some((method, path, _)) if method == "GET" && (path == "/v1/status" || path == "/") => {
+        Some(request)
+            if request.method == "GET" && (request.path == "/v1/status" || request.path == "/") =>
+        {
             let latest = status
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone();
             match latest {
-                Some(body) => (200, "OK", body),
+                Some(body) => (200, "OK", body.into_bytes()),
                 None => (
                     503,
                     "Service Unavailable",
-                    r#"{"ok":false,"error":"no local snapshot yet"}"#.to_string(),
+                    br#"{"ok":false,"error":"no local snapshot yet"}"#.to_vec(),
                 ),
             }
         }
-        Some((method, path, _)) if method == "GET" && path == "/v1/health" => {
-            (200, "OK", r#"{"ok":true,"schema_version":1}"#.to_string())
+        Some(request) if request.method == "GET" && request.path == "/v1/health" => {
+            (200, "OK", br#"{"ok":true,"schema_version":1}"#.to_vec())
         }
-        Some(_) => (404, "Not Found", r#"{"ok":false}"#.to_string()),
-        None => (400, "Bad Request", r#"{"ok":false}"#.to_string()),
+        Some(request)
+            if request.path.starts_with("/v2/cluster/")
+                || request.path.starts_with("/v3/cluster/") =>
+        {
+            let response = cluster.handle_http(ClusterHttpRequest {
+                method: request.method,
+                path: request.path,
+                headers: request.headers,
+                body: request.body,
+                peer_host: peer.ip().to_string(),
+                local_port,
+            });
+            (response.status, response.reason, response.body)
+        }
+        Some(_) => (404, "Not Found", br#"{"ok":false}"#.to_vec()),
+        None => (400, "Bad Request", br#"{"ok":false}"#.to_vec()),
     };
     write!(
         stream,
-        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         response.0,
         response.1,
-        response.2.len(),
-        response.2
-    )
+        response.2.len()
+    )?;
+    stream.write_all(&response.2)
+}
+
+struct ParsedRequest {
+    method: String,
+    path: String,
+    headers: HashMap<String, String>,
+    body: Vec<u8>,
 }
 
 /// Minimal HTTP/1.1 parse: request line, Content-Length, body. Anything
@@ -255,7 +284,7 @@ fn handle(
 fn read_request(
     stream: &mut TcpStream,
     deadline: Instant,
-) -> std::io::Result<Option<(String, String, Vec<u8>)>> {
+) -> std::io::Result<Option<ParsedRequest>> {
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 4096];
     let header_end = loop {
@@ -278,10 +307,13 @@ fn read_request(
     let (Some(method), Some(path)) = (parts.next(), parts.next()) else {
         return Ok(None);
     };
-    let content_length = lines
+    let headers: HashMap<String, String> = lines
         .filter_map(|line| line.split_once(':'))
-        .find(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
-        .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+        .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_string()))
+        .collect();
+    let content_length = headers
+        .get("content-length")
+        .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(0);
     if content_length > MAX_REQUEST_BYTES {
         return Ok(None);
@@ -295,7 +327,12 @@ fn read_request(
         body.extend_from_slice(&chunk[..read]);
     }
     body.truncate(content_length);
-    Ok(Some((method.to_string(), path.to_string(), body)))
+    Ok(Some(ParsedRequest {
+        method: method.to_string(),
+        path: path.to_string(),
+        headers,
+        body,
+    }))
 }
 
 fn read_before_deadline(
@@ -318,8 +355,21 @@ fn find_header_end(buffer: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicU32;
 
     const NOW: i64 = 1_783_933_200;
+
+    fn test_cluster() -> Arc<ClusterService> {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let path = std::env::temp_dir()
+            .join(format!(
+                "elink-tui-hooks-cluster-{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            ))
+            .join("cluster.json");
+        Arc::new(ClusterService::load(path, Some("test-node")).expect("load cluster state"))
+    }
 
     fn status(state: &str) -> ProviderStatus {
         ProviderStatus {
@@ -412,6 +462,7 @@ mod tests {
             "127.0.0.1:0",
             Arc::new(HookRegistry::default()),
             SharedStatus::default(),
+            test_cluster(),
         )
         .expect("bind test listener");
         let address = listener.local_addr();
@@ -427,6 +478,7 @@ mod tests {
             "127.0.0.1:0",
             Arc::new(HookRegistry::default()),
             SharedStatus::default(),
+            test_cluster(),
         )
         .expect("bind test listener");
         let address = listener.local_addr();
@@ -464,6 +516,7 @@ mod tests {
             "127.0.0.1:0",
             Arc::new(HookRegistry::default()),
             SharedStatus::default(),
+            test_cluster(),
         )
         .expect("bind test listener");
         let address = listener.local_addr();
@@ -488,8 +541,13 @@ mod tests {
     fn listener_serves_latest_status_snapshot() {
         let registry = Arc::new(HookRegistry::default());
         let status = SharedStatus::default();
-        let listener = spawn_listener("127.0.0.1:0", Arc::clone(&registry), Arc::clone(&status))
-            .expect("bind test listener");
+        let listener = spawn_listener(
+            "127.0.0.1:0",
+            Arc::clone(&registry),
+            Arc::clone(&status),
+            test_cluster(),
+        )
+        .expect("bind test listener");
         let address = listener.local_addr();
 
         let response = send(address, "GET /v1/status HTTP/1.1\r\nHost: x\r\n\r\n");
@@ -508,6 +566,7 @@ mod tests {
             "127.0.0.1:0",
             Arc::clone(&registry),
             SharedStatus::default(),
+            test_cluster(),
         )
         .expect("bind test listener");
         let address = listener.local_addr();
@@ -538,6 +597,7 @@ mod tests {
             "127.0.0.1:0",
             Arc::clone(&registry),
             SharedStatus::default(),
+            test_cluster(),
         )
         .expect("bind test listener");
         let address = listener.local_addr();

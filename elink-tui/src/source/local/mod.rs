@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::cluster::ClusterService;
 use crate::config::Config;
 use crate::model::{ProviderStatus, Snapshot};
 use crate::util::epoch_now;
@@ -31,20 +32,44 @@ pub struct LocalSource {
     claude_home: PathBuf,
     codex_home: PathBuf,
     backfill_started: bool,
+    cluster: Arc<ClusterService>,
 }
 
 impl LocalSource {
-    pub fn new(config: &Config, history: Arc<History>) -> Self {
-        Self::build(config, Some(history))
+    pub fn new(config: &Config, history: Arc<History>) -> Result<Self, String> {
+        let cluster = Arc::new(
+            ClusterService::load(
+                config.cluster_state.clone(),
+                config.cluster_node_name.as_deref(),
+            )
+            .map_err(|error| error.to_string())?,
+        );
+        Ok(Self::build(config, Some(history), cluster))
     }
 
-    pub fn for_compact(config: &Config) -> Self {
-        Self::build(config, None)
+    pub fn for_compact(config: &Config) -> Result<Self, String> {
+        let cluster = Arc::new(
+            ClusterService::load(
+                config.cluster_state.clone(),
+                config.cluster_node_name.as_deref(),
+            )
+            .map_err(|error| error.to_string())?,
+        );
+        Ok(Self::build(config, None, cluster))
     }
 
-    fn build(config: &Config, history: Option<Arc<History>>) -> Self {
+    pub fn with_cluster(
+        config: &Config,
+        history: Arc<History>,
+        cluster: Arc<ClusterService>,
+    ) -> Self {
+        Self::build(config, Some(history), cluster)
+    }
+
+    fn build(config: &Config, history: Option<Arc<History>>, cluster: Arc<ClusterService>) -> Self {
+        let timezone = cluster.bucket_timezone();
         Self {
-            scanner: SessionScanner::new(&config.claude_home, &config.codex_home),
+            scanner: SessionScanner::new_in(&config.claude_home, &config.codex_home, timezone),
             quota: Arc::new(QuotaFetcher::new(
                 config.claude_home.clone(),
                 config.codex_home.clone(),
@@ -60,6 +85,7 @@ impl LocalSource {
             claude_home: config.claude_home.clone(),
             codex_home: config.codex_home.clone(),
             backfill_started: false,
+            cluster,
         }
     }
 
@@ -75,9 +101,11 @@ impl LocalSource {
         self.backfill_started = true;
         let claude_home = self.claude_home.clone();
         let codex_home = self.codex_home.clone();
+        let timezone = self.cluster.bucket_timezone();
         std::thread::spawn(move || {
             let cutoff = epoch_now() - BACKFILL_DAYS * 86_400;
-            let (claude, codex) = sessions::full_daily_totals(&claude_home, &codex_home, cutoff);
+            let (claude, codex) =
+                sessions::full_daily_totals_in(&claude_home, &codex_home, cutoff, timezone);
             history.merge_backfill(claude, codex);
         });
     }
@@ -100,6 +128,7 @@ impl LocalSource {
             address,
             Arc::clone(&self.hooks),
             Arc::clone(&self.served_status),
+            Arc::clone(&self.cluster),
         ) {
             Ok(listener) => {
                 self.listener = Some(listener);
@@ -167,12 +196,11 @@ impl LocalSource {
         let now = epoch_now();
 
         if update_history {
-            let local_now = chrono::Local::now();
-            let today = local_now.format("%Y-%m-%d").to_string();
+            let today = self.cluster.day_key(now);
             if let Some(history) = &self.history {
                 history.record_day("claude", &today, &outcome.claude.models);
                 history.record_day("codex", &today, &outcome.codex.models);
-                history.flush_if_dirty(now, local_now.date_naive());
+                history.flush_if_dirty(now, self.cluster.today());
             }
         }
 
@@ -196,7 +224,7 @@ impl LocalSource {
             .into_iter()
             .chain(codex.provider_usage_fetched_at)
             .max();
-        let snapshot = Snapshot {
+        let local = Snapshot {
             schema_version: 1,
             generated_at: Some(now),
             usage_fetched_at,
@@ -204,6 +232,7 @@ impl LocalSource {
             claude,
             codex,
         };
+        let snapshot = self.cluster.aggregate(&local, self.history.as_deref());
         if let Ok(serialized) = serde_json::to_string(&snapshot) {
             *self
                 .served_status
@@ -276,6 +305,8 @@ mod tests {
             statusline_cache: root.join("statusline.json"),
             quota_cache: root.join("quota.json"),
             history_cache: root.join("history.json"),
+            cluster_state: root.join("cluster.json"),
+            cluster_node_name: Some("test-node".to_string()),
             hook_listen: String::new(),
             device_url: None,
         }
@@ -284,7 +315,7 @@ mod tests {
     #[test]
     fn compact_source_has_no_history_and_skips_backfill() {
         let config = test_config();
-        let mut source = LocalSource::for_compact(&config);
+        let mut source = LocalSource::for_compact(&config).expect("cluster state loads");
 
         assert!(source.history.is_none());
 

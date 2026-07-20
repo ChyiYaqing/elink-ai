@@ -4,8 +4,8 @@ use anyhow::{anyhow, Result};
 use clap::Parser;
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
 
-use elink_tui::app::App;
-use elink_tui::config::{Cli, Config};
+use elink_tui::app::{App, LocalData};
+use elink_tui::config::{AppCommand, Cli, Config};
 use elink_tui::source::{self, Command, SourceKind};
 use elink_tui::ui;
 
@@ -26,6 +26,14 @@ fn local_collection_mode(compact: bool) -> LocalCollectionMode {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let config = Config::load(&cli)?;
+    if let Some(AppCommand::Cluster { command }) = &cli.command {
+        let cluster = elink_tui::cluster::ClusterService::load(
+            config.cluster_state.clone(),
+            config.cluster_node_name.as_deref(),
+        )?;
+        println!("{}", cluster.run_command(command)?);
+        return Ok(());
+    }
     if cli.once || cli.compact {
         return run_once(&config, cli.compact);
     }
@@ -45,14 +53,16 @@ fn run_once(config: &Config, compact: bool) -> Result<()> {
             source::remote::fetch(&agent, url).map_err(|error| anyhow!(error))?
         }
         SourceKind::Local => match local_collection_mode(compact) {
-            LocalCollectionMode::Cached => {
-                source::local::LocalSource::for_compact(config).snapshot_for_compact()
-            }
+            LocalCollectionMode::Cached => source::local::LocalSource::for_compact(config)
+                .map_err(|error| anyhow!(error))?
+                .snapshot_for_compact(),
             LocalCollectionMode::Fresh => {
                 let history = std::sync::Arc::new(source::local::history::History::new(
                     config.history_cache.clone(),
                 ));
-                source::local::LocalSource::new(config, history).collect(true)
+                source::local::LocalSource::new(config, history)
+                    .map_err(|error| anyhow!(error))?
+                    .collect(true)
             }
         }
         .map_err(|error| anyhow!(error))?,
@@ -71,11 +81,14 @@ fn run_tui(config: Config) -> Result<()> {
     let device_url = config.device_url.clone();
     let hook_listen = config.hook_listen.clone();
     let status_poll_s = config.status_poll_s;
-    let handle = source::spawn(config, initial);
+    let handle = source::spawn(config, initial).map_err(|error| anyhow!(error))?;
     let mut app = App::new(
         initial,
         bridge_configured,
-        handle.history.clone(),
+        LocalData {
+            history: handle.history.clone(),
+            cluster: handle.cluster.clone(),
+        },
         device_url,
         hook_listen,
         handle.local_bridge_ready.clone(),

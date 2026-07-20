@@ -8,7 +8,8 @@ elink-ai 目前只有 macOS 菜单栏 GUI (mac-app/, Swift) 和树莓派墨水�
 - **技术栈: Rust** (ratatui + crossterm)
 - **双数据模式**: 本地模式(直接读 Linux 上的 `~/.claude`、`~/.codex` 并调用 provider usage API)+ 远程模式(轮询现有 mac-app bridge `http://host:8765/v1/status`)
 
-v1 范围外:多 Mac 集群同步、墨水屏设备控制、更新检查、历史统计页。
+原始 v1 范围外的墨水屏设备控制、更新检查、历史统计页和多节点集群同步均已在
+2026-07-19 至 2026-07-20 的后续迭代中实现；当前保留的平台差异见文末。
 
 ## 移植参照(权威来源,实现时必读)
 
@@ -30,8 +31,11 @@ elink-tui/
 │   ├── main.rs          # clap 参数、终端 setup/teardown、事件循环
 │   ├── config.rs        # CLI 参数 + ~/.config/elink-ai/tui.toml 合并
 │   ├── model.rs         # Snapshot/ProviderStatus/UsageWindow/ModelUsage + serde
+│   ├── cluster.rs       # v3 安全配对 + v2 加密同步、持久化、聚合、集群 CLI
 │   ├── app.rs           # App 状态机: 焦点、模式、help overlay、滚动、按键处理
 │   ├── ui.rs            # ratatui 渲染: 布局、provider 卡片、配额 Gauge、帮助层、底部键位栏
+│   ├── device.rs        # elink-agent 状态、预览与显示控制
+│   ├── update.rs        # GitHub Release 更新检查
 │   ├── source/
 │   │   ├── mod.rs       # Source 枚举 (Remote|Local)、后台 worker 线程 + mpsc
 │   │   ├── remote.rs    # ureq GET /v1/status → model::Snapshot
@@ -39,6 +43,9 @@ elink-tui/
 │   │       ├── mod.rs   # 汇总 sessions + quota 组装 Snapshot
 │   │       ├── creds.rs # Claude token (env/文件)、Codex auth.json + JWT claim 解码
 │   │       ├── quota.rs # Anthropic + ChatGPT usage API、statusline 缓存 fallback、keep-last-good、退避
+│   │       ├── hooks.rs # hook/bridge HTTP 服务，含集群协议路由
+│   │       ├── history.rs # 366 天本地历史统计
+│   │       ├── store.rs # 私有权限的配额/状态原子写入
 │   │       └── sessions.rs # JSONL 扫描: Claude 去重求和、Codex 增量、按天分桶、mtime 状态
 │   └── util.rs          # ~ 展开、ISO8601 解析、格式化
 └── tests/
@@ -50,7 +57,10 @@ elink-tui/
 
 ## 依赖(最小集)
 
-`ratatui` + `crossterm`、`serde`/`serde_json`、`ureq`(rustls;阻塞式,每周期最多 3 个小 GET,拒绝 tokio/reqwest 的额外依赖)、`toml`、`chrono`(ISO8601 + 本地时区按天分桶)、`base64`(JWT payload 解码,不引 JWT 库)、`clap`(derive)、`dirs`、`anyhow`。
+`ratatui` + `crossterm`、`serde`/`serde_json`、`ureq`(rustls;阻塞式,拒绝
+tokio/reqwest 的额外依赖)、`toml`、`chrono`/`chrono-tz`(ISO8601 + 集群时区
+按天分桶)、`base64`(JWT/协议编码)、`ring`(X25519、AES-256-GCM、
+HKDF/HMAC-SHA256)、`clap`(derive)、`dirs`、`anyhow`。
 
 ## 模式与配置
 
@@ -59,10 +69,15 @@ elink-tui                          # 本地模式(默认)
 elink-tui --bridge http://mac:8765 # 远程模式
 elink-tui --config PATH
 elink-tui --once                   # 采集一次快照打印 JSON 后退出(调试/CI)
+elink-tui cluster create           # 创建加密同步集群
+elink-tui cluster join --endpoint http://host:8765 --code XXXX-XXXX-XXXX-XXXX
 ```
 
 配置文件 `~/.config/elink-ai/tui.toml`(CLI 覆盖文件,全部可选):
-`mode`、`bridge_url`、`[refresh] status_poll_s=2 / quota_fetch_s=120`、`[paths] claude_home / codex_home / statusline_cache`(测试用覆盖)。
+`mode`、`bridge_url`、`[refresh] status_poll_s=2 / quota_fetch_s=120`、
+`[paths] claude_home / codex_home / statusline_cache / quota_cache /
+history_cache / cluster_state`、`[cluster] node_name`、`[hooks] listen`、
+`[device] url`。
 
 本地模式要点(忠实移植 Swift 逻辑):
 - Claude token: env `CLAUDE_CODE_OAUTH_TOKEN` → `~/.claude/.credentials.json` 的 `claudeAiOauth.accessToken`(Linux 无 Keychain 路径)
@@ -70,7 +85,7 @@ elink-tui --once                   # 采集一次快照打印 JSON 后退出(调
 - Codex 配额: `GET https://chatgpt.com/backend-api/wham/usage`,Bearer + `ChatGPT-Account-Id`;凭据 `~/.codex/auth.json`,account id 取 `tokens.account_id` 或解 `tokens.id_token` JWT claim;`limit_window_seconds >= 518400` ⇒ weekly;再 fallback 会话日志里最新 `payload.rate_limits`
 - keep-last-good: 拉取失败保留上次非空窗口并标记 cached;`reset_at` 已过则丢弃置 null
 - 会话扫描: Claude 递归 `~/.claude/projects/**/*.jsonl`,4 字段 token 求和,按 `message.id`/`uuid` 去重取 max,本地时区按天分桶,按 `message.model` 分组;Codex 递归 `~/.codex/sessions`,`payload.type=="token_count"`,优先 `last_token_usage.total_tokens`,否则累计值差分
-- `needs_input` 本地模式 v1 恒为 false(Mac 上靠 hook 事件;后续可加监听),状态仅由 mtime 推导
+- `needs_input` 由本地 `/v1/event` hook 监听提供；没有 hook 时活动状态仍由 mtime 推导
 
 ## 键盘快捷键
 
@@ -81,6 +96,10 @@ elink-tui --once                   # 采集一次快照打印 JSON 后退出(调
 | `Tab`、`←`/`→`、`h`/`l` | 切换焦点卡片 |
 | `1` / `2` | 直达 Claude / Codex |
 | `↑`/`↓`、`k`/`j` | 焦点卡片内滚动模型列表 |
+| `s` | 本地/集群聚合历史统计页 |
+| `c` | 加密集群状态与配对页 |
+| `d` | 墨水屏设备页 |
+| `u` | 更新检查 |
 | `m` | 本地 ↔ 远程模式切换(未配 bridge_url 时底部提示) |
 | `?` | 帮助浮层;`Esc` 关闭 |
 
@@ -108,27 +127,33 @@ elink-tui --once                   # 采集一次快照打印 JSON 后退出(调
 
 ## 测试
 
-解析逻辑全部写成纯函数,无需网络:
+解析逻辑写成纯函数；HTTP 集成测试只使用本机临时端口，不访问外网:
 - `tests/status_schema.rs`: 反序列化仓库 `fixtures/status-v1.json`,断言缺省字段回退正常;再补一个全字段(含 null、cluster)用例
 - sessions 单测: Claude 去重取 max、4 字段求和、按天分桶;Codex 差分规则(首行取累计、累计不变⇒0、优先 last_token_usage)
 - quota 单测: Anthropic/wham 响应解析、≥6 天判 weekly、statusline 缓存 6 小时规则、过期窗口丢弃、keep-last-good
 - creds 单测: 手工构造的 JWT base64url 解码
+- cluster 单测:CryptoKit 固定向量、签名篡改/重放、私有权限持久化、revision
+  幂等合并、v3 配对 + v2 manifest/pull + 聚合的双节点 HTTP 端到端
 - 端到端(无 Mac): `elink-tui --once` 对着 `python3 -m http.server` 伺服的 fixture 验证
 - `cargo test` 成为第三套测试;首个 PR 顺带在根 CLAUDE.md 的测试要求里加一句 Rust 测试
 
-## 里程碑(每步独立可验证)
+## 里程碑(已完成)
 
-1. **M0 脚手架 + schema**: crate 可编译;`model.rs` 通过 fixture 反序列化测试;`--once --bridge URL` 打印解析结果 → 验证: `cargo test` + fixture server
-2. **M1 远程模式 dashboard**: 完整 TUI 循环、2s 轮询、卡片/Gauge/倒计时、键位、帮助层、断连 banner → 验证: 对真实 mac-app bridge 和 fixture server 各跑一次
-3. **M2 本地会话扫描**: sessions.rs 移植(只扫 mtime ≥ 当日零点的文件,按 (path, mtime, len) 做解析缓存)、mtime 状态推导 → 验证: 单测 + 在有 `~/.claude`/`~/.codex` 的机器上与 mac-app 数字对账
-4. **M3 本地配额**: creds/quota + 各 fallback + keep-last-good + 120s/60s/429 节奏 + `r` 强制刷新 → 验证: 单测 + 实跑;临时破坏凭据观察错误行
-5. **M4 收尾**: `m` 模式切换、配置文件、窄屏堆叠、`--once` 输出定稿、README 章节、CHANGELOG 条目;可选 `ubuntu-latest` Rust CI job(现有 macOS 自托管 CI/Release 工作流不动、不受 Rust 门禁影响)
+1. **M0 脚手架 + schema**:已完成。
+2. **M1 远程模式 dashboard**:已完成。
+3. **M2 本地会话扫描**:已完成，含目录索引和解析缓存。
+4. **M3 本地配额**:已完成，含各级 fallback、keep-last-good 和后台抓取。
+5. **M4 收尾**:已完成模式切换、配置、窄屏、`--once`、README 和 CHANGELOG；
+   `ubuntu-latest` Rust CI 仍是可选工程项，不属于功能范围。
+6. **M5 扩展能力**:已完成 hooks、持久缓存、历史统计、bridge 服务端、
+   compact 状态、墨水屏控制、更新检查和加密多节点同步。
 
 ## 风险
 
 - Codex 增量/subagent 归因与 mac-app "usageParserVersion 2" 语义需保持一致,fixture 镜像 + 注释标注 parity
 - 大 JSONL 文件扫描成本:M2 的按 (mtime, size) 解析缓存兜底;字节偏移增量 tail 仅在需要时再做(Claude 去重跨行,需缓存 per-file 累加器状态而非仅总数)
-- 安全:绝不打印/渲染 token,错误信息不得包含 Authorization 头
+- 安全:绝不打印/渲染 provider token 或集群 secret,错误信息不得包含
+  Authorization 头；配对码只带外显示且 2 分钟/5 次尝试失效
 - macOS Release 工作流保持不变;Rust 构建不进入其门禁
 
 ## 与 mac-app 的功能差距(v1 完成后盘点,2026-07-18)
@@ -136,9 +161,10 @@ elink-tui --once                   # 采集一次快照打印 JSON 后退出(调
 v1 已对齐 mac-app 的核心 dashboard:双卡片(状态徽章、今日 token、按模型明细、
 5h/周配额条与重置倒计时、错误行)、本地会话扫描与配额抓取(含 statusline 缓存、
 Codex 日志配额、keep-last-good 全部 fallback)、远程 bridge 轮询、`r` 手动刷新、
-断连 banner 保留 last-good。以下是尚未实现的部分,按建议优先级排列。
+断连 banner 保留 last-good。以下记录后续功能对齐过程；截至 2026-07-20，
+列表中的 Linux 功能项均已实现。
 
-### 功能性差距(Linux 上有意义,可作为后续迭代)
+### 功能对齐记录
 
 1. ~~**本地模式 `needs_input` / hook 事件**~~ **已实现(2026-07-19)**:
    `src/source/local/hooks.rs` 内嵌迷你 HTTP 监听(默认 `127.0.0.1:8765`,
@@ -155,14 +181,14 @@ Codex 日志配额、keep-last-good 全部 fallback)、远程 bridge 轮询、`r
    `~/.local/state/elink-ai/history.json`(366 天保留,30 秒节流写盘),
    启动后后台线程从现有会话日志回填近一年;`s` 键统计页按 `w`/`m`/`y` 切
    周(柱状)/月(sparkline)/年(按月柱状),含区间总量与按模型明细。未移植
-   时区迁移/残差守恒机制(mac-app `runUsageMaintenance`),历史桶固定用本机
-   当前时区。
+   时区迁移/残差守恒机制(mac-app `runUsageMaintenance`)；单机使用本机时区，
+   入群后的新扫描使用集群时区，但不会重写入群前已有的历史桶。
 4. ~~**作为数据源服务端**~~ **已实现(2026-07-19)**:hook 监听端点同时伺服
    `GET /v1/status`(bridge 线格式,`Serialize for Snapshot` 输出
    `five_hour_*`/`primary_*` 字段名),已用 `elink_agent.models.StatusSnapshot`
    实际解析验证互通;`[hooks] listen = "0.0.0.0:8765"` 即可供局域网内
-   Pi agent 使用。注意:与 mac-app 不同,cluster 字段为 null(v1 客户端可
-   忽略),且不提供 `/v2/cluster/*`。
+   Pi agent 使用。集群启用后，快照的 `cluster` 字段包含聚合摘要；同一监听器
+   还提供 v3 配对和 `/v2/cluster/*` 加密同步端点。
 5. ~~**菜单栏常驻用量提示的等价物**~~ **已实现(2026-07-19)**:
    `ui::terminal_title` 用 `crossterm::SetTitle` 把两家中更高的周用量百分比
    写入终端标题(仅在变化时更新);`--compact` 打印单行摘要
@@ -175,11 +201,18 @@ Codex 日志配额、keep-last-good 全部 fallback)、远程 bridge 轮询、`r
    切显示模式、`p`/`f` 智能/完整刷新、`b` 把设备的 bridge 指向本机
    (用 UDP connect 探测本机到设备路由上的出口 IP + 监听端口)。
    `[device] url` 配置启用。PNG 用 `png` crate 解码,归一化到 8-bit 灰度。
-7. **多 Mac / 多节点集群同步**(参照 `ClusterManager` + protocol.md v2):配对、
-   AES-GCM/HMAC 加密快照交换、聚合求和与 freshest-wins 配额。工程量最大,
-   **有意保留不做**;远程模式下 TUI 已能显示 bridge 聚合后的集群总和
-   (header 的 cluster n/n),短期依赖该路径而不移植 v2 协议。这是唯一
-   仍未实现的差距项。
+7. ~~**多 Mac / 多节点集群同步**~~ **已实现(2026-07-20)**:
+   `src/cluster.rs` 兼容当前 mac-app 的 v3 配对和 v2 同步协议。16 位配对码
+   通过 X25519 + HKDF + HMAC proof 完成带外认证，码本身不上网线；同步请求使用
+   HMAC-SHA256 时间戳/nonce 签名并拒绝重放，JSON 使用 AES-256-GCM 加密。
+   `manifest`/`pull`/`announce` 交换带 revision/content hash 的绝对快照，远端
+   仅接受更高 revision，Dashboard 和历史页按节点求和，实时状态按 90 秒在线
+   窗口聚合，配额使用 freshest-wins + 10 分钟无错误优先规则。凭据、peer、节点
+   和快照持久化到 `~/.local/state/elink-ai/cluster.json`(0600)，切换集群时保留
+   本节点快照并原子清除远端数据。`elink-tui cluster create/join/leave/add-peer/
+   status` 管理集群，TUI `c` 页显示节点并用 `p` 开放两分钟配对窗口。Linux
+   不做 Bonjour，节点通过配对记录或 `add-peer` 手动发现。至此 PLAN 中列出的
+   Linux 功能性差距均已完成。
 8. ~~**更新检查**~~ **已实现(2026-07-19)**:`src/update.rs` 后台线程查
    GitHub `/releases`(匿名 API 优先,私有仓库 404 时回退到用户已有的
    `gh auth login` 会话,不复制/持久化 token,对齐 `UpdateChecker`),
@@ -195,5 +228,5 @@ Codex 日志配额、keep-last-good 全部 fallback)、远程 bridge 轮询、`r
   终端复用器,TUI 是前台程序)
 - Bonjour 设备发现、DHCP/bridge 自愈(菜单栏 app 的设备运维功能)
 - SwiftUI 面板交互细节(悬停提示、动画)与日志文件入口(TUI 无日志文件)
-- 时区迁移/历史重建(`runUsageMaintenance`):依赖持久历史库,若第 3 项落地
-  再评估是否需要
+- mac-app SQLite 历史库的时区迁移/残差守恒维护；TUI 在入群后使用集群时区
+  扫描与分桶，但不会重写入群前已有的轻量 JSON 历史
