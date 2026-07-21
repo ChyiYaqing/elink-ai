@@ -6,6 +6,23 @@ and `Removed`.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## 0.1.16-rc1
+
+### Added
+
+- The macOS cluster panel can copy a generated pairing code with one click
+
+### Changed
+
+- Cluster UI text now refers to hosts instead of Macs so Linux TUI peers are
+  represented accurately
+
+### Fixed
+
+- `elink-tui` cluster JSON now uses the Swift protocol's `ID` field spelling,
+  restoring pairing and synchronization with the macOS app while accepting
+  the previous TUI spelling when reading data
+
 ## 0.1.15
 
 ### Packaging

@@ -63,6 +63,7 @@ pub enum ClusterCommand {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "camelCase")]
 pub struct ClusterSnapshotKey {
+    #[serde(rename = "originNodeID", alias = "originNodeId")]
     pub origin_node_id: String,
     pub day: String,
     pub provider: String,
@@ -136,6 +137,7 @@ struct ClusterModelUsage {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct ClusterLiveStatus {
+    #[serde(rename = "nodeID", alias = "nodeId")]
     node_id: String,
     node_name: String,
     observed_at: f64,
@@ -147,7 +149,9 @@ struct ClusterLiveStatus {
 #[serde(rename_all = "camelCase")]
 struct ClusterManifest {
     protocol_version: u32,
+    #[serde(rename = "clusterID", alias = "clusterId")]
     cluster_id: String,
+    #[serde(rename = "senderNodeID", alias = "senderNodeId")]
     sender_node_id: String,
     sender_name: String,
     live_statuses: Vec<ClusterLiveStatus>,
@@ -177,6 +181,7 @@ struct ClusterAck {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ClusterSecurePayload {
+    #[serde(rename = "senderNodeID", alias = "senderNodeId")]
     sender_node_id: String,
     sealed: String,
 }
@@ -185,6 +190,7 @@ struct ClusterSecurePayload {
 #[serde(rename_all = "camelCase")]
 struct ClusterJoinRequest {
     proof: String,
+    #[serde(rename = "clientNodeID", alias = "clientNodeId")]
     client_node_id: String,
     client_name: String,
     client_public_key: String,
@@ -193,6 +199,7 @@ struct ClusterJoinRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ClusterJoinSecret {
+    #[serde(rename = "clusterID", alias = "clusterId")]
     cluster_id: String,
     cluster_secret: String,
     timezone: String,
@@ -2573,6 +2580,50 @@ mod tests {
         };
         let wire = serde_json::to_string(&request).unwrap();
         assert!(!wire.contains(&normalized));
+        assert!(wire.contains("\"clientNodeID\""));
+        assert!(!wire.contains("\"clientNodeId\""));
+    }
+
+    #[test]
+    fn cluster_wire_json_matches_swift_id_spelling() {
+        let snapshot_key = ClusterSnapshotKey {
+            origin_node_id: "node-a".to_string(),
+            day: "2026-07-21".to_string(),
+            provider: "codex".to_string(),
+        };
+        let manifest = ClusterManifest {
+            protocol_version: PROTOCOL_VERSION,
+            cluster_id: "cluster-a".to_string(),
+            sender_node_id: "node-a".to_string(),
+            sender_name: "Mac".to_string(),
+            live_statuses: Vec::new(),
+            snapshots: Vec::new(),
+        };
+        let envelope = ClusterSecurePayload {
+            sender_node_id: "node-a".to_string(),
+            sealed: "payload".to_string(),
+        };
+        let secret = ClusterJoinSecret {
+            cluster_id: "cluster-a".to_string(),
+            cluster_secret: "secret".to_string(),
+            timezone: "Asia/Singapore".to_string(),
+        };
+
+        assert_eq!(
+            serde_json::to_value(snapshot_key).unwrap()["originNodeID"],
+            "node-a"
+        );
+        let manifest = serde_json::to_value(manifest).unwrap();
+        assert_eq!(manifest["clusterID"], "cluster-a");
+        assert_eq!(manifest["senderNodeID"], "node-a");
+        assert_eq!(
+            serde_json::to_value(envelope).unwrap()["senderNodeID"],
+            "node-a"
+        );
+        assert_eq!(
+            serde_json::to_value(secret).unwrap()["clusterID"],
+            "cluster-a"
+        );
     }
 
     #[test]

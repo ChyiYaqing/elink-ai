@@ -215,7 +215,7 @@ struct UsageStatsView: View {
                 .foregroundStyle(theme.textSecondary)
             Spacer()
             Picker("数据来源", selection: $selectedNodeID) {
-                Text("全部 Mac").tag("")
+                Text("全部主机").tag("")
                 ForEach(clusterNodes) { node in
                     Text(node.name).tag(node.nodeID)
                 }

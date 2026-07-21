@@ -220,13 +220,13 @@ final class ClusterManager: ObservableObject {
             // 不是 Elink AI 桥接端口（任何 HTTP 服务都会 404），提示不能只说版本
             if let http = response as? HTTPURLResponse, http.statusCode == 426 {
                 return DispatchQueue.main.async {
-                    completion(BridgeError.message("对方 Elink AI 版本不兼容，请把两台 Mac 都升级到最新版"))
+                    completion(BridgeError.message("对方 Elink AI 版本不兼容，请把两台主机都升级到最新版"))
                 }
             }
             if let http = response as? HTTPURLResponse, http.statusCode == 404 {
                 return DispatchQueue.main.async {
                     completion(BridgeError.message(
-                        "对方没有配对接口：请确认地址是另一台 Mac 的 Elink AI（端口 8765），或将其升级到最新版"
+                        "对方没有配对接口：请确认地址是另一台主机的 Elink AI（端口 8765），或将其升级到最新版"
                     ))
                 }
             }
@@ -287,7 +287,7 @@ final class ClusterManager: ObservableObject {
         let endpoints = knownEndpoints()
         guard !endpoints.isEmpty else {
             refreshPublishedState()
-            completion?(BridgeError.message("尚无已配对节点，请先在另一台 Mac 使用配对码加入"))
+            completion?(BridgeError.message("尚无已配对节点，请先在另一台主机使用配对码加入"))
             return
         }
         syncing = true

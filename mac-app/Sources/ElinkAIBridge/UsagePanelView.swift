@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 final class PanelModel: ObservableObject {
@@ -40,6 +41,7 @@ struct UsagePanelView: View {
     @State private var clusterAddress = ""
     @State private var clusterCode = ""
     @State private var clusterMessage: String?
+    @State private var pairingCodeCopied = false
     @State private var showClusterAdvanced = false
     @State private var showLeaveClusterConfirmation = false
 
@@ -395,7 +397,7 @@ struct UsagePanelView: View {
                                     .frame(width: 24, height: 24)
                                     .background(Circle().fill(Color.blue.opacity(theme.dark ? 0.18 : 0.09)))
                                 VStack(alignment: .leading, spacing: 1) {
-                                    Text("在另一台 Mac 输入配对码")
+                                    Text("在另一台主机输入配对码")
                                         .font(.system(size: 9, weight: .semibold, design: .rounded))
                                         .foregroundStyle(theme.textPrimary)
                                     Text("两分钟内有效")
@@ -407,6 +409,25 @@ struct UsagePanelView: View {
                                     .font(.system(size: 12, weight: .bold, design: .monospaced))
                                     .foregroundStyle(theme.textPrimary)
                                     .textSelection(.enabled)
+                                Button {
+                                    NSPasteboard.general.clearContents()
+                                    NSPasteboard.general.setString(code, forType: .string)
+                                    pairingCodeCopied = true
+                                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                                        pairingCodeCopied = false
+                                    }
+                                } label: {
+                                    Image(systemName: pairingCodeCopied ? "checkmark" : "doc.on.doc")
+                                        .font(.system(size: 11, weight: .semibold))
+                                        .foregroundStyle(pairingCodeCopied
+                                            ? Color.green
+                                            : Color(red: 0.32, green: 0.58, blue: 0.96))
+                                        .frame(width: 20, height: 20)
+                                        .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+                                .help("复制配对码")
+                                .accessibilityLabel(pairingCodeCopied ? "配对码已复制" : "复制配对码")
                             }
                             .padding(8)
                             .background(
@@ -429,7 +450,7 @@ struct UsagePanelView: View {
                             }
                             .disabled(cluster.syncing)
                             PillButton(
-                                title: cluster.pairingCode == nil ? "添加 Mac" : "停止配对",
+                                title: cluster.pairingCode == nil ? "添加主机" : "停止配对",
                                 icon: cluster.pairingCode == nil ? "plus" : "xmark",
                                 theme: theme
                             ) {
@@ -449,7 +470,7 @@ struct UsagePanelView: View {
                                     Text("加入已有同步集群")
                                         .font(.system(size: 9, weight: .semibold, design: .rounded))
                                         .foregroundStyle(theme.textPrimary)
-                                    Text("输入另一台 Mac 显示的地址和配对码")
+                                    Text("输入另一台主机显示的地址和配对码")
                                         .font(.system(size: 8, weight: .medium))
                                         .foregroundStyle(theme.textTertiary)
                                 }
@@ -682,7 +703,7 @@ struct UsagePanelView: View {
                     joinClusterFromFields()
                 }
             }
-        Text("在集群主机点击“添加 Mac”生成配对码；验证码有效期为两分钟。")
+        Text("在集群主机点击“添加主机”生成配对码；验证码有效期为两分钟。")
             .font(.system(size: 8, weight: .medium))
             .foregroundStyle(theme.textTertiary)
         if let peer = Self.preferredPairingPeer(in: cluster.discoveredPeers) {
@@ -715,7 +736,7 @@ struct UsagePanelView: View {
             if let error {
                 clusterMessage = "配对失败：\(error.localizedDescription)"
             } else {
-                clusterMessage = "配对成功，正在同步其他 Mac 的历史用量"
+                clusterMessage = "配对成功，正在同步其他主机的历史用量"
                 clusterAddress = ""
                 clusterCode = ""
             }
@@ -1310,7 +1331,7 @@ private struct DestructiveButton: View {
         .buttonStyle(.plain)
         .animation(.easeOut(duration: 0.15), value: hovering)
         .onHover { hovering = $0 }
-        .accessibilityHint("停止与其他 Mac 同步，本机历史数据会保留")
+        .accessibilityHint("停止与其他主机同步，本机历史数据会保留")
     }
 }
 
