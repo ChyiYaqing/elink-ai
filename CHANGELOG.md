@@ -6,7 +6,11 @@ and `Removed`.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## Unreleased
+## 0.1.15
+
+### Packaging
+
+- GitHub Releases now include an `elink-tui` Linux binary for `arm64`
 
 ### Added
 
@@ -47,6 +51,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   imported once without deleting the recoverable source files
 - Usage-history timezone changes now rebucket data and advance the timezone
   marker atomically while conserving usage no longer reconstructable from logs
+
+### Fixed
+
+- macOS cluster discovery now ignores co-located bridges to prevent the same
+  machine's usage from being counted twice
 
 ## 0.1.15-rc1
 

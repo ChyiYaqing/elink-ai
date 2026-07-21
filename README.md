@@ -134,12 +134,12 @@ Build an ad-hoc-signed DMG installer with:
 ```bash
 cd mac-app
 sh build-dmg.sh
-open .build/elink-ai-v0.1.15-rc1.dmg
+open .build/elink-ai-v0.1.15.dmg
 ```
 
 Pushing a `v*` tag runs the release workflow, creates the matching GitHub
-Release when needed, and uploads a versioned asset such as
-`elink-ai-v0.1.15-rc1.dmg`.
+Release when needed, and uploads the versioned macOS DMG plus Linux
+`elink-tui` archive for `arm64`.
 
 Before tagging a release, add a matching `## X.Y.Z` section to
 [CHANGELOG.md](CHANGELOG.md). Keep its non-empty subsections in `Packaging`,

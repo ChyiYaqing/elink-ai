@@ -46,7 +46,8 @@ cargo install --path . --locked
 elink-tui
 ```
 
-当前项目没有单独发布 Linux TUI 二进制，需要从源码构建。
+GitHub Release 提供 `arm64` Linux 预编译包，文件名为
+`elink-tui-vX.Y.Z-linux-arm64.tar.gz`。
 
 ## 数据模式
 
