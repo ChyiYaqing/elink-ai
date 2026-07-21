@@ -91,6 +91,15 @@ final class ClusterDiscovery: NSObject, NetServiceBrowserDelegate, NetServiceDel
         let txt = NetService.dictionary(fromTXTRecord: data)
         let remoteNode = txt["node"].map { String(decoding: $0, as: UTF8.self) } ?? ""
         guard remoteNode != nodeID else { return }
+        // Same-machine guard: a co-located bridge (e.g. an elink-tui on this
+        // host) advertises this machine's own addresses under a different node
+        // id. Syncing with it would double-count this machine's usage in the
+        // cluster, so skip it. Intentional localhost setups can still use a
+        // manual VPN endpoint.
+        let peerAddresses = Self.peerAddressStrings(from: sender.addresses ?? [])
+        if Self.isColocated(peerAddresses: peerAddresses, localAddresses: Self.localAddresses()) {
+            return
+        }
         let cluster = txt["cluster"].map { String(decoding: $0, as: UTF8.self) }
         let pairable = txt["pairing"].map { String(decoding: $0, as: UTF8.self) == "1" } ?? false
         let pairingProtocol = txt["pairproto"]
@@ -110,5 +119,59 @@ final class ClusterDiscovery: NSObject, NetServiceBrowserDelegate, NetServiceDel
     private func notify() {
         let result = peers.values.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
         DispatchQueue.main.async { [weak self] in self?.onPeersChanged?(result) }
+    }
+
+    /// True when a resolved peer advertises a loopback or this machine's own
+    /// address, meaning it is really a co-located bridge, not a remote node.
+    static func isColocated(peerAddresses: [String], localAddresses: Set<String>) -> Bool {
+        peerAddresses.contains { isLoopbackAddress($0) || localAddresses.contains($0) }
+    }
+
+    static func isLoopbackAddress(_ ip: String) -> Bool {
+        ip == "::1" || ip.hasPrefix("127.")
+    }
+
+    /// Drops an IPv6 zone id (e.g. `fe80::1%en0` → `fe80::1`) and lowercases so
+    /// this machine's addresses and a peer's advertised ones compare equal.
+    static func normalizeIP(_ value: String) -> String {
+        let base = value.split(separator: "%", maxSplits: 1).first.map(String.init) ?? value
+        return base.lowercased()
+    }
+
+    /// This machine's interface addresses (IPv4 and IPv6, including loopback).
+    private static func localAddresses() -> Set<String> {
+        var result: Set<String> = []
+        var addresses: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&addresses) == 0, let first = addresses else { return result }
+        defer { freeifaddrs(addresses) }
+        for pointer in sequence(first: first, next: { $0.pointee.ifa_next }) {
+            let item = pointer.pointee
+            guard let address = item.ifa_addr else { continue }
+            let family = address.pointee.sa_family
+            guard family == UInt8(AF_INET) || family == UInt8(AF_INET6) else { continue }
+            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            guard getnameinfo(address, socklen_t(address.pointee.sa_len), &host,
+                              socklen_t(host.count), nil, 0, NI_NUMERICHOST) == 0 else { continue }
+            result.insert(normalizeIP(String(cString: host)))
+        }
+        return result
+    }
+
+    /// Parses a `NetService`'s resolved socket addresses into numeric IP
+    /// strings for comparison against this machine's addresses.
+    private static func peerAddressStrings(from addresses: [Data]) -> [String] {
+        addresses.compactMap { datum -> String? in
+            datum.withUnsafeBytes { raw -> String? in
+                guard raw.count >= MemoryLayout<sockaddr>.size,
+                      let base = raw.baseAddress else { return nil }
+                let sockaddrPointer = base.assumingMemoryBound(to: sockaddr.self)
+                let family = sockaddrPointer.pointee.sa_family
+                guard family == UInt8(AF_INET) || family == UInt8(AF_INET6) else { return nil }
+                var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                guard getnameinfo(sockaddrPointer, socklen_t(datum.count), &host,
+                                  socklen_t(host.count), nil, 0, NI_NUMERICHOST) == 0 else { return nil }
+                return normalizeIP(String(cString: host))
+            }
+        }
     }
 }

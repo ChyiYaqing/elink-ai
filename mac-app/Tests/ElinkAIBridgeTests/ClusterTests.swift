@@ -331,6 +331,27 @@ final class ClusterTests: XCTestCase {
         XCTAssertNil(ClusterCrypto.normalizedPairingCode(""))
     }
 
+    func testDiscoverySameMachineGuardRejectsLocalAndLoopbackPeers() {
+        let local: Set<String> = ["192.168.1.5", "fe80::1"]
+        // A co-located bridge advertising this machine's LAN address.
+        XCTAssertTrue(ClusterDiscovery.isColocated(
+            peerAddresses: ["192.168.1.5"], localAddresses: local
+        ))
+        // Loopback is always same-machine, even if absent from the interface set.
+        XCTAssertTrue(ClusterDiscovery.isColocated(
+            peerAddresses: ["127.0.0.1"], localAddresses: local
+        ))
+        XCTAssertTrue(ClusterDiscovery.isColocated(
+            peerAddresses: ["::1"], localAddresses: local
+        ))
+        // A genuine remote peer shares no address with us.
+        XCTAssertFalse(ClusterDiscovery.isColocated(
+            peerAddresses: ["192.168.1.9"], localAddresses: local
+        ))
+        // IPv6 zone ids are stripped before comparison.
+        XCTAssertEqual(ClusterDiscovery.normalizeIP("FE80::1%en0"), "fe80::1")
+    }
+
     func testPairingHandshakeDeliversSecretWithoutSendingCodeOnWire() throws {
         let (usageStore, path) = store()
         defer { try? FileManager.default.removeItem(atPath: path) }
