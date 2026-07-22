@@ -19,6 +19,8 @@ final class PanelModel: ObservableObject {
     @Published var bridgeAddress = ""
     @Published var deviceConnectionEnabled = true
     @Published var settingsMessage: String?
+    @Published var agentSessions: [AgentSession] = []
+    @Published var agentSessionsEnabled = true
 
     var onSetMode: ((String) -> Void)?
     var onDeviceRefresh: ((String) -> Void)?
@@ -28,6 +30,7 @@ final class PanelModel: ObservableObject {
     var onAutoPair: (() -> Void)?
     var onPointHere: (() -> Void)?
     var onOpenDeviceStatus: (() -> Void)?
+    var onSetAgentSessionsEnabled: ((Bool) -> Void)?
 }
 
 struct UsagePanelView: View {
@@ -78,6 +81,9 @@ struct UsagePanelView: View {
                         }
                     }
                     .fixedSize(horizontal: false, vertical: true)
+                    if model.agentSessionsEnabled && !model.agentSessions.isEmpty {
+                        AgentSessionsCard(sessions: model.agentSessions, theme: theme)
+                    }
                     if model.deviceConnectionEnabled || model.showSettings || model.statsProvider != nil {
                         deviceCard(theme)
                     }
@@ -233,6 +239,7 @@ struct UsagePanelView: View {
                 VStack(spacing: 10) {
                     deviceSettings(theme)
                     launchSettings(theme)
+                    agentSessionsSettings(theme)
                     clusterSettings(theme)
                     logSettings(theme)
                     updateSettings(theme)
@@ -351,6 +358,26 @@ struct UsagePanelView: View {
             .scaleEffect(0.78)
             .labelsHidden()
             .accessibilityLabel("开机自启动")
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .glassCard(theme)
+    }
+
+    private func agentSessionsSettings(_ theme: PanelTheme) -> some View {
+        HStack(spacing: 8) {
+            settingsHeader(theme, icon: "terminal.fill",
+                           color: Color(red: 0.55, green: 0.40, blue: 0.90),
+                           title: "Agent 会话", subtitle: "在面板显示运行中的 Claude Code / Codex 会话")
+            Toggle("", isOn: Binding(
+                get: { model.agentSessionsEnabled },
+                set: { model.onSetAgentSessionsEnabled?($0) }
+            ))
+            .toggleStyle(.switch)
+            .tint(theme.statusHealthy)
+            .scaleEffect(0.78)
+            .labelsHidden()
+            .accessibilityLabel("Agent 会话")
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1231,7 +1258,7 @@ private struct UsageBar: View {
     }
 }
 
-private struct StateBadge: View {
+struct StateBadge: View {
     let text: String
     let color: Color
 
@@ -1389,6 +1416,6 @@ private struct GlassCard: ViewModifier {
     }
 }
 
-private extension View {
+extension View {
     func glassCard(_ theme: PanelTheme) -> some View { modifier(GlassCard(theme: theme)) }
 }

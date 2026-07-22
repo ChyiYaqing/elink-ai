@@ -55,6 +55,8 @@ The editable source is [docs/architecture.drawio](docs/architecture.drawio)
 - restart-safe quota caching with per-provider freshness and fallback status
 - encrypted peer-to-peer usage aggregation across paired Macs on the same LAN/VPN
 - manual and periodic GitHub Release checks with direct access to the newest DMG
+- live Claude Code / Codex terminal-session list in the panel with running,
+  idle, and finished states plus collapsible subagents
 
 The LCD-specific pet animation, music, and network graphs from `esp8266-ai`
 are intentionally excluded because they conflict with e-paper refresh limits.
@@ -92,10 +94,14 @@ swift run ElinkAIBridge
 
 The app runs only in the menu bar, showing a color-coded Claude usage
 percentage next to the icon. Left-click opens a panel with Claude and Codex
-usage cards (5-hour/weekly windows, reset countdowns, per-model tokens), the
-exact PNG last sent to the display with page switching and smart/full refresh
-controls, and a settings page for device pairing, launch at login, logs, and
-about. Settings are available from the gear button at the bottom of the panel.
+usage cards (5-hour/weekly windows, reset countdowns, per-model tokens), a live
+list of Claude Code / Codex sessions running in local terminals (animated pixel
+mascot while busy, dimmed when idle, green check when finished, subagents in a
+collapsible dropdown; discovered via `ps`/`lsof` and session transcripts, only
+polled while the panel is open, and toggleable in settings), the exact PNG last
+sent to the display with page switching and smart/full refresh controls, and a
+settings page for device pairing, launch at login, logs, and about. Settings
+are available from the gear button at the bottom of the panel.
 Verify the bridge with:
 
 ```bash

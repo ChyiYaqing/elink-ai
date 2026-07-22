@@ -14,6 +14,8 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
     private var loadingPreview = false
     private var loadingSnapshot = false
     private var actionInFlight = false
+    private let sessionMonitor = AgentSessionMonitor()
+    private var loadingSessions = false
 
     init(status: StatusService, usage: UsageFetcher, cluster: ClusterManager, port: UInt16) {
         self.status = status
@@ -113,6 +115,19 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
                     ?? "桥接已设置，设备将从 \(url)/v1/status 拉取数据"
             }
         }
+        model.agentSessionsEnabled = AgentSessionMonitor.isEnabled
+        model.onSetAgentSessionsEnabled = { [weak self] enabled in
+            guard let self else { return }
+            AgentSessionMonitor.isEnabled = enabled
+            self.model.agentSessionsEnabled = enabled
+            self.model.settingsMessage = enabled ? "Agent 会话显示已开启" : "Agent 会话显示已关闭"
+            Log.user("agent sessions \(enabled ? "enabled" : "disabled")")
+            if enabled {
+                self.reloadAgentSessions()
+            } else {
+                self.model.agentSessions = []
+            }
+        }
         model.onOpenDeviceStatus = { [weak self] in
             guard let base = DeviceClient.baseURL else {
                 Log.warning("open device status failed: device address is not configured", category: "user")
@@ -143,6 +158,7 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
         model.bridgeAddress = "http://\(DeviceClient.localIPv4() ?? "127.0.0.1"):\(port)/v1/status"
         model.settingsMessage = nil
         model.launchAtLogin = LaunchAtLogin.isEnabled()
+        model.agentSessionsEnabled = AgentSessionMonitor.isEnabled
         updater.checkAutomaticallyIfNeeded()
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         // .accessory 应用弹出时未被激活，transient 不会因外部点击自动关闭，需手动监听
@@ -160,6 +176,7 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
     func popoverDidClose(_ notification: Notification) {
         pollTimer?.invalidate()
         pollTimer = nil
+        sessionMonitor.reset()
         if let clickMonitor {
             NSEvent.removeMonitor(clickMonitor)
             self.clickMonitor = nil
@@ -175,9 +192,23 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
 
     private func reload() {
         reloadSnapshot()
+        reloadAgentSessions()
         guard model.deviceConnectionEnabled else { return }
         reloadInfo()
         reloadPreview()
+    }
+
+    private func reloadAgentSessions() {
+        guard model.agentSessionsEnabled, !loadingSessions else { return }
+        loadingSessions = true
+        sessionMonitor.poll { [weak self] sessions in
+            guard let self else { return }
+            self.loadingSessions = false
+            guard self.model.agentSessionsEnabled else { return }
+            withAnimation(.easeOut(duration: 0.2)) {
+                self.model.agentSessions = sessions
+            }
+        }
     }
 
     private func reloadSnapshot() {
