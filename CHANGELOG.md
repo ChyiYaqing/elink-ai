@@ -6,6 +6,13 @@ and `Removed`.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## 0.1.16-rc2
+
+### Added
+
+- The macOS panel now lists live Claude Code and Codex terminal sessions with
+  working, idle, and finished states plus collapsible subagents
+
 ## 0.1.16-rc1
 
 ### Added
