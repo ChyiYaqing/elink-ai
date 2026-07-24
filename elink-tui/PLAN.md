@@ -220,7 +220,7 @@ Codex 日志配额、keep-last-good 全部 fallback)、远程 bridge 轮询、`r
    `gh auth login` 会话,不复制/持久化 token,对齐 `UpdateChecker`),
    跳过 draft/prerelease 取最高稳定版,SemVer 比较(release 高于同版本 rc),
    `u` 键触发,有新版时 header 显示 `⬆ vX.Y.Z available` 标记。crate 版本
-   与仓库发布版本对齐(当前 `0.1.15`)。
+   与仓库发布版本对齐(当前 `0.1.16`)。
 
 ### 平台差异,不移植(macOS 专属或已被替代)
 

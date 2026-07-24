@@ -223,15 +223,15 @@ mod tests {
             {"tag_name": "v0.2.0-rc1", "prerelease": true, "html_url": "https://x/rc"},
             {"tag_name": "v0.1.99", "draft": true, "html_url": "https://x/draft"},
             {"tag_name": "v0.1.14", "prerelease": false, "html_url": "https://x/14"},
-            {"tag_name": "v0.1.16", "prerelease": false, "html_url": "https://x/16"},
+            {"tag_name": "v0.1.17", "prerelease": false, "html_url": "https://x/17"},
             {"tag_name": "not-a-version", "prerelease": false, "html_url": "https://x/bad"}
         ]);
 
         let info = release_info(&releases).expect("stable release found");
 
-        assert_eq!(info.tag, "v0.1.16");
-        assert_eq!(info.url, "https://x/16");
-        assert!(info.newer, "0.1.16 outranks the running 0.1.15-rc1");
+        assert_eq!(info.tag, "v0.1.17");
+        assert_eq!(info.url, "https://x/17");
+        assert!(info.newer, "0.1.17 outranks the running release");
         assert_eq!(release_info(&serde_json::json!([])), None);
     }
 }
