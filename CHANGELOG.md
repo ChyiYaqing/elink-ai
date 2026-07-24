@@ -6,6 +6,20 @@ and `Removed`.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## 0.1.17-rc1
+
+### Changed
+
+- The macOS Agent Sessions card now starts collapsed and can be expanded or
+  collapsed from its header
+
+### Fixed
+
+- The menu-bar panel now stays anchored below its status item and keeps its
+  header and footer visible when dashboard content exceeds the screen height
+- Usage-statistics range controls now remain inside the card at narrow widths
+  and with English labels
+
 ## 0.1.16
 
 ### Added

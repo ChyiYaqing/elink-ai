@@ -231,7 +231,7 @@ mod tests {
 
         assert_eq!(info.tag, "v0.1.17");
         assert_eq!(info.url, "https://x/17");
-        assert!(info.newer, "0.1.17 outranks the running release");
+        assert!(info.newer, "0.1.17 outranks the running release candidate");
         assert_eq!(release_info(&serde_json::json!([])), None);
     }
 }
