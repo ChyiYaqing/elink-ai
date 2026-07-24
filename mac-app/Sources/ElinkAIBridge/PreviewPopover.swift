@@ -168,6 +168,10 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
         model.settingsMessage = nil
         model.launchAtLogin = LaunchAtLogin.isEnabled()
         model.agentSessionsEnabled = AgentSessionMonitor.isEnabled
+        let visibleHeight = button.window?.screen?.visibleFrame.height
+            ?? NSScreen.main?.visibleFrame.height
+            ?? 724
+        model.panelMaxHeight = max(320, visibleHeight - 24)
         updater.checkAutomaticallyIfNeeded()
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         // .accessory 应用弹出时未被激活，transient 不会因外部点击自动关闭，需手动监听

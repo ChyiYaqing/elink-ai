@@ -75,6 +75,83 @@ final class UsagePanelViewTests: XCTestCase {
     }
 
     @MainActor
+    func testAgentSessionsCardDefaultsCollapsedAndExpandedRowsIncreaseHeight() {
+        let session = AgentSession(
+            id: "session-1",
+            kind: .claude,
+            title: "elink-ai",
+            snippet: "修复弹窗布局",
+            model: "claude-opus",
+            lastModified: Date()
+        )
+
+        func height(initiallyExpanded: Bool = false) -> CGFloat {
+            let host = NSHostingView(rootView: AgentSessionsCard(
+                sessions: [session],
+                theme: PanelTheme(.light),
+                initiallyExpanded: initiallyExpanded
+            ))
+            host.frame = NSRect(x: 0, y: 0, width: 408, height: 1)
+            host.layoutSubtreeIfNeeded()
+            return host.fittingSize.height
+        }
+
+        XCTAssertGreaterThan(height(initiallyExpanded: true), height())
+    }
+
+    @MainActor
+    func testDashboardHeightIsCappedAndMainContentScrolls() {
+        let path = NSTemporaryDirectory() + "elink-panel-\(UUID().uuidString).db"
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let store = UsageStore(path: path)
+        let cluster = ClusterManager(store: store, credentials: ClusterCredentials(
+            nodeID: "local-node",
+            nodeName: "Local Mac",
+            clusterID: nil,
+            clusterSecret: nil,
+            timezone: nil
+        ))
+        let model = PanelModel()
+        model.panelMaxHeight = 320
+        let view = UsagePanelView(
+            model: model,
+            updater: UpdateChecker(currentVersion: "0.1.16"),
+            cluster: cluster
+        )
+        let host = NSHostingView(rootView: view)
+        let size = host.fittingSize
+        host.frame = NSRect(origin: .zero, size: size)
+        host.layoutSubtreeIfNeeded()
+
+        XCTAssertLessThanOrEqual(size.height, 320)
+        XCTAssertTrue(host.descendants.contains { $0 is NSScrollView })
+    }
+
+    @MainActor
+    func testEnglishStatsRangePickerFitsNarrowCard() throws {
+        UserDefaults.standard.set(AppLanguage.english.rawValue, forKey: AppLanguage.defaultsKey)
+        let view = UsageStatsView(
+            provider: "codex",
+            title: "Codex",
+            pet: PixelPet.codex,
+            accent: PanelTheme.codexColor(dark: false),
+            theme: PanelTheme(.light),
+            clusterNodes: [],
+            onBack: {}
+        )
+        let host = NSHostingView(rootView: view)
+        host.frame = NSRect(x: 0, y: 0, width: 384, height: 500)
+        host.layoutSubtreeIfNeeded()
+
+        let picker = try XCTUnwrap(
+            host.descendants.compactMap { $0 as? NSSegmentedControl }.first
+        )
+        let pickerFrame = host.convert(picker.bounds, from: picker)
+        XCTAssertGreaterThanOrEqual(pickerFrame.minX, host.bounds.minX)
+        XCTAssertLessThanOrEqual(pickerFrame.maxX, host.bounds.maxX)
+    }
+
+    @MainActor
     func testScreenConnectionSettingsAreCollapsedByDefault() {
         XCTAssertFalse(deviceSettingsPlaceholders(
             enabled: true,

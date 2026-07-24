@@ -5,27 +5,52 @@ import SwiftUI
 struct AgentSessionsCard: View {
     let sessions: [AgentSession]
     let theme: PanelTheme
+    @State private var isExpanded = false
     @State private var expandedIDs = Set<String>()
 
     private static let busyColor = Color(red: 0.32, green: 0.58, blue: 0.96)
 
+    init(sessions: [AgentSession], theme: PanelTheme, initiallyExpanded: Bool = false) {
+        self.sessions = sessions
+        self.theme = theme
+        _isExpanded = State(initialValue: initiallyExpanded)
+    }
+
     var body: some View {
         let running = sessions.filter { $0.anyBusy }.count
         VStack(spacing: 10) {
-            HStack(spacing: 6) {
-                Image(systemName: "terminal.fill")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(theme.textSecondary)
-                Text(tr("Agent 会话", "Agent Sessions"))
-                    .font(.system(size: 12, weight: .semibold, design: .rounded))
-                    .foregroundStyle(theme.textPrimary)
-                Spacer()
-                StateBadge(text: running > 0 ? tr("\(running) 运行中", "\(running) working")
-                                             : tr("空闲", "Idle"),
-                           color: running > 0 ? theme.statusHealthy : theme.textTertiary)
+            Button {
+                Log.user("\(isExpanded ? "collapse" : "expand") agent sessions")
+                withAnimation(.easeOut(duration: 0.2)) {
+                    isExpanded.toggle()
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "terminal.fill")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(theme.textSecondary)
+                    Text(tr("Agent 会话", "Agent Sessions"))
+                        .font(.system(size: 12, weight: .semibold, design: .rounded))
+                        .foregroundStyle(theme.textPrimary)
+                    Spacer()
+                    StateBadge(text: running > 0 ? tr("\(running) 运行中", "\(running) working")
+                                                 : tr("空闲", "Idle"),
+                               color: running > 0 ? theme.statusHealthy : theme.textTertiary)
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(theme.textTertiary)
+                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                }
+                .contentShape(Rectangle())
             }
-            ForEach(sessions.prefix(4)) { session in
-                sessionRow(session)
+            .buttonStyle(.plain)
+            .accessibilityLabel(tr("Agent 会话", "Agent Sessions"))
+            .accessibilityValue(isExpanded ? tr("已展开", "Expanded") : tr("已折叠", "Collapsed"))
+            if isExpanded {
+                ForEach(sessions.prefix(4)) { session in
+                    sessionRow(session)
+                }
+                .transition(.opacity)
             }
         }
         .padding(12)

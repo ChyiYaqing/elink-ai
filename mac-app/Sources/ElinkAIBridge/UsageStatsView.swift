@@ -249,20 +249,22 @@ struct UsageStatsView: View {
     }
 
     private var header: some View {
-        HStack(spacing: 8) {
-            PillButton(title: tr("返回", "Back"), icon: "chevron.left", theme: theme, action: onBack)
-            PixelPetView(art: pet, color: accent)
-                .frame(width: 24, height: 17)
-            Text(tr("\(title) 用量统计", "\(title) Usage"))
-                .font(.system(size: 13, weight: .bold, design: .rounded))
-                .foregroundStyle(theme.textPrimary)
-            Spacer()
+        VStack(spacing: 8) {
+            HStack(spacing: 8) {
+                PillButton(title: tr("返回", "Back"), icon: "chevron.left", theme: theme, action: onBack)
+                PixelPetView(art: pet, color: accent)
+                    .frame(width: 24, height: 17)
+                Text(tr("\(title) 用量统计", "\(title) Usage"))
+                    .font(.system(size: 13, weight: .bold, design: .rounded))
+                    .foregroundStyle(theme.textPrimary)
+                Spacer()
+            }
             Picker("", selection: $range) {
                 ForEach(StatsRange.allCases, id: \.self) { Text($0.title).tag($0) }
             }
             .pickerStyle(.segmented)
             .labelsHidden()
-            .frame(width: 160)
+            .frame(maxWidth: .infinity)
         }
     }
 

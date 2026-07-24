@@ -22,6 +22,7 @@ final class PanelModel: ObservableObject {
     @Published var agentSessions: [AgentSession] = []
     @Published var agentSessionsEnabled = true
     @Published var language: AppLanguage = AppLanguage.current
+    @Published var panelMaxHeight: CGFloat = 700
 
     var onSetMode: ((String) -> Void)?
     var onDeviceRefresh: ((String) -> Void)?
@@ -65,29 +66,32 @@ struct UsagePanelView: View {
             header(theme)
             // 设置页作为覆盖层，保持面板尺寸稳定，避免弹窗因高度突变而跳位
             ZStack(alignment: .top) {
-                VStack(spacing: 12) {
-                    // fixedSize 让 HStack 取最高卡片的高度，两张卡片再撑满对齐
-                    HStack(alignment: .top, spacing: 10) {
-                        ProviderCard(name: "Claude", pet: PixelPet.claude,
-                                     accent: PanelTheme.claudeColor(dark: theme.dark),
-                                     status: model.claude, theme: theme) {
-                            Log.user("open Claude usage statistics")
-                            withAnimation(.easeOut(duration: 0.2)) { model.statsProvider = "claude" }
+                ScrollView(.vertical, showsIndicators: false) {
+                    VStack(spacing: 12) {
+                        // fixedSize 让 HStack 取最高卡片的高度，两张卡片再撑满对齐
+                        HStack(alignment: .top, spacing: 10) {
+                            ProviderCard(name: "Claude", pet: PixelPet.claude,
+                                         accent: PanelTheme.claudeColor(dark: theme.dark),
+                                         status: model.claude, theme: theme) {
+                                Log.user("open Claude usage statistics")
+                                withAnimation(.easeOut(duration: 0.2)) { model.statsProvider = "claude" }
+                            }
+                            ProviderCard(name: "Codex", pet: PixelPet.codex,
+                                         accent: PanelTheme.codexColor(dark: theme.dark),
+                                         status: model.codex, theme: theme) {
+                                Log.user("open Codex usage statistics")
+                                withAnimation(.easeOut(duration: 0.2)) { model.statsProvider = "codex" }
+                            }
                         }
-                        ProviderCard(name: "Codex", pet: PixelPet.codex,
-                                     accent: PanelTheme.codexColor(dark: theme.dark),
-                                     status: model.codex, theme: theme) {
-                            Log.user("open Codex usage statistics")
-                            withAnimation(.easeOut(duration: 0.2)) { model.statsProvider = "codex" }
+                        .fixedSize(horizontal: false, vertical: true)
+                        if model.agentSessionsEnabled && !model.agentSessions.isEmpty {
+                            AgentSessionsCard(sessions: model.agentSessions, theme: theme)
+                        }
+                        if model.deviceConnectionEnabled || model.showSettings || model.statsProvider != nil {
+                            deviceCard(theme)
                         }
                     }
-                    .fixedSize(horizontal: false, vertical: true)
-                    if model.agentSessionsEnabled && !model.agentSessions.isEmpty {
-                        AgentSessionsCard(sessions: model.agentSessions, theme: theme)
-                    }
-                    if model.deviceConnectionEnabled || model.showSettings || model.statsProvider != nil {
-                        deviceCard(theme)
-                    }
+                    .frame(maxWidth: .infinity)
                 }
                 .opacity(model.showSettings || model.statsProvider != nil ? 0 : 1)
                 .allowsHitTesting(!model.showSettings && model.statsProvider == nil)
@@ -103,6 +107,7 @@ struct UsagePanelView: View {
         }
         .padding(16)
         .frame(width: 440)
+        .frame(maxHeight: model.panelMaxHeight)
         .background(theme.backgroundGradient)
     }
 
