@@ -5,6 +5,17 @@ import XCTest
 @testable import ElinkAIBridge
 
 final class UsagePanelViewTests: XCTestCase {
+    // 断言依赖中文文案；语言默认跟随系统，这里固定为中文保证在英文系统的 CI 上稳定
+    override func setUp() {
+        super.setUp()
+        UserDefaults.standard.set(AppLanguage.chinese.rawValue, forKey: AppLanguage.defaultsKey)
+    }
+
+    override func tearDown() {
+        UserDefaults.standard.removeObject(forKey: AppLanguage.defaultsKey)
+        super.tearDown()
+    }
+
     func testClusterFeedbackFollowsCurrentBackgroundSyncState() {
         let failure = "同步失败：节点认证失败"
 

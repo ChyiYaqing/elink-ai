@@ -6,19 +6,19 @@ enum StatsRange: String, CaseIterable {
 
     var title: String {
         switch self {
-        case .day: return "日"
-        case .week: return "周"
-        case .month: return "月"
-        case .year: return "年"
+        case .day: return tr("日", "Day")
+        case .week: return tr("周", "Week")
+        case .month: return tr("月", "Month")
+        case .year: return tr("年", "Year")
         }
     }
 
     var summaryTitle: String {
         switch self {
-        case .day: return "今日"
-        case .week: return "近 7 天"
-        case .month: return "近 30 天"
-        case .year: return "近 12 个月"
+        case .day: return tr("今日", "Today")
+        case .week: return tr("近 7 天", "Last 7 days")
+        case .month: return tr("近 30 天", "Last 30 days")
+        case .year: return tr("近 12 个月", "Last 12 months")
         }
     }
 }
@@ -67,7 +67,10 @@ enum UsageStats {
             return (0..<12).reversed().map { offset in
                 let date = calendar.date(byAdding: .month, value: -offset, to: now) ?? now
                 let key = String(StatusService.dayKey(date).prefix(7))
-                let label = "\(calendar.component(.month, from: date))月"
+                let month = calendar.component(.month, from: date)
+                let label = tr("\(month)月",
+                    ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                     "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][month - 1])
                 return StatsBucket(id: key, label: label, models: byMonth[key] ?? [:])
             }
         }
@@ -102,7 +105,7 @@ enum UsageStats {
             byHour[row.hour, default: [:]][row.model, default: 0] += row.tokens
         }
         return (0..<24).map { hour in
-            StatsBucket(id: String(format: "%02d", hour), label: "\(hour)时",
+            StatsBucket(id: String(format: "%02d", hour), label: tr("\(hour)时", "\(hour)"),
                         models: byHour[hour] ?? [:])
         }
     }
@@ -120,13 +123,15 @@ enum UsageStats {
 
     /// Token 分类的展示顺序、中文名与配色（参考 Input 蓝 / Output 绿 /
     /// Cache Read 紫 / Cache Write 橙 / Reasoning 红的通用惯例）
-    static let categoryOrder: [(key: String, label: String, color: Color)] = [
-        ("input", "输入", Color(red: 0.36, green: 0.62, blue: 0.98)),
-        ("output", "输出", Color(red: 0.30, green: 0.76, blue: 0.55)),
-        ("cache_read", "缓存读取", Color(red: 0.78, green: 0.38, blue: 0.92)),
-        ("cache_write", "缓存写入", Color(red: 0.95, green: 0.60, blue: 0.25)),
-        ("reasoning", "推理", Color(red: 0.98, green: 0.38, blue: 0.45)),
-    ]
+    static var categoryOrder: [(key: String, label: String, color: Color)] {
+        [
+            ("input", tr("输入", "Input"), Color(red: 0.36, green: 0.62, blue: 0.98)),
+            ("output", tr("输出", "Output"), Color(red: 0.30, green: 0.76, blue: 0.55)),
+            ("cache_read", tr("缓存读取", "Cache Read"), Color(red: 0.78, green: 0.38, blue: 0.92)),
+            ("cache_write", tr("缓存写入", "Cache Write"), Color(red: 0.95, green: 0.60, blue: 0.25)),
+            ("reasoning", tr("推理", "Reasoning"), Color(red: 0.98, green: 0.38, blue: 0.45)),
+        ]
+    }
 
     /// 当前范围窗口内的 token 分类总量；分类数据仅本机、按天累积
     static func categoryTotals(rows: [DailyCategoryUsage], range: StatsRange,
@@ -245,10 +250,10 @@ struct UsageStatsView: View {
 
     private var header: some View {
         HStack(spacing: 8) {
-            PillButton(title: "返回", icon: "chevron.left", theme: theme, action: onBack)
+            PillButton(title: tr("返回", "Back"), icon: "chevron.left", theme: theme, action: onBack)
             PixelPetView(art: pet, color: accent)
                 .frame(width: 24, height: 17)
-            Text("\(title) 用量统计")
+            Text(tr("\(title) 用量统计", "\(title) Usage"))
                 .font(.system(size: 13, weight: .bold, design: .rounded))
                 .foregroundStyle(theme.textPrimary)
             Spacer()
@@ -266,12 +271,12 @@ struct UsageStatsView: View {
             Image(systemName: "laptopcomputer.and.arrow.down")
                 .font(.system(size: 9, weight: .semibold))
                 .foregroundStyle(theme.textTertiary)
-            Text("数据来源")
+            Text(tr("数据来源", "Data Source"))
                 .font(.system(size: 9, weight: .medium))
                 .foregroundStyle(theme.textSecondary)
             Spacer()
-            Picker("数据来源", selection: $selectedNodeID) {
-                Text("全部主机").tag("")
+            Picker(tr("数据来源", "Data Source"), selection: $selectedNodeID) {
+                Text(tr("全部主机", "All Macs")).tag("")
                 ForEach(clusterNodes) { node in
                     Text(node.name).tag(node.nodeID)
                 }
@@ -286,10 +291,12 @@ struct UsageStatsView: View {
             Image(systemName: "chart.bar")
                 .font(.system(size: 22))
                 .foregroundStyle(theme.textTertiary)
-            Text(loaded ? "暂无\(title)历史用量" : "正在读取用量数据…")
+            Text(loaded ? tr("暂无\(title)历史用量", "No \(title) usage history yet")
+                        : tr("正在读取用量数据…", "Loading usage data…"))
                 .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(theme.textSecondary)
-            Text("每日各模型的 token 用量会自动写入本地数据库")
+            Text(tr("每日各模型的 token 用量会自动写入本地数据库",
+                    "Daily per-model token usage is saved to a local database automatically"))
                 .font(.system(size: 9))
                 .foregroundStyle(theme.textTertiary)
         }
@@ -302,12 +309,13 @@ struct UsageStatsView: View {
         let spacing: CGFloat = (range == .month || range == .day) ? 2 : 4
         return VStack(spacing: 4) {
             HStack {
-                Text("\(range.summaryTitle) · 共 \(UsageFormat.tokens(buckets.reduce(0) { $0 + $1.total })) tokens")
+                Text(tr("\(range.summaryTitle) · 共 \(UsageFormat.tokens(buckets.reduce(0) { $0 + $1.total })) tokens",
+                        "\(range.summaryTitle) · \(UsageFormat.tokens(buckets.reduce(0) { $0 + $1.total })) tokens total"))
                     .font(.system(size: 9, weight: .medium))
                     .foregroundStyle(theme.textSecondary)
                 Spacer()
                 if maxTotal > 0 {
-                    Text("峰值 \(UsageFormat.tokens(maxTotal))")
+                    Text(tr("峰值 \(UsageFormat.tokens(maxTotal))", "Peak \(UsageFormat.tokens(maxTotal))"))
                         .font(.system(size: 9, weight: .medium))
                         .foregroundStyle(theme.textTertiary)
                 }
@@ -396,13 +404,14 @@ struct UsageStatsView: View {
         }
         let total = models.values.reduce(0, +)
         let heading = selected.map { "\($0.label) · \(UsageFormat.tokens($0.total)) tokens" }
-            ?? "\(range.summaryTitle)模型占比 · 悬停柱状图看明细"
+            ?? tr("\(range.summaryTitle)模型占比 · 悬停柱状图看明细",
+                  "\(range.summaryTitle) model share · hover bars for details")
         return VStack(alignment: .leading, spacing: 5) {
             Text(heading)
                 .font(.system(size: 9, weight: .semibold))
                 .foregroundStyle(theme.textSecondary)
             if total == 0 {
-                Text("该时段无用量")
+                Text(tr("该时段无用量", "No usage in this period"))
                     .font(.system(size: 9))
                     .foregroundStyle(theme.textTertiary)
             }
@@ -441,7 +450,7 @@ struct UsageStatsView: View {
         let total = entries.reduce(0) { $0 + $1.tokens }
         if total > 0 {
             VStack(alignment: .leading, spacing: 6) {
-                Text("\(range.summaryTitle) Token 分类")
+                Text(tr("\(range.summaryTitle) Token 分类", "\(range.summaryTitle) token categories"))
                     .font(.system(size: 9, weight: .semibold))
                     .foregroundStyle(theme.textSecondary)
                 GeometryReader { geo in
@@ -487,7 +496,8 @@ struct UsageStatsView: View {
     /// 悬停某个桶时标题跟随该桶，与 detail 的标题口径一致
     private func deviceHeading(_ buckets: [StatsBucket]) -> String {
         let hovered = hoveredBucket.flatMap { id in buckets.first { $0.id == id } }
-        return hovered.map { "\($0.label) 设备占比" } ?? "\(range.summaryTitle)设备占比"
+        return hovered.map { tr("\($0.label) 设备占比", "\($0.label) device share") }
+            ?? tr("\(range.summaryTitle)设备占比", "\(range.summaryTitle) device share")
     }
 
     private func deviceSection(devices: [DeviceUsage], order: [String],
@@ -498,7 +508,7 @@ struct UsageStatsView: View {
                 .font(.system(size: 9, weight: .semibold))
                 .foregroundStyle(theme.textSecondary)
             if devices.isEmpty {
-                Text("该时段无用量")
+                Text(tr("该时段无用量", "No usage in this period"))
                     .font(.system(size: 9))
                     .foregroundStyle(theme.textTertiary)
             }
@@ -572,8 +582,9 @@ struct UsageStatsView: View {
     }
 
     private func deviceName(_ nodeID: String?) -> String {
-        guard let nodeID else { return "本机" }
-        return clusterNodes.first { $0.nodeID == nodeID }?.name ?? "未知设备 \(nodeID.prefix(8))"
+        guard let nodeID else { return tr("本机", "This Mac") }
+        return clusterNodes.first { $0.nodeID == nodeID }?.name
+            ?? tr("未知设备 \(nodeID.prefix(8))", "Unknown device \(nodeID.prefix(8))")
     }
 
     static func percentText(_ tokens: Int, of total: Int) -> String {

@@ -49,7 +49,7 @@ final class DeviceClient {
         get(path: "v1/device") { result in
             completion(result.flatMap { data in
                 guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                    return .failure(BridgeError.message("设备响应不是 JSON"))
+                    return .failure(BridgeError.message(tr("设备响应不是 JSON", "Device response is not JSON")))
                 }
                 do { return .success(try DeviceInfo(json: json)) }
                 catch { return .failure(error) }
@@ -109,7 +109,7 @@ final class DeviceClient {
                 return
             }
             let candidate = candidates.removeFirst()
-            progress("验证 \(candidate)…")
+            progress(tr("验证 \(candidate)…", "Verifying \(candidate)…"))
             verify(candidate) { ok in
                 guard isEnabled else { completion(nil); return }
                 if ok { host = candidate; completion(candidate) } else { next() }
@@ -126,7 +126,7 @@ final class DeviceClient {
             return
         }
         let prefix = local[..<dot]
-        progress("扫描 \(prefix).1–254…")
+        progress(tr("扫描 \(prefix).1–254…", "Scanning \(prefix).1–254…"))
         let group = DispatchGroup(), lock = NSLock(), limit = DispatchSemaphore(value: 32)
         var found: String?
         DispatchQueue.global(qos: .utility).async {
@@ -231,7 +231,7 @@ final class DeviceClient {
     private static func get(path: String, completion: @escaping (Result<Data, Error>) -> Void) {
         guard let base = baseURL else {
             Log.warning("request GET \(path) failed: device address is not configured", category: "device")
-            completion(.failure(BridgeError.message("未设置设备地址")))
+            completion(.failure(BridgeError.message(tr("未设置设备地址", "Device address not set"))))
             return
         }
         let url = base.appendingPathComponent(path)
@@ -243,7 +243,7 @@ final class DeviceClient {
             if let error { result = .failure(error) }
             else if let data, let response = response as? HTTPURLResponse,
                     (200...299).contains(response.statusCode) { result = .success(data) }
-            else { result = .failure(BridgeError.message("设备响应失败")) }
+            else { result = .failure(BridgeError.message(tr("设备响应失败", "Device request failed"))) }
             Log.device(responseLog(
                 method: "GET", url: url, response: response, data: data,
                 error: error, startedAt: startedAt
@@ -256,7 +256,7 @@ final class DeviceClient {
                              completion: @escaping (Error?) -> Void) {
         guard let base = baseURL else {
             Log.warning("request \(method) \(path) failed: device address is not configured", category: "device")
-            completion(BridgeError.message("未设置设备地址"))
+            completion(BridgeError.message(tr("未设置设备地址", "Device address not set")))
             return
         }
         let url = base.appendingPathComponent(path)

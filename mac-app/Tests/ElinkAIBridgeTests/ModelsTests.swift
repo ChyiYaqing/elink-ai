@@ -3,6 +3,27 @@ import SQLite3
 @testable import ElinkAIBridge
 
 final class ModelsTests: XCTestCase {
+    // 部分断言依赖中文文案；语言默认跟随系统，这里固定为中文保证在英文系统的 CI 上稳定
+    override func setUp() {
+        super.setUp()
+        UserDefaults.standard.set(AppLanguage.chinese.rawValue, forKey: AppLanguage.defaultsKey)
+    }
+
+    override func tearDown() {
+        UserDefaults.standard.removeObject(forKey: AppLanguage.defaultsKey)
+        super.tearDown()
+    }
+
+    func testAppLanguageSelectionDrivesTr() {
+        UserDefaults.standard.set(AppLanguage.english.rawValue, forKey: AppLanguage.defaultsKey)
+        XCTAssertEqual(AppLanguage.current, .english)
+        XCTAssertEqual(tr("中文文案", "English copy"), "English copy")
+
+        UserDefaults.standard.set(AppLanguage.chinese.rawValue, forKey: AppLanguage.defaultsKey)
+        XCTAssertEqual(AppLanguage.current, .chinese)
+        XCTAssertEqual(tr("中文文案", "English copy"), "中文文案")
+    }
+
     func testSnapshotHasVersionedShape() throws {
         var snapshot = BridgeSnapshot()
         snapshot.claude.state = "working"

@@ -16,11 +16,12 @@ struct AgentSessionsCard: View {
                 Image(systemName: "terminal.fill")
                     .font(.system(size: 10, weight: .semibold))
                     .foregroundStyle(theme.textSecondary)
-                Text("Agent 会话")
+                Text(tr("Agent 会话", "Agent Sessions"))
                     .font(.system(size: 12, weight: .semibold, design: .rounded))
                     .foregroundStyle(theme.textPrimary)
                 Spacer()
-                StateBadge(text: running > 0 ? "\(running) 运行中" : "空闲",
+                StateBadge(text: running > 0 ? tr("\(running) 运行中", "\(running) working")
+                                             : tr("空闲", "Idle"),
                            color: running > 0 ? theme.statusHealthy : theme.textTertiary)
             }
             ForEach(sessions.prefix(4)) { session in
@@ -62,7 +63,8 @@ struct AgentSessionsCard: View {
                         }
                     }
                 } label: {
-                    Text("\(expandedIDs.contains(session.id) ? "▾" : "▸") \(session.children.count) 个子任务")
+                    Text(tr("\(expandedIDs.contains(session.id) ? "▾" : "▸") \(session.children.count) 个子任务",
+                            "\(expandedIDs.contains(session.id) ? "▾" : "▸") \(session.children.count) subtasks"))
                         .font(.system(size: 10, weight: .medium, design: .monospaced))
                         .foregroundStyle(theme.textTertiary)
                 }

@@ -44,6 +44,17 @@ private final class JoinURLProtocolStub: URLProtocol {
 }
 
 final class ClusterTests: XCTestCase {
+    // 断言依赖中文文案；语言默认跟随系统，这里固定为中文保证在英文系统的 CI 上稳定
+    override func setUp() {
+        super.setUp()
+        UserDefaults.standard.set(AppLanguage.chinese.rawValue, forKey: AppLanguage.defaultsKey)
+    }
+
+    override func tearDown() {
+        UserDefaults.standard.removeObject(forKey: AppLanguage.defaultsKey)
+        super.tearDown()
+    }
+
     private func store(_ name: String = UUID().uuidString) -> (UsageStore, String) {
         let path = NSTemporaryDirectory() + "elink-cluster-\(name).db"
         try? FileManager.default.removeItem(atPath: path)

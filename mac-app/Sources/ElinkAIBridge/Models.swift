@@ -107,7 +107,7 @@ struct DeviceInfo {
 
     init(json: [String: Any]) throws {
         guard json["device_type"] as? String == "elink-agent" else {
-            throw BridgeError.message("目标不是 elink-agent")
+            throw BridgeError.message(tr("目标不是 elink-agent", "Target is not an elink-agent"))
         }
         deviceType = "elink-agent"
         version = (json["version"] as? String).flatMap { $0.isEmpty ? nil : $0 }
@@ -125,6 +125,6 @@ enum BridgeError: LocalizedError {
     case message(String)
     var errorDescription: String? {
         if case let .message(value) = self { return value }
-        return "未知错误"
+        return tr("未知错误", "Unknown error")
     }
 }

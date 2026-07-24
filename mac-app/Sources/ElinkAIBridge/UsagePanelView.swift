@@ -4,10 +4,10 @@ import SwiftUI
 final class PanelModel: ObservableObject {
     @Published var claude = AgentStatus()
     @Published var codex = AgentStatus()
-    @Published var updatedText = "用量更新中…"
+    @Published var updatedText = tr("用量更新中…", "Updating usage…")
     @Published var previewImage: NSImage?
-    @Published var deviceSummary = "正在连接设备…"
-    @Published var deviceBadge = "连接中"
+    @Published var deviceSummary = tr("正在连接设备…", "Connecting to device…")
+    @Published var deviceBadge = tr("连接中", "Connecting")
     @Published var deviceHealthy = false
     @Published var mode = "dashboard"
     @Published var busy = false
@@ -21,6 +21,7 @@ final class PanelModel: ObservableObject {
     @Published var settingsMessage: String?
     @Published var agentSessions: [AgentSession] = []
     @Published var agentSessionsEnabled = true
+    @Published var language: AppLanguage = AppLanguage.current
 
     var onSetMode: ((String) -> Void)?
     var onDeviceRefresh: ((String) -> Void)?
@@ -129,12 +130,13 @@ struct UsagePanelView: View {
             Spacer()
             if cluster.enabled {
                 StateBadge(
-                    text: "\(max(1, cluster.nodes.filter { $0.isOnline() }.count))/\(max(1, cluster.nodes.count)) 台",
+                    text: tr("\(max(1, cluster.nodes.filter { $0.isOnline() }.count))/\(max(1, cluster.nodes.count)) 台",
+                             "\(max(1, cluster.nodes.filter { $0.isOnline() }.count))/\(max(1, cluster.nodes.count)) Macs"),
                     color: cluster.nodes.allSatisfy { $0.isOnline() }
                         ? theme.statusHealthy : theme.statusWarning
                 )
             }
-            PillButton(title: model.refreshingUsage ? "刷新中" : "刷新",
+            PillButton(title: model.refreshingUsage ? tr("刷新中", "Refreshing") : tr("刷新", "Refresh"),
                        icon: "arrow.clockwise", theme: theme) {
                 model.onRefreshAll?()
             }
@@ -148,7 +150,7 @@ struct UsagePanelView: View {
                 Image(systemName: "display")
                     .font(.system(size: 10, weight: .semibold))
                     .foregroundStyle(theme.textSecondary)
-                Text("电子纸屏幕")
+                Text(tr("电子纸屏幕", "E-Paper Screen"))
                     .font(.system(size: 12, weight: .semibold, design: .rounded))
                     .foregroundStyle(theme.textPrimary)
                 Spacer()
@@ -166,7 +168,7 @@ struct UsagePanelView: View {
                     .fill(theme.progressTrack)
                     .frame(height: 140)
                     .overlay(
-                        Text("等待设备画面…")
+                        Text(tr("等待设备画面…", "Waiting for device screen…"))
                             .font(.system(size: 10))
                             .foregroundStyle(theme.textTertiary)
                     )
@@ -176,7 +178,7 @@ struct UsagePanelView: View {
                     get: { model.mode },
                     set: { model.mode = $0; model.onSetMode?($0) }
                 )) {
-                    Text("双栏").tag("dashboard")
+                    Text(tr("双栏", "Dual")).tag("dashboard")
                     Text("Claude").tag("claude")
                     Text("Codex").tag("codex")
                 }
@@ -184,10 +186,10 @@ struct UsagePanelView: View {
                 .labelsHidden()
                 .frame(width: 180)
                 Spacer()
-                PillButton(title: "智能刷新", icon: "wand.and.stars", theme: theme) {
+                PillButton(title: tr("智能刷新", "Smart Refresh"), icon: "wand.and.stars", theme: theme) {
                     model.onDeviceRefresh?("smart")
                 }
-                PillButton(title: "完整刷新", icon: "arrow.triangle.2.circlepath", theme: theme) {
+                PillButton(title: tr("完整刷新", "Full Refresh"), icon: "arrow.triangle.2.circlepath", theme: theme) {
                     model.onDeviceRefresh?("full")
                 }
             }
@@ -224,11 +226,11 @@ struct UsagePanelView: View {
     private func settingsCard(_ theme: PanelTheme) -> some View {
         VStack(spacing: 10) {
             ZStack {
-                Text("设置")
+                Text(tr("设置", "Settings"))
                     .font(.system(size: 14, weight: .bold, design: .rounded))
                     .foregroundStyle(theme.textPrimary)
                 HStack {
-                    PillButton(title: "返回", icon: "chevron.left", theme: theme) {
+                    PillButton(title: tr("返回", "Back"), icon: "chevron.left", theme: theme) {
                         Log.user("close settings")
                         withAnimation(.easeOut(duration: 0.2)) { model.showSettings = false }
                     }
@@ -239,6 +241,7 @@ struct UsagePanelView: View {
                 VStack(spacing: 10) {
                     deviceSettings(theme)
                     launchSettings(theme)
+                    languageSettings(theme)
                     agentSessionsSettings(theme)
                     clusterSettings(theme)
                     logSettings(theme)
@@ -269,17 +272,17 @@ struct UsagePanelView: View {
                         theme,
                         icon: "display",
                         color: Color(red: 0.35, green: 0.60, blue: 0.95),
-                        title: "屏幕连接",
+                        title: tr("屏幕连接", "Screen Connection"),
                         subtitle: model.deviceConnectionEnabled
-                            ? "树莓派电子纸的地址与配对"
-                            : "已关闭 · 本机仅采集与同步用量",
+                            ? tr("树莓派电子纸的地址与配对", "Raspberry Pi e-paper address and pairing")
+                            : tr("已关闭 · 本机仅采集与同步用量", "Off · this Mac only collects and syncs usage"),
                         expanded: deviceSettingsExpanded
                     )
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .disabled(!model.deviceConnectionEnabled)
-                .accessibilityValue(deviceSettingsExpanded ? "已展开" : "已折叠")
+                .accessibilityValue(deviceSettingsExpanded ? tr("已展开", "Expanded") : tr("已折叠", "Collapsed"))
                 Toggle("", isOn: Binding(
                     get: { model.deviceConnectionEnabled },
                     set: { enabled in
@@ -295,35 +298,35 @@ struct UsagePanelView: View {
                 .tint(theme.statusHealthy)
                 .scaleEffect(0.78)
                 .labelsHidden()
-                .accessibilityLabel("屏幕连接")
+                .accessibilityLabel(tr("屏幕连接", "Screen Connection"))
                 .accessibilityHint(model.deviceConnectionEnabled
-                    ? "关闭电子纸设备发现、轮询与刷新"
-                    : "开启电子纸设备连接")
+                    ? tr("关闭电子纸设备发现、轮询与刷新", "Turn off e-paper device discovery, polling and refresh")
+                    : tr("开启电子纸设备连接", "Turn on e-paper device connection"))
             }
 
             if model.deviceConnectionEnabled && deviceSettingsExpanded {
                 VStack(alignment: .leading, spacing: 8) {
                     HStack(spacing: 8) {
-                        TextField("例如 192.168.1.50:8766", text: $model.deviceHost)
+                        TextField(tr("例如 192.168.1.50:8766", "e.g. 192.168.1.50:8766"), text: $model.deviceHost)
                             .textFieldStyle(.roundedBorder)
                             .font(.system(size: 11, design: .monospaced))
-                        PillButton(title: "保存", icon: "checkmark", theme: theme) {
+                        PillButton(title: tr("保存", "Save"), icon: "checkmark", theme: theme) {
                             model.onSaveHost?(model.deviceHost)
                         }
                     }
                     HStack(spacing: 8) {
-                        PillButton(title: "自动配对屏幕", icon: "antenna.radiowaves.left.and.right", theme: theme) {
+                        PillButton(title: tr("自动配对屏幕", "Auto-Pair Screen"), icon: "antenna.radiowaves.left.and.right", theme: theme) {
                             model.onAutoPair?()
                         }
-                        PillButton(title: "设为数据桥接", icon: "point.3.connected.trianglepath.dotted", theme: theme) {
+                        PillButton(title: tr("设为数据桥接", "Set as Data Bridge"), icon: "point.3.connected.trianglepath.dotted", theme: theme) {
                             model.onPointHere?()
                         }
-                        PillButton(title: "设备状态页", icon: "safari", theme: theme) {
+                        PillButton(title: tr("设备状态页", "Device Status Page"), icon: "safari", theme: theme) {
                             model.onOpenDeviceStatus?()
                         }
                     }
                     .disabled(model.busy)
-                    Text("桥接服务：\(model.bridgeAddress)")
+                    Text(tr("桥接服务：\(model.bridgeAddress)", "Bridge service: \(model.bridgeAddress)"))
                         .font(.system(size: 9, weight: .medium, design: .monospaced))
                         .foregroundStyle(theme.textTertiary)
                         .textSelection(.enabled)
@@ -339,7 +342,8 @@ struct UsagePanelView: View {
     private func launchSettings(_ theme: PanelTheme) -> some View {
         HStack(spacing: 8) {
             settingsHeader(theme, icon: "power", color: theme.statusHealthy,
-                           title: "开机自启动", subtitle: "登录 macOS 时自动启动 Elink AI")
+                           title: tr("开机自启动", "Launch at Login"),
+                           subtitle: tr("登录 macOS 时自动启动 Elink AI", "Launch Elink AI automatically when you log in to macOS"))
             Toggle("", isOn: Binding(
                 get: { model.launchAtLogin },
                 set: { enabled in
@@ -349,7 +353,8 @@ struct UsagePanelView: View {
                         Log.user("launch at login \(enabled ? "enabled" : "disabled")")
                     } catch {
                         Log.warning("set launch at login failed: \(error.localizedDescription)", category: "user")
-                        model.settingsMessage = "设置开机自启动失败：\(error.localizedDescription)"
+                        model.settingsMessage = tr("设置开机自启动失败：\(error.localizedDescription)",
+                                                   "Failed to set launch at login: \(error.localizedDescription)")
                     }
                 }
             ))
@@ -357,7 +362,32 @@ struct UsagePanelView: View {
             .tint(theme.statusHealthy)
             .scaleEffect(0.78)
             .labelsHidden()
-            .accessibilityLabel("开机自启动")
+            .accessibilityLabel(tr("开机自启动", "Launch at Login"))
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .glassCard(theme)
+    }
+
+    private func languageSettings(_ theme: PanelTheme) -> some View {
+        HStack(spacing: 8) {
+            settingsHeader(theme, icon: "globe",
+                           color: Color(red: 0.28, green: 0.66, blue: 0.62),
+                           title: tr("语言", "Language"),
+                           subtitle: tr("界面显示语言", "Interface display language"))
+            Picker("", selection: Binding(
+                get: { model.language },
+                set: { value in
+                    AppLanguage.current = value
+                    model.language = value
+                }
+            )) {
+                Text("中文").tag(AppLanguage.chinese)
+                Text("English").tag(AppLanguage.english)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(width: 140)
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -368,7 +398,9 @@ struct UsagePanelView: View {
         HStack(spacing: 8) {
             settingsHeader(theme, icon: "terminal.fill",
                            color: Color(red: 0.55, green: 0.40, blue: 0.90),
-                           title: "Agent 会话", subtitle: "在面板显示运行中的 Claude Code / Codex 会话")
+                           title: tr("Agent 会话", "Agent Sessions"),
+                           subtitle: tr("在面板显示运行中的 Claude Code / Codex 会话",
+                                        "Show running Claude Code / Codex sessions in the panel"))
             Toggle("", isOn: Binding(
                 get: { model.agentSessionsEnabled },
                 set: { model.onSetAgentSessionsEnabled?($0) }
@@ -377,7 +409,7 @@ struct UsagePanelView: View {
             .tint(theme.statusHealthy)
             .scaleEffect(0.78)
             .labelsHidden()
-            .accessibilityLabel("Agent 会话")
+            .accessibilityLabel(tr("Agent 会话", "Agent Sessions"))
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -395,10 +427,11 @@ struct UsagePanelView: View {
                     theme,
                     icon: "macbook.and.iphone",
                     color: Color(red: 0.32, green: 0.58, blue: 0.96),
-                    title: "多机同步",
+                    title: tr("多机同步", "Multi-Mac Sync"),
                     subtitle: cluster.enabled
-                        ? "\(max(1, cluster.nodes.filter { $0.isOnline() }.count))/\(max(1, cluster.nodes.count)) 台在线"
-                        : "独立模式 · 本机数据不会广播",
+                        ? tr("\(max(1, cluster.nodes.filter { $0.isOnline() }.count))/\(max(1, cluster.nodes.count)) 台在线",
+                             "\(max(1, cluster.nodes.filter { $0.isOnline() }.count))/\(max(1, cluster.nodes.count)) online")
+                        : tr("独立模式 · 本机数据不会广播", "Standalone · this Mac's data isn't broadcast"),
                     expanded: clusterExpanded
                 )
                 .padding(12)
@@ -406,7 +439,7 @@ struct UsagePanelView: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .accessibilityValue(clusterExpanded ? "已展开" : "已折叠")
+            .accessibilityValue(clusterExpanded ? tr("已展开", "Expanded") : tr("已折叠", "Collapsed"))
 
             if clusterExpanded {
                 VStack(alignment: .leading, spacing: 9) {
@@ -424,10 +457,10 @@ struct UsagePanelView: View {
                                     .frame(width: 24, height: 24)
                                     .background(Circle().fill(Color.blue.opacity(theme.dark ? 0.18 : 0.09)))
                                 VStack(alignment: .leading, spacing: 1) {
-                                    Text("在另一台主机输入配对码")
+                                    Text(tr("在另一台主机输入配对码", "Enter the pairing code on another Mac"))
                                         .font(.system(size: 9, weight: .semibold, design: .rounded))
                                         .foregroundStyle(theme.textPrimary)
-                                    Text("两分钟内有效")
+                                    Text(tr("两分钟内有效", "Valid for two minutes"))
                                         .font(.system(size: 8, weight: .medium))
                                         .foregroundStyle(theme.textTertiary)
                                 }
@@ -453,8 +486,10 @@ struct UsagePanelView: View {
                                         .contentShape(Rectangle())
                                 }
                                 .buttonStyle(.plain)
-                                .help("复制配对码")
-                                .accessibilityLabel(pairingCodeCopied ? "配对码已复制" : "复制配对码")
+                                .help(tr("复制配对码", "Copy pairing code"))
+                                .accessibilityLabel(pairingCodeCopied
+                                    ? tr("配对码已复制", "Pairing code copied")
+                                    : tr("复制配对码", "Copy pairing code"))
                             }
                             .padding(8)
                             .background(
@@ -465,19 +500,20 @@ struct UsagePanelView: View {
 
                         HStack(spacing: 8) {
                             PillButton(
-                                title: cluster.syncing ? "同步中" : "立即同步",
+                                title: cluster.syncing ? tr("同步中", "Syncing") : tr("立即同步", "Sync Now"),
                                 icon: "arrow.triangle.2.circlepath",
                                 theme: theme
                             ) {
-                                clusterMessage = "正在同步…"
+                                clusterMessage = tr("正在同步…", "Syncing…")
                                 cluster.syncAll { error in
-                                    clusterMessage = error.map { "同步失败：\($0.localizedDescription)" }
-                                        ?? "同步完成"
+                                    clusterMessage = error.map { tr("同步失败：\($0.localizedDescription)",
+                                                                    "Sync failed: \($0.localizedDescription)") }
+                                        ?? tr("同步完成", "Sync complete")
                                 }
                             }
                             .disabled(cluster.syncing)
                             PillButton(
-                                title: cluster.pairingCode == nil ? "添加主机" : "停止配对",
+                                title: cluster.pairingCode == nil ? tr("添加主机", "Add Mac") : tr("停止配对", "Stop Pairing"),
                                 icon: cluster.pairingCode == nil ? "plus" : "xmark",
                                 theme: theme
                             ) {
@@ -494,19 +530,21 @@ struct UsagePanelView: View {
                                     .font(.system(size: 10, weight: .semibold))
                                     .foregroundStyle(Color(red: 0.32, green: 0.58, blue: 0.96))
                                 VStack(alignment: .leading, spacing: 1) {
-                                    Text("加入已有同步集群")
+                                    Text(tr("加入已有同步集群", "Join an existing sync cluster"))
                                         .font(.system(size: 9, weight: .semibold, design: .rounded))
                                         .foregroundStyle(theme.textPrimary)
-                                    Text("输入另一台主机显示的地址和配对码")
+                                    Text(tr("输入另一台主机显示的地址和配对码",
+                                            "Enter the address and pairing code shown on another Mac"))
                                         .font(.system(size: 8, weight: .medium))
                                         .foregroundStyle(theme.textTertiary)
                                 }
                             }
 
-                            Text("加入后将替换本机的单节点集群配置，本机历史用量会保留。")
+                            Text(tr("加入后将替换本机的单节点集群配置，本机历史用量会保留。",
+                                    "Joining replaces this Mac's single-node cluster; its usage history is kept."))
                                 .font(.system(size: 8, weight: .medium))
                                 .foregroundStyle(theme.statusWarning)
-                            clusterJoinFields(theme, buttonTitle: "加入已有集群")
+                            clusterJoinFields(theme, buttonTitle: tr("加入已有集群", "Join Existing Cluster"))
                         }
 
                         if let message = Self.clusterFeedbackMessage(
@@ -530,10 +568,10 @@ struct UsagePanelView: View {
                             HStack(spacing: 6) {
                                 Image(systemName: "network")
                                     .font(.system(size: 9, weight: .semibold))
-                                Text("高级连接")
+                                Text(tr("高级连接", "Advanced Connection"))
                                     .font(.system(size: 9, weight: .semibold, design: .rounded))
                                 Spacer()
-                                Text("VPN 手动地址")
+                                Text(tr("VPN 手动地址", "Manual VPN address"))
                                     .font(.system(size: 8, weight: .medium))
                                     .foregroundStyle(theme.textTertiary)
                                 Image(systemName: "chevron.right")
@@ -548,25 +586,28 @@ struct UsagePanelView: View {
                         if showClusterAdvanced {
                             VStack(alignment: .leading, spacing: 6) {
                                 HStack(spacing: 6) {
-                                    TextField("已配对节点地址，例如 10.1.7.106:8765", text: $clusterAddress)
+                                    TextField(tr("已配对节点地址，例如 10.1.7.106:8765",
+                                                 "Paired node address, e.g. 10.1.7.106:8765"), text: $clusterAddress)
                                         .textFieldStyle(.roundedBorder)
                                         .font(.system(size: 9, design: .monospaced))
-                                    PillButton(title: "连接", icon: "link", theme: theme) {
+                                    PillButton(title: tr("连接", "Connect"), icon: "link", theme: theme) {
                                         let address = clusterAddress
-                                        clusterMessage = "正在连接 \(address)…"
+                                        clusterMessage = tr("正在连接 \(address)…", "Connecting to \(address)…")
                                         cluster.addManualEndpoint(address)
                                         cluster.syncAll { error in
                                             if let error {
-                                                clusterMessage = "连接失败：\(error.localizedDescription)"
+                                                clusterMessage = tr("连接失败：\(error.localizedDescription)",
+                                                                    "Connection failed: \(error.localizedDescription)")
                                             } else {
-                                                clusterMessage = "已连接并完成同步"
+                                                clusterMessage = tr("已连接并完成同步", "Connected and synced")
                                                 clusterAddress = ""
                                             }
                                         }
                                     }
                                     .disabled(clusterAddress.isEmpty)
                                 }
-                                Text("仅用于已经完成配对、但 Bonjour 无法发现的 VPN 节点。")
+                                Text(tr("仅用于已经完成配对、但 Bonjour 无法发现的 VPN 节点。",
+                                        "Only for already-paired VPN nodes that Bonjour can't discover."))
                                     .font(.system(size: 8, weight: .medium))
                                     .foregroundStyle(theme.textTertiary)
                             }
@@ -574,20 +615,20 @@ struct UsagePanelView: View {
                         }
 
                         DestructiveButton(
-                            title: "离开同步集群",
+                            title: tr("离开同步集群", "Leave Sync Cluster"),
                             icon: "rectangle.portrait.and.arrow.right",
                             theme: theme
                         ) { showLeaveClusterConfirmation = true }
                     } else {
-                        WideButton(title: "创建同步集群", icon: "plus.circle", theme: theme) {
+                        WideButton(title: tr("创建同步集群", "Create Sync Cluster"), icon: "plus.circle", theme: theme) {
                             clusterMessage = cluster.createCluster()
-                                ? "同步集群已创建，可在此生成配对码"
-                                : "创建失败：集群凭据写入失败，请重试"
+                                ? tr("同步集群已创建，可在此生成配对码", "Sync cluster created; you can generate a pairing code here")
+                                : tr("创建失败：集群凭据写入失败，请重试", "Creation failed: could not write cluster credentials, please try again")
                         }
 
                         Divider().opacity(0.4)
 
-                        clusterJoinFields(theme, buttonTitle: "加入同步集群")
+                        clusterJoinFields(theme, buttonTitle: tr("加入同步集群", "Join Sync Cluster"))
                     }
 
                     if !cluster.enabled, let message = clusterMessage ?? cluster.lastError {
@@ -605,11 +646,12 @@ struct UsagePanelView: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .glassCard(theme)
-        .alert("离开同步集群？", isPresented: $showLeaveClusterConfirmation) {
-            Button("取消", role: .cancel) {}
-            Button("离开", role: .destructive) { cluster.leaveCluster() }
+        .alert(tr("离开同步集群？", "Leave sync cluster?"), isPresented: $showLeaveClusterConfirmation) {
+            Button(tr("取消", "Cancel"), role: .cancel) {}
+            Button(tr("离开", "Leave"), role: .destructive) { cluster.leaveCluster() }
         } message: {
-            Text("本机将停止同步；本地采集数据不会删除。重新加入需要新的配对码。")
+            Text(tr("本机将停止同步；本地采集数据不会删除。重新加入需要新的配对码。",
+                    "This Mac will stop syncing; locally collected data isn't deleted. Rejoining needs a new pairing code."))
         }
     }
 
@@ -632,7 +674,7 @@ struct UsagePanelView: View {
                         .foregroundStyle(theme.textPrimary)
                         .lineLimit(1)
                     if local {
-                        Text("本机")
+                        Text(tr("本机", "This Mac"))
                             .font(.system(size: 7, weight: .bold, design: .rounded))
                             .foregroundStyle(theme.textSecondary)
                             .padding(.horizontal, 4)
@@ -641,15 +683,17 @@ struct UsagePanelView: View {
                     }
                 }
                 Text(local
-                     ? "本机节点"
-                     : node.lastSyncAt.map { "同步于 \($0.formatted(date: .omitted, time: .shortened))" }
-                        ?? (online ? "已连接，等待首次同步" : "尚未同步"))
+                     ? tr("本机节点", "This node")
+                     : node.lastSyncAt.map { tr("同步于 \($0.formatted(date: .omitted, time: .shortened))",
+                                               "Synced at \($0.formatted(date: .omitted, time: .shortened))") }
+                        ?? (online ? tr("已连接，等待首次同步", "Connected, awaiting first sync")
+                                   : tr("尚未同步", "Not synced yet")))
                     .font(.system(size: 8, weight: .medium))
                     .foregroundStyle(theme.textTertiary)
             }
             Spacer(minLength: 6)
             StateBadge(
-                text: online ? "在线" : "离线",
+                text: online ? tr("在线", "Online") : tr("离线", "Offline"),
                 color: online ? theme.statusHealthy : theme.textTertiary
             )
         }
@@ -662,9 +706,12 @@ struct UsagePanelView: View {
 
     private func clusterFeedback(_ message: String, forceError: Bool,
                                  theme: PanelTheme) -> some View {
-        let failed = forceError || ["失败", "错误", "无法", "不属于", "尚无"]
-            .contains { message.contains($0) }
-        let working = message.contains("正在")
+        let lower = message.lowercased()
+        let failed = forceError
+            || ["失败", "错误", "无法", "不属于", "尚无"].contains { message.contains($0) }
+            || ["fail", "error", "cannot", "could not", "not part of", "no pairing"]
+                .contains { lower.contains($0) }
+        let working = message.contains("正在") || message.hasSuffix("…")
         let color = failed
             ? theme.statusCritical
             : working ? Color(red: 0.32, green: 0.58, blue: 0.96) : theme.statusHealthy
@@ -687,15 +734,17 @@ struct UsagePanelView: View {
 
     static func clusterFeedbackMessage(transient: String?, currentError: String?) -> String? {
         guard let transient else { return currentError }
-        if transient.hasPrefix("正在") { return transient }
+        if transient.hasPrefix("正在") || transient.hasSuffix("…") { return transient }
 
-        if transient.hasPrefix("同步失败：") || transient == "同步完成" {
-            return currentError.map { "同步失败：\($0)" }
-                ?? (transient == "同步完成" ? transient : nil)
+        if transient.hasPrefix("同步失败：") || transient.hasPrefix("Sync failed:")
+            || transient == "同步完成" || transient == "Sync complete" {
+            return currentError.map { tr("同步失败：\($0)", "Sync failed: \($0)") }
+                ?? ((transient == "同步完成" || transient == "Sync complete") ? transient : nil)
         }
-        if transient.hasPrefix("连接失败：") || transient == "已连接并完成同步" {
-            return currentError.map { "连接失败：\($0)" }
-                ?? (transient == "已连接并完成同步" ? transient : nil)
+        if transient.hasPrefix("连接失败：") || transient.hasPrefix("Connection failed:")
+            || transient == "已连接并完成同步" || transient == "Connected and synced" {
+            return currentError.map { tr("连接失败：\($0)", "Connection failed: \($0)") }
+                ?? ((transient == "已连接并完成同步" || transient == "Connected and synced") ? transient : nil)
         }
         return transient
     }
@@ -707,11 +756,13 @@ struct UsagePanelView: View {
 
     @ViewBuilder
     private func clusterJoinFields(_ theme: PanelTheme, buttonTitle: String) -> some View {
-        TextField("集群主机地址，例如 macbook.local:8765", text: $clusterAddress)
+        TextField(tr("集群主机地址，例如 macbook.local:8765",
+                     "Cluster host address, e.g. macbook.local:8765"), text: $clusterAddress)
             .textFieldStyle(.roundedBorder)
             .font(.system(size: 10, design: .monospaced))
             .onSubmit { joinClusterFromFields() }
-        TextField("配对码，例如 ABCD-EFGH-JKMN-PQRS（填满后自动加入）", text: $clusterCode)
+        TextField(tr("配对码，例如 ABCD-EFGH-JKMN-PQRS（填满后自动加入）",
+                     "Pairing code, e.g. ABCD-EFGH-JKMN-PQRS (auto-joins once complete)"), text: $clusterCode)
             .textFieldStyle(.roundedBorder)
             .font(.system(size: 10, design: .monospaced))
             .onSubmit { joinClusterFromFields() }
@@ -730,12 +781,13 @@ struct UsagePanelView: View {
                     joinClusterFromFields()
                 }
             }
-        Text("在集群主机点击“添加主机”生成配对码；验证码有效期为两分钟。")
+        Text(tr("在集群主机点击“添加主机”生成配对码；验证码有效期为两分钟。",
+                "Click “Add Mac” on the cluster host to generate a pairing code; it's valid for two minutes."))
             .font(.system(size: 8, weight: .medium))
             .foregroundStyle(theme.textTertiary)
         if let peer = Self.preferredPairingPeer(in: cluster.discoveredPeers) {
             if peer.pairingCompatible {
-                Button("使用已发现的 \(peer.name)") {
+                Button(tr("使用已发现的 \(peer.name)", "Use discovered \(peer.name)")) {
                     clusterAddress = peer.endpoint
                     if ClusterCrypto.normalizedPairingCode(clusterCode) != nil { joinClusterFromFields() }
                 }
@@ -743,7 +795,8 @@ struct UsagePanelView: View {
                 .font(.system(size: 9, weight: .semibold))
                 .foregroundStyle(theme.textSecondary)
             } else {
-                Text("发现 \(peer.name)，但其版本过旧，无法配对；请先把它升级到最新版")
+                Text(tr("发现 \(peer.name)，但其版本过旧，无法配对；请先把它升级到最新版",
+                        "Found \(peer.name), but its version is too old to pair; please update it to the latest version first"))
                     .font(.system(size: 9, weight: .semibold))
                     .foregroundStyle(theme.statusWarning)
             }
@@ -757,13 +810,15 @@ struct UsagePanelView: View {
     private func joinClusterFromFields() {
         guard !model.busy else { return }
         model.busy = true
-        clusterMessage = "正在安全配对…"
+        clusterMessage = tr("正在安全配对…", "Securely pairing…")
         cluster.joinCluster(endpoint: clusterAddress, code: clusterCode) { error in
             model.busy = false
             if let error {
-                clusterMessage = "配对失败：\(error.localizedDescription)"
+                clusterMessage = tr("配对失败：\(error.localizedDescription)",
+                                    "Pairing failed: \(error.localizedDescription)")
             } else {
-                clusterMessage = "配对成功，正在同步其他主机的历史用量"
+                clusterMessage = tr("配对成功，正在同步其他主机的历史用量",
+                                    "Paired · syncing other Macs' usage history")
                 clusterAddress = ""
                 clusterCode = ""
             }
@@ -773,16 +828,17 @@ struct UsagePanelView: View {
     private func logSettings(_ theme: PanelTheme) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             settingsHeader(theme, icon: "doc.text.fill", color: Color(red: 0.55, green: 0.52, blue: 0.62),
-                           title: "日志", subtitle: "查看桥接应用运行日志")
-            WideButton(title: "打开日志文件", icon: "doc.text", theme: theme) {
+                           title: tr("日志", "Logs"), subtitle: tr("查看桥接应用运行日志", "View the bridge app's runtime logs"))
+            WideButton(title: tr("打开日志文件", "Open Log File"), icon: "doc.text", theme: theme) {
                 let url = Log.fileURL()
                 Log.user("open log file in Console \(url.path)")
                 Log.flush()
                 if NSWorkspace.shared.open(url) {
-                    model.settingsMessage = "日志文件：\(url.path)"
+                    model.settingsMessage = tr("日志文件：\(url.path)", "Log file: \(url.path)")
                 } else {
                     Log.warning("Console failed to open log file \(url.path)", category: "user")
-                    model.settingsMessage = "无法使用 Console 打开日志文件：\(url.path)"
+                    model.settingsMessage = tr("无法使用 Console 打开日志文件：\(url.path)",
+                                               "Could not open the log file with Console: \(url.path)")
                 }
             }
         }
@@ -794,12 +850,12 @@ struct UsagePanelView: View {
     private func aboutSettings(_ theme: PanelTheme) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             settingsHeader(theme, icon: "info.circle.fill", color: theme.statusCritical,
-                           title: "关于", subtitle: "版本 \(AppInfo.version)")
-            WideButton(title: "在 GitHub 查看", icon: "link", theme: theme) {
+                           title: tr("关于", "About"), subtitle: tr("版本 \(AppInfo.version)", "Version \(AppInfo.version)"))
+            WideButton(title: tr("在 GitHub 查看", "View on GitHub"), icon: "link", theme: theme) {
                 Log.user("open project page on GitHub")
                 NSWorkspace.shared.open(AppInfo.repoURL)
             }
-            Text("在 GitHub 反馈问题或参与贡献")
+            Text(tr("在 GitHub 反馈问题或参与贡献", "Report issues or contribute on GitHub"))
                 .font(.system(size: 9, weight: .medium))
                 .foregroundStyle(theme.textTertiary)
         }
@@ -816,7 +872,8 @@ struct UsagePanelView: View {
                 }
             } label: {
                 settingsHeader(theme, icon: "arrow.down.circle.fill", color: theme.statusHealthy,
-                               title: "软件更新", subtitle: "当前版本 \(updater.currentVersion)",
+                               title: tr("软件更新", "Software Update"),
+                               subtitle: tr("当前版本 \(updater.currentVersion)", "Current version \(updater.currentVersion)"),
                                expanded: updatesExpanded)
                     .padding(12)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -850,7 +907,8 @@ struct UsagePanelView: View {
                     .foregroundStyle(updateStatusColor(theme))
 
                     if updater.state == .updateAvailable {
-                        WideButton(title: "下载 v\(updater.latestVersion ?? "最新版") DMG",
+                        WideButton(title: tr("下载 v\(updater.latestVersion ?? "最新版") DMG",
+                                             "Download v\(updater.latestVersion ?? "latest") DMG"),
                                    icon: "arrow.down.to.line.compact", theme: theme) {
                             updater.openAvailableUpdate()
                         }
@@ -859,7 +917,8 @@ struct UsagePanelView: View {
                     if let lastCheckedAt = updater.lastCheckedAt {
                         HStack(spacing: 4) {
                             Image(systemName: "clock.fill").font(.system(size: 8))
-                            Text("上次检查：\(lastCheckedAt.formatted(date: .abbreviated, time: .shortened))")
+                            Text(tr("上次检查：\(lastCheckedAt.formatted(date: .abbreviated, time: .shortened))",
+                                    "Last checked: \(lastCheckedAt.formatted(date: .abbreviated, time: .shortened))"))
                                 .font(.system(size: 9, weight: .medium))
                         }
                         .foregroundStyle(theme.textTertiary)
@@ -868,8 +927,8 @@ struct UsagePanelView: View {
                     Divider().opacity(0.4)
 
                     updateToggle(
-                        title: "自动检查更新",
-                        subtitle: "打开菜单时定期检查 GitHub Releases",
+                        title: tr("自动检查更新", "Check for updates automatically"),
+                        subtitle: tr("打开菜单时定期检查 GitHub Releases", "Periodically check GitHub Releases when the menu opens"),
                         isOn: Binding(
                             get: { updater.automaticallyChecks },
                             set: { updater.setAutomaticallyChecks($0) }
@@ -877,8 +936,8 @@ struct UsagePanelView: View {
                         theme: theme
                     )
                     updateToggle(
-                        title: "包含测试版本",
-                        subtitle: "同时检查 GitHub prerelease 版本",
+                        title: tr("包含测试版本", "Include pre-releases"),
+                        subtitle: tr("同时检查 GitHub prerelease 版本", "Also check GitHub prerelease versions"),
                         isOn: Binding(
                             get: { updater.includesPrereleases },
                             set: { updater.setIncludesPrereleases($0) }
@@ -916,12 +975,12 @@ struct UsagePanelView: View {
     }
 
     private var updateStatusText: String {
-        if updater.isChecking { return "正在检查 GitHub Releases…" }
+        if updater.isChecking { return tr("正在检查 GitHub Releases…", "Checking GitHub Releases…") }
         switch updater.state {
-        case .idle: return "尚未检查更新"
-        case .upToDate: return "已是最新版"
-        case .updateAvailable: return "发现新版本 v\(updater.latestVersion ?? "")"
-        case let .failed(message): return "检查失败：\(message)"
+        case .idle: return tr("尚未检查更新", "Not checked yet")
+        case .upToDate: return tr("已是最新版", "Up to date")
+        case .updateAvailable: return tr("发现新版本 v\(updater.latestVersion ?? "")", "New version v\(updater.latestVersion ?? "") available")
+        case let .failed(message): return tr("检查失败：\(message)", "Check failed: \(message)")
         }
     }
 
@@ -1026,16 +1085,16 @@ enum UsagePresentation {
     private static let freshCacheAge: TimeInterval = 10 * 60
 
     static func missingPrimaryText(_ status: AgentStatus) -> String {
-        if status.weekly.percent != nil { return "当前无活跃的 5 小时窗口" }
-        if isRateLimited(status.error) { return "用量更新受限，稍后自动重试" }
-        return status.error ?? "暂无用量数据"
+        if status.weekly.percent != nil { return tr("当前无活跃的 5 小时窗口", "No active 5h window") }
+        if isRateLimited(status.error) { return tr("用量更新受限，稍后自动重试", "Usage updates are limited, retrying later") }
+        return status.error ?? tr("暂无用量数据", "No usage data")
     }
 
     static func freshnessText(_ status: AgentStatus, now: Date = Date()) -> String? {
         guard let fetchedAt = status.usageFetchedAt else { return nil }
         let age = max(0, Int(now.timeIntervalSince(fetchedAt)))
-        let relative = age < 5 ? "刚刚" : "\(PreviewPopoverController.formatAge(age))前"
-        return status.usageCached ? "缓存 · \(relative)" : "\(relative)更新"
+        let relative = age < 5 ? tr("刚刚", "just now") : tr("\(PreviewPopoverController.formatAge(age))前", "\(PreviewPopoverController.formatAge(age)) ago")
+        return status.usageCached ? tr("缓存 · \(relative)", "Cached · \(relative)") : tr("\(relative)更新", "Updated \(relative)")
     }
 
     static func notice(_ status: AgentStatus, now: Date = Date(),
@@ -1043,7 +1102,7 @@ enum UsagePresentation {
         guard let error = status.error else { return nil }
         guard status.primary.percent != nil || status.weekly.percent != nil else { return nil }
         guard isRateLimited(error) else {
-            return Notice(kind: .failure, text: "更新失败 · \(error)")
+            return Notice(kind: .failure, text: tr("更新失败 · \(error)", "Update failed · \(error)"))
         }
 
         let exceededWindows = [status.primary, status.weekly].filter {
@@ -1054,8 +1113,8 @@ enum UsagePresentation {
                 if let resetAt = window.resetAt { return resetAt }
                 return window.resetMinutes.map { now.addingTimeInterval(TimeInterval($0 * 60)) }
             }.min()
-            let suffix = resetAt.map { " · \(clockTime($0, timeZone: timeZone)) 重置" } ?? ""
-            return Notice(kind: .limit, text: "已达到用量上限\(suffix)")
+            let suffix = resetAt.map { tr(" · \(clockTime($0, timeZone: timeZone)) 重置", " · resets at \(clockTime($0, timeZone: timeZone))") } ?? ""
+            return Notice(kind: .limit, text: tr("已达到用量上限\(suffix)", "Usage limit reached\(suffix)"))
         }
 
         if status.usageCached,
@@ -1064,8 +1123,8 @@ enum UsagePresentation {
             return nil
         }
         let text = status.usageCached
-            ? "用量更新受限 · 显示缓存"
-            : "用量更新受限 · 稍后自动重试"
+            ? tr("用量更新受限 · 显示缓存", "Usage updates limited · showing cache")
+            : tr("用量更新受限 · 稍后自动重试", "Usage updates limited · retrying later")
         return Notice(kind: .cachedRateLimit, text: text)
     }
 
@@ -1116,7 +1175,7 @@ private struct ProviderCard: View {
                         .font(.system(size: 15, weight: .medium, design: .rounded))
                         .foregroundStyle(theme.textTertiary)
                     Spacer()
-                    Text("5 小时")
+                    Text(tr("5 小时", "5h"))
                         .font(.system(size: 9, weight: .medium))
                         .foregroundStyle(theme.textSecondary)
                 }
@@ -1128,7 +1187,7 @@ private struct ProviderCard: View {
                         .font(.system(size: 30, weight: .bold, design: .rounded))
                         .foregroundStyle(theme.textTertiary)
                     Spacer()
-                    Text("5 小时")
+                    Text(tr("5 小时", "5h"))
                         .font(.system(size: 9, weight: .medium))
                         .foregroundStyle(theme.textSecondary)
                 }
@@ -1140,7 +1199,7 @@ private struct ProviderCard: View {
             }
             if let weekly = status.weekly.percent {
                 HStack {
-                    Text("7 天")
+                    Text(tr("7 天", "7d"))
                         .font(.system(size: 9, weight: .medium))
                         .foregroundStyle(theme.textSecondary)
                     Spacer()
@@ -1180,7 +1239,7 @@ private struct ProviderCard: View {
                 HStack(spacing: 3) {
                     Image(systemName: "number.circle.fill")
                         .font(.system(size: 7))
-                    Text("今日 \(UsageFormat.tokens(status.tokensToday)) tokens")
+                    Text(tr("今日 \(UsageFormat.tokens(status.tokensToday)) tokens", "Today \(UsageFormat.tokens(status.tokensToday)) tokens"))
                         .font(.system(size: 9, weight: .medium))
                 }
                 .foregroundStyle(theme.textSecondary)
@@ -1212,18 +1271,18 @@ private struct ProviderCard: View {
     private func resetLine(_ minutes: Int?) -> some View {
         HStack(spacing: 3) {
             Image(systemName: "clock.fill").font(.system(size: 7))
-            Text(minutes.map { "\(MenuBarController.formatMinutes($0)) 后重置" } ?? "无活跃窗口")
+            Text(minutes.map { tr("\(MenuBarController.formatMinutes($0)) 后重置", "resets in \(MenuBarController.formatMinutes($0))") } ?? tr("无活跃窗口", "No active window"))
                 .font(.system(size: 8, weight: .medium))
         }
         .foregroundStyle(theme.textTertiary)
     }
 
     private var stateText: String {
-        if status.needsInput { return "等输入" }
+        if status.needsInput { return tr("等输入", "Needs Input") }
         switch status.state {
-        case "working": return "运行中"
-        case "idle": return "空闲"
-        default: return "离线"
+        case "working": return tr("运行中", "Working")
+        case "idle": return tr("空闲", "Idle")
+        default: return tr("离线", "Offline")
         }
     }
 
@@ -1358,7 +1417,8 @@ private struct DestructiveButton: View {
         .buttonStyle(.plain)
         .animation(.easeOut(duration: 0.15), value: hovering)
         .onHover { hovering = $0 }
-        .accessibilityHint("停止与其他主机同步，本机历史数据会保留")
+        .accessibilityHint(tr("停止与其他主机同步，本机历史数据会保留",
+                              "Stops syncing with other Macs; this Mac's history is kept"))
     }
 }
 
@@ -1381,7 +1441,7 @@ private struct UpdateCheckButton: View {
                     Image(systemName: "arrow.clockwise")
                         .font(.system(size: 10, weight: .semibold))
                 }
-                Text(checking ? "正在检查…" : "检查更新")
+                Text(checking ? tr("正在检查…", "Checking…") : tr("检查更新", "Check for Updates"))
                     .font(.system(size: 11, weight: .semibold, design: .rounded))
             }
             .foregroundStyle(.white)

@@ -9,9 +9,9 @@ enum ClusterCryptoError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .invalidCredentials: return "集群凭据无效"
-        case .invalidPayload: return "同步数据格式无效"
-        case .authenticationFailed: return "同步请求认证失败"
+        case .invalidCredentials: return tr("集群凭据无效", "Invalid cluster credentials")
+        case .invalidPayload: return tr("同步数据格式无效", "Invalid sync data format")
+        case .authenticationFailed: return tr("同步请求认证失败", "Sync request authentication failed")
         }
     }
 }
@@ -247,7 +247,7 @@ final class ClusterCredentialStore {
     func save(_ value: ClusterCredentials) throws {
         let data = try ClusterCrypto.encoder.encode(value)
         guard store.saveClusterCredentialsData(data) else {
-            throw BridgeError.message("无法将集群凭据写入 usage.db")
+            throw BridgeError.message(tr("无法将集群凭据写入 usage.db", "Cannot write cluster credentials to usage.db"))
         }
         try? FileManager.default.removeItem(at: legacyFallbackURL)
     }
@@ -258,7 +258,7 @@ final class ClusterCredentialStore {
         guard store.saveClusterCredentialsData(
             data, resettingRemoteDataExceptNodeID: localNodeID
         ) else {
-            throw BridgeError.message("无法将集群凭据写入 usage.db")
+            throw BridgeError.message(tr("无法将集群凭据写入 usage.db", "Cannot write cluster credentials to usage.db"))
         }
         try? FileManager.default.removeItem(at: legacyFallbackURL)
     }

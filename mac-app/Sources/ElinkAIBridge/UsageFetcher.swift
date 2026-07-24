@@ -139,7 +139,8 @@ final class UsageFetcher {
             token = value
         case let .failure(error):
             if var cached = Self.cachedClaudeUsage() {
-                cached.error = "\(error.localizedDescription)，显示状态栏缓存"
+                cached.error = tr("\(error.localizedDescription)，显示状态栏缓存",
+                                  "\(error.localizedDescription) — showing status bar cache")
                 return cached
             }
             return ProviderUsage(error: error.localizedDescription)
@@ -150,13 +151,13 @@ final class UsageFetcher {
         request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         guard let (data, status) = Self.request(request) else {
-            return Self.claudeFallback(error: "Claude 用量请求失败")
+            return Self.claudeFallback(error: tr("Claude 用量请求失败", "Claude usage request failed"))
         }
         guard status == 200 else {
-            return Self.claudeFallback(error: "Claude 用量 HTTP \(status)")
+            return Self.claudeFallback(error: tr("Claude 用量 HTTP \(status)", "Claude usage HTTP \(status)"))
         }
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return Self.claudeFallback(error: "Claude 用量响应解析失败")
+            return Self.claudeFallback(error: tr("Claude 用量响应解析失败", "Failed to parse Claude usage response"))
         }
         let primary = Self.isoWindow(json["five_hour"])
         let weekly = Self.isoWindow(json["seven_day"])
@@ -227,18 +228,20 @@ final class UsageFetcher {
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         if let account = credentials.account { request.setValue(account, forHTTPHeaderField: "ChatGPT-Account-Id") }
         guard let (data, status) = Self.request(request) else {
-            return ProviderUsage(error: "Codex 用量请求失败")
+            return ProviderUsage(error: tr("Codex 用量请求失败", "Codex usage request failed"))
         }
         guard (200...299).contains(status) else {
             let error = status == 401 || status == 403
-                ? "Codex 凭据过期，请运行 codex 重新登录"
-                : status == 429 ? "Codex 用量 HTTP 429，稍后自动重试"
-                : "Codex 用量 HTTP \(status)"
+                ? tr("Codex 凭据过期，请运行 codex 重新登录",
+                     "Codex credentials expired — run codex to sign in again")
+                : status == 429 ? tr("Codex 用量 HTTP 429，稍后自动重试",
+                                     "Codex usage HTTP 429 — will retry automatically")
+                : tr("Codex 用量 HTTP \(status)", "Codex usage HTTP \(status)")
             return ProviderUsage(error: error)
         }
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let limits = json["rate_limit"] as? [String: Any] else {
-            return ProviderUsage(error: "Codex 用量响应解析失败")
+            return ProviderUsage(error: tr("Codex 用量响应解析失败", "Failed to parse Codex usage response"))
         }
         let windows = Self.codexWindows(limits)
         return ProviderUsage(
@@ -295,15 +298,20 @@ final class UsageFetcher {
         var errorDescription: String? {
             switch self {
             case .claudeKeychainUnavailable:
-                return "无法调用 macOS Keychain 读取 Claude 凭据"
+                return tr("无法调用 macOS Keychain 读取 Claude 凭据",
+                          "Cannot access macOS Keychain to read Claude credentials")
             case let .claudeKeychain(status):
-                return "Keychain 中未找到或无法访问 Claude 凭据（security \(status)）"
+                return tr("Keychain 中未找到或无法访问 Claude 凭据（security \(status)）",
+                          "Claude credentials not found or inaccessible in Keychain (security \(status))")
             case .invalidClaudeCredentials:
-                return "Claude 凭据格式无效，请运行 claude 重新登录"
+                return tr("Claude 凭据格式无效，请运行 claude 重新登录",
+                          "Invalid Claude credentials — run claude to sign in again")
             case .missingCodexFile:
-                return "未找到 ~/.codex/auth.json，请运行 codex 重新登录"
+                return tr("未找到 ~/.codex/auth.json，请运行 codex 重新登录",
+                          "~/.codex/auth.json not found — run codex to sign in again")
             case .invalidCodexCredentials:
-                return "Codex 凭据格式无效，请运行 codex 重新登录"
+                return tr("Codex 凭据格式无效，请运行 codex 重新登录",
+                          "Invalid Codex credentials — run codex to sign in again")
             }
         }
     }

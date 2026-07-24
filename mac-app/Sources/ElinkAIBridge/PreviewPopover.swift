@@ -25,16 +25,18 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
         super.init()
         model.deviceConnectionEnabled = DeviceClient.isEnabled
         if !model.deviceConnectionEnabled {
-            model.deviceSummary = "屏幕连接已关闭"
-            model.deviceBadge = "已关闭"
+            model.deviceSummary = tr("屏幕连接已关闭", "Screen Connection off")
+            model.deviceBadge = tr("已关闭", "Off")
         }
         model.onSetMode = { [weak self] mode in
             Log.user("change device display mode to \(mode)")
-            self?.performAction("正在切换页面…") { DeviceClient.setMode(mode, completion: $0) }
+            self?.performAction(tr("正在切换页面…", "Switching page…")) { DeviceClient.setMode(mode, completion: $0) }
         }
         model.onDeviceRefresh = { [weak self] kind in
             Log.user("refresh device display kind=\(kind)")
-            self?.performAction(kind == "smart" ? "正在请求智能刷新…" : "正在请求完整刷新…") {
+            self?.performAction(kind == "smart"
+                ? tr("正在请求智能刷新…", "Requesting smart refresh…")
+                : tr("正在请求完整刷新…", "Requesting full refresh…")) {
                 DeviceClient.refresh(kind, completion: $0)
             }
         }
@@ -42,7 +44,7 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
             guard let self, !self.model.refreshingUsage else { return }
             Log.user("refresh provider usage")
             self.model.refreshingUsage = true
-            self.model.updatedText = "正在刷新用量…"
+            self.model.updatedText = tr("正在刷新用量…", "Refreshing usage…")
             self.usage.refresh(force: true) { [weak self] in
                 guard let self else { return }
                 self.model.refreshingUsage = false
@@ -53,16 +55,18 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
             guard let self else { return }
             DeviceClient.isEnabled = enabled
             self.model.deviceConnectionEnabled = enabled
-            self.model.settingsMessage = enabled ? "屏幕连接已开启" : "屏幕连接已关闭"
+            self.model.settingsMessage = enabled
+                ? tr("屏幕连接已开启", "Screen Connection on")
+                : tr("屏幕连接已关闭", "Screen Connection off")
             Log.user("device connection \(enabled ? "enabled" : "disabled")")
             if enabled {
-                self.model.deviceSummary = "正在连接设备…"
-                self.model.deviceBadge = "连接中"
+                self.model.deviceSummary = tr("正在连接设备…", "Connecting device…")
+                self.model.deviceBadge = tr("连接中", "Connecting")
                 self.reload()
             } else {
                 self.model.previewImage = nil
-                self.model.deviceSummary = "屏幕连接已关闭"
-                self.model.deviceBadge = "已关闭"
+                self.model.deviceSummary = tr("屏幕连接已关闭", "Screen Connection off")
+                self.model.deviceBadge = tr("已关闭", "Off")
                 self.model.deviceHealthy = false
                 self.model.busy = false
             }
@@ -71,14 +75,14 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
             DeviceClient.host = DeviceClient.normalizedHost(host)
             Log.user("save device address \(DeviceClient.host)")
             self?.model.deviceHost = DeviceClient.host
-            self?.model.settingsMessage = "地址已保存"
+            self?.model.settingsMessage = tr("地址已保存", "Address saved")
             self?.reload()
         }
         model.onAutoPair = { [weak self] in
             guard self?.model.deviceConnectionEnabled == true else { return }
             Log.user("start device auto-pair")
             self?.model.busy = true
-            self?.model.settingsMessage = "正在查找屏幕…"
+            self?.model.settingsMessage = tr("正在查找屏幕…", "Searching for screen…")
             DeviceClient.autoPair(progress: { [weak self] text in
                 self?.model.settingsMessage = text
             }) { [weak self] found in
@@ -91,8 +95,9 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
                         ?? "device auto-pair failed: no device found",
                     level: found == nil ? .warning : .info
                 )
-                self.model.settingsMessage = found.map { "配对成功：\($0)" }
-                    ?? "未找到屏幕，请确认树莓派与 Mac 在同一局域网"
+                self.model.settingsMessage = found.map { tr("配对成功：\($0)", "Paired: \($0)") }
+                    ?? tr("未找到屏幕，请确认树莓派与 Mac 在同一局域网",
+                          "No screen found. Make sure the Raspberry Pi and Mac are on the same LAN")
                 self.reload()
             }
         }
@@ -101,7 +106,7 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
             Log.user("set this Mac as device bridge")
             guard let ip = DeviceClient.localIPv4() else {
                 Log.warning("set bridge failed: local IPv4 unavailable", category: "user")
-                self.model.settingsMessage = "无法取得本机局域网地址"
+                self.model.settingsMessage = tr("无法取得本机局域网地址", "Cannot get this Mac's LAN address")
                 return
             }
             let url = "http://\(ip):\(self.port)"
@@ -111,8 +116,10 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
                         ?? "bridge set to \(url)",
                     level: error == nil ? .info : .warning
                 )
-                self?.model.settingsMessage = error.map { "设置失败：\($0.localizedDescription)" }
-                    ?? "桥接已设置，设备将从 \(url)/v1/status 拉取数据"
+                self?.model.settingsMessage = error.map {
+                    tr("设置失败：\($0.localizedDescription)", "Setup failed: \($0.localizedDescription)")
+                } ?? tr("桥接已设置，设备将从 \(url)/v1/status 拉取数据",
+                        "Bridge set. The device will pull data from \(url)/v1/status")
             }
         }
         model.agentSessionsEnabled = AgentSessionMonitor.isEnabled
@@ -120,7 +127,9 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
             guard let self else { return }
             AgentSessionMonitor.isEnabled = enabled
             self.model.agentSessionsEnabled = enabled
-            self.model.settingsMessage = enabled ? "Agent 会话显示已开启" : "Agent 会话显示已关闭"
+            self.model.settingsMessage = enabled
+                ? tr("Agent 会话显示已开启", "Agent sessions display on")
+                : tr("Agent 会话显示已关闭", "Agent sessions display off")
             Log.user("agent sessions \(enabled ? "enabled" : "disabled")")
             if enabled {
                 self.reloadAgentSessions()
@@ -131,7 +140,7 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
         model.onOpenDeviceStatus = { [weak self] in
             guard let base = DeviceClient.baseURL else {
                 Log.warning("open device status failed: device address is not configured", category: "user")
-                self?.model.settingsMessage = "请先设置屏幕地址"
+                self?.model.settingsMessage = tr("请先设置屏幕地址", "Set the screen address first")
                 return
             }
             Log.user("open device status page \(base.appendingPathComponent("v1/device").absoluteString)")
@@ -249,11 +258,12 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
             case let .success(info):
                 self.model.mode = info.mode
                 self.model.deviceSummary = Self.deviceSummary(info)
-                self.model.deviceBadge = info.stale ? "数据陈旧" : "在线"
+                self.model.deviceBadge = info.stale ? tr("数据陈旧", "Stale") : tr("在线", "Online")
                 self.model.deviceHealthy = !info.stale
             case let .failure(error):
-                self.model.deviceSummary = "设备离线 · \(error.localizedDescription)"
-                self.model.deviceBadge = "离线"
+                self.model.deviceSummary = tr("设备离线 · \(error.localizedDescription)",
+                                              "Device offline · \(error.localizedDescription)")
+                self.model.deviceBadge = tr("离线", "Offline")
                 self.model.deviceHealthy = false
             }
         }
@@ -272,18 +282,22 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
             guard self.model.deviceConnectionEnabled else { return }
             if let error {
                 Log.warning("device action failed: \(error.localizedDescription)", category: "user")
-                self.model.deviceSummary = "操作失败 · \(error.localizedDescription)"
+                self.model.deviceSummary = tr("操作失败 · \(error.localizedDescription)",
+                                              "Action failed · \(error.localizedDescription)")
             } else {
-                self.model.deviceSummary = "请求已发送，等待设备完成送屏…"
+                self.model.deviceSummary = tr("请求已发送，等待设备完成送屏…",
+                                              "Request sent, waiting for the device to finish updating the screen…")
                 self.reload()
             }
         }
     }
 
     static func updatedText(_ fetchedAt: Date?) -> String {
-        guard let fetchedAt else { return "用量更新中…" }
+        guard let fetchedAt else { return tr("用量更新中…", "Updating usage…") }
         let age = Int(Date().timeIntervalSince(fetchedAt))
-        return age < 5 ? "用量刚刚更新" : "用量 \(formatAge(age))前更新"
+        return age < 5
+            ? tr("用量刚刚更新", "Usage just updated")
+            : tr("用量 \(formatAge(age))前更新", "Usage updated \(formatAge(age)) ago")
     }
 
     static func segment(for mode: String) -> Int {
@@ -291,12 +305,14 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
     }
 
     static func deviceSummary(_ info: DeviceInfo) -> String {
-        let connection = info.stale ? "数据陈旧" : "设备在线"
+        let connection = info.stale ? tr("数据陈旧", "Stale") : tr("设备在线", "Device online")
         let version = info.version.map { " v\($0)" } ?? ""
-        let mode = ["dashboard": "双栏", "claude": "Claude", "codex": "Codex"][info.mode] ?? info.mode
-        let refresh = ["full": "完整刷新", "partial": "局部刷新", "none": "尚未刷新"][info.refreshKind]
+        let mode = ["dashboard": tr("双栏", "Dual"), "claude": "Claude", "codex": "Codex"][info.mode] ?? info.mode
+        let refresh = ["full": tr("完整刷新", "Full refresh"),
+                       "partial": tr("局部刷新", "Partial refresh"),
+                       "none": tr("尚未刷新", "Not refreshed yet")][info.refreshKind]
             ?? info.refreshKind
-        let age = info.lastRefreshAge.map { " · \(formatAge($0))前送屏" } ?? ""
+        let age = info.lastRefreshAge.map { tr(" · \(formatAge($0))前送屏", " · pushed \(formatAge($0)) ago") } ?? ""
         if let error = info.error, !error.isEmpty {
             return "\(connection)\(version) · \(mode) · \(error)"
         }
@@ -304,8 +320,8 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
     }
 
     static func formatAge(_ seconds: Int) -> String {
-        if seconds >= 3600 { return "\(seconds / 3600)小时" }
-        if seconds >= 60 { return "\(seconds / 60)分钟" }
-        return "\(max(0, seconds))秒"
+        if seconds >= 3600 { return tr("\(seconds / 3600)小时", "\(seconds / 3600)h") }
+        if seconds >= 60 { return tr("\(seconds / 60)分钟", "\(seconds / 60)min") }
+        return tr("\(max(0, seconds))秒", "\(max(0, seconds))s")
     }
 }

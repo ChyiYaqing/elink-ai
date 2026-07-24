@@ -155,7 +155,7 @@ final class ClusterManager: ObservableObject {
     @discardableResult
     func startPairing() -> String? {
         guard enabled else {
-            lastError = "请先创建同步集群"
+            lastError = tr("请先创建同步集群", "Create a sync cluster first")
             return nil
         }
         let code = ClusterCrypto.generatePairingCode()
@@ -188,7 +188,8 @@ final class ClusterManager: ObservableObject {
     func joinCluster(endpoint: String, code: String, completion: @escaping (Error?) -> Void) {
         guard let base = normalizedEndpoint(endpoint),
               let pairingCode = ClusterCrypto.normalizedPairingCode(code) else {
-            completion(BridgeError.message("请输入有效的节点地址和 16 位配对码"))
+            completion(BridgeError.message(tr("请输入有效的节点地址和 16 位配对码",
+                                               "Enter a valid node address and 16-character pairing code")))
             return
         }
         let privateKey = Curve25519.KeyAgreement.PrivateKey()
@@ -220,14 +221,16 @@ final class ClusterManager: ObservableObject {
             // 不是 Elink AI 桥接端口（任何 HTTP 服务都会 404），提示不能只说版本
             if let http = response as? HTTPURLResponse, http.statusCode == 426 {
                 return DispatchQueue.main.async {
-                    completion(BridgeError.message("对方 Elink AI 版本不兼容，请把两台主机都升级到最新版"))
+                    completion(BridgeError.message(tr("对方 Elink AI 版本不兼容，请把两台主机都升级到最新版",
+                                                      "The other Elink AI version is incompatible. Upgrade both hosts to the latest version.")))
                 }
             }
             if let http = response as? HTTPURLResponse, http.statusCode == 404 {
                 return DispatchQueue.main.async {
-                    completion(BridgeError.message(
-                        "对方没有配对接口：请确认地址是另一台主机的 Elink AI（端口 8765），或将其升级到最新版"
-                    ))
+                    completion(BridgeError.message(tr(
+                        "对方没有配对接口：请确认地址是另一台主机的 Elink AI（端口 8765），或将其升级到最新版",
+                        "Cannot find the pairing endpoint: make sure the address points to another host's Elink AI (port 8765), or upgrade it to the latest version."
+                    )))
                 }
             }
             guard let http = response as? HTTPURLResponse, http.statusCode == 200,
@@ -236,7 +239,8 @@ final class ClusterManager: ObservableObject {
                   let serverPublic = Data(base64Encoded: joined.serverPublicKey),
                   let sealedData = Data(base64Encoded: joined.sealed) else {
                 return DispatchQueue.main.async {
-                    completion(BridgeError.message("配对失败，请确认配对码尚未过期"))
+                    completion(BridgeError.message(tr("配对失败，请确认配对码尚未过期",
+                                                      "Pairing failed. Make sure the pairing code has not expired.")))
                 }
             }
             do {
@@ -253,12 +257,14 @@ final class ClusterManager: ObservableObject {
                 DispatchQueue.main.async {
                     // 请求发出后若用户已建群、入群或退群，旧响应不能覆盖新凭据
                     guard self.lock.holding({ self.credentialsGeneration }) == generation else {
-                        completion(BridgeError.message("配对已取消：集群配置已变化"))
+                        completion(BridgeError.message(tr("配对已取消：集群配置已变化",
+                                                          "Pairing canceled: cluster configuration changed")))
                         return
                     }
                     // 换凭据 + 清旧数据是一个事务；失败时旧集群状态原样保留
                     guard self.saveCredentials(updated, resetRemoteData: true) else {
-                        completion(BridgeError.message("集群凭据保存失败，请重试"))
+                        completion(BridgeError.message(tr("集群凭据保存失败，请重试",
+                                                          "Failed to save cluster credentials. Please retry.")))
                         return
                     }
                     UserDefaults.standard.set([base], forKey: self.manualPeersKey)
@@ -281,13 +287,14 @@ final class ClusterManager: ObservableObject {
 
     func syncAll(completion: ((Error?) -> Void)? = nil) {
         guard enabled else {
-            completion?(BridgeError.message("请先创建或加入同步集群"))
+            completion?(BridgeError.message(tr("请先创建或加入同步集群", "Create or join a sync cluster first")))
             return
         }
         let endpoints = knownEndpoints()
         guard !endpoints.isEmpty else {
             refreshPublishedState()
-            completion?(BridgeError.message("尚无已配对节点，请先在另一台主机使用配对码加入"))
+            completion?(BridgeError.message(tr("尚无已配对节点，请先在另一台主机使用配对码加入",
+                                               "No paired nodes yet. On another host, join using the pairing code first.")))
             return
         }
         syncing = true
@@ -529,7 +536,7 @@ final class ClusterManager: ObservableObject {
         let epoch = store.clusterDataEpoch()
         guard isClusteredNow, let key,
               let url = URL(string: endpoint + "/v2/cluster/manifest") else {
-            completion?(BridgeError.message("同步配置无效")); return
+            completion?(BridgeError.message(tr("同步配置无效", "Invalid sync configuration"))); return
         }
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
@@ -538,16 +545,19 @@ final class ClusterManager: ObservableObject {
             nodeID: nodeID, key: key
         ).forEach { request.setValue($0.value, forHTTPHeaderField: $0.key) }
         session.dataTask(with: request) { [weak self] data, response, error in
-            guard let self else { completion?(BridgeError.message("同步服务已停止")); return }
+            guard let self else { completion?(BridgeError.message(tr("同步服务已停止", "Sync service stopped"))); return }
             if let error { completion?(error); return }
             guard let http = response as? HTTPURLResponse else {
-                completion?(BridgeError.message("节点 \(endpoint) 没有返回有效响应"))
+                completion?(BridgeError.message(tr("节点 \(endpoint) 没有返回有效响应",
+                                                   "Node \(endpoint) returned no valid response")))
                 return
             }
             guard http.statusCode == 200 else {
                 let message = http.statusCode == 401
-                    ? "节点 \(endpoint) 尚未加入当前同步集群，请先使用配对码加入"
-                    : "节点 \(endpoint) 返回 HTTP \(http.statusCode)"
+                    ? tr("节点 \(endpoint) 尚未加入当前同步集群，请先使用配对码加入",
+                         "Node \(endpoint) has not joined the current sync cluster. Join with a pairing code first.")
+                    : tr("节点 \(endpoint) 返回 HTTP \(http.statusCode)",
+                         "Node \(endpoint) returned HTTP \(http.statusCode)")
                 completion?(BridgeError.message(message))
                 return
             }
@@ -556,16 +566,19 @@ final class ClusterManager: ObservableObject {
                     ClusterManifest.self, data: data, key: key
                   ), manifest.protocolVersion == 2,
                   manifest.clusterID == self.currentClusterID else {
-                completion?(BridgeError.message("节点 \(endpoint) 不属于当前同步集群"))
+                completion?(BridgeError.message(tr("节点 \(endpoint) 不属于当前同步集群",
+                                                   "Node \(endpoint) does not belong to the current sync cluster")))
                 return
             }
             guard manifest.senderNodeID != self.nodeID else {
-                completion?(BridgeError.message("节点地址 \(endpoint) 指向本机"))
+                completion?(BridgeError.message(tr("节点地址 \(endpoint) 指向本机",
+                                                   "Node address \(endpoint) points to this machine")))
                 return
             }
             // 响应回来时若已切换集群（凭据代数变化），丢弃整包，避免旧集群数据落库
             guard self.lock.holding({ self.credentialsGeneration }) == generation else {
-                completion?(BridgeError.message("同步已取消：集群配置已变化"))
+                completion?(BridgeError.message(tr("同步已取消：集群配置已变化",
+                                                   "Sync canceled: cluster configuration changed")))
                 return
             }
             let now = Date()
@@ -605,7 +618,8 @@ final class ClusterManager: ObservableObject {
                 var finalError = error
                 if finalError == nil,
                    self.lock.holding({ self.credentialsGeneration }) != generation {
-                    finalError = BridgeError.message("同步已取消：集群配置已变化")
+                    finalError = BridgeError.message(tr("同步已取消：集群配置已变化",
+                                                        "Sync canceled: cluster configuration changed"))
                 }
                 if finalError == nil {
                     let accepted = self.store.upsertRemoteClusterNode(ClusterNodeRecord(
@@ -616,9 +630,10 @@ final class ClusterManager: ObservableObject {
                         lastSyncAt: Date()
                     ), ifEpoch: epoch)
                     if !accepted {
-                        finalError = BridgeError.message(
-                            "同步状态未写入：集群配置已变化或本地存储失败"
-                        )
+                        finalError = BridgeError.message(tr(
+                            "同步状态未写入：集群配置已变化或本地存储失败",
+                            "Sync status not written: cluster configuration changed or local storage failed"
+                        ))
                     }
                 }
                 DispatchQueue.main.async { self.refreshPublishedState() }
@@ -655,7 +670,7 @@ final class ClusterManager: ObservableObject {
                 ClusterPullRequest(keys: keys), key: key, senderNodeID: nodeID
             )
             guard let url = URL(string: endpoint + "/v2/cluster/pull") else {
-                completion?(BridgeError.message("节点地址无效"))
+                completion?(BridgeError.message(tr("节点地址无效", "Invalid node address")))
                 return
             }
             var request = URLRequest(url: url)
@@ -668,25 +683,28 @@ final class ClusterManager: ObservableObject {
             ).forEach { request.setValue($0.value, forHTTPHeaderField: $0.key) }
             session.dataTask(with: request) { [weak self] data, response, error in
                 guard let self else {
-                    completion?(BridgeError.message("同步服务已停止"))
+                    completion?(BridgeError.message(tr("同步服务已停止", "Sync service stopped")))
                     return
                 }
                 if let error { completion?(error); return }
                 guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
                     let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-                    completion?(BridgeError.message("节点 \(endpoint) 拉取失败 HTTP \(status)"))
+                    completion?(BridgeError.message(tr("节点 \(endpoint) 拉取失败 HTTP \(status)",
+                                                       "Node \(endpoint) pull failed HTTP \(status)")))
                     return
                 }
                 guard let data,
                       let (_, pulled) = try? ClusterCrypto.open(
                         ClusterPullResponse.self, data: data, key: key
                       ) else {
-                    completion?(BridgeError.message("节点 \(endpoint) 拉取响应无法解密"))
+                    completion?(BridgeError.message(tr("节点 \(endpoint) 拉取响应无法解密",
+                                                       "Node \(endpoint) pull response cannot be decrypted")))
                     return
                 }
                 // ifEpoch 在 store 队列内校验，与 reset 原子互斥；nil 表示整包被拒绝
                 guard self.store.mergeClusterSnapshots(pulled.snapshots, ifEpoch: epoch) != nil else {
-                    completion?(BridgeError.message("同步数据未写入：集群配置已变化或本地存储失败"))
+                    completion?(BridgeError.message(tr("同步数据未写入：集群配置已变化或本地存储失败",
+                                                       "Sync data not written: cluster configuration changed or local storage failed")))
                     return
                 }
                 DispatchQueue.main.async { self.refreshPublishedState() }

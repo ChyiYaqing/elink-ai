@@ -58,8 +58,9 @@ do {
     Log.info("bridge v\(AppInfo.version) started on port \(port)")
 } catch {
     Log.error("server start failed: \(error.localizedDescription)", category: "server")
-    let alert = NSAlert(); alert.messageText = "Elink AI Bridge 无法启动"
-    alert.informativeText = "端口 \(port) 绑定失败：\(error.localizedDescription)"; alert.runModal()
+    let alert = NSAlert(); alert.messageText = tr("Elink AI Bridge 无法启动", "Elink AI Bridge failed to start")
+    alert.informativeText = tr("端口 \(port) 绑定失败：\(error.localizedDescription)",
+                               "Port \(port) binding failed: \(error.localizedDescription)"); alert.runModal()
 }
 
 let app = NSApplication.shared

@@ -239,14 +239,15 @@ final class UpdateChecker: ObservableObject {
         var errorDescription: String? {
             switch self {
             case let .network(message): return message
-            case .invalidResponse: return "GitHub 返回了无效响应"
-            case let .http(status): return "GitHub 请求失败（HTTP \(status)）"
-            case .invalidData: return "无法解析 GitHub Release 信息"
+            case .invalidResponse: return tr("GitHub 返回了无效响应", "GitHub returned an invalid response")
+            case let .http(status): return tr("GitHub 请求失败（HTTP \(status)）", "GitHub request failed (HTTP \(status))")
+            case .invalidData: return tr("无法解析 GitHub Release 信息", "Cannot parse GitHub release info")
             case .privateRepositoryAuthRequired:
-                return "私有仓库需要先安装 GitHub CLI 并执行 gh auth login"
+                return tr("私有仓库需要先安装 GitHub CLI 并执行 gh auth login",
+                          "Private repository requires GitHub CLI installed and gh auth login")
             case let .githubCLI(detail):
-                if let detail, !detail.isEmpty { return "GitHub CLI：\(detail)" }
-                return "GitHub CLI 认证失败"
+                if let detail, !detail.isEmpty { return tr("GitHub CLI：\(detail)", "GitHub CLI: \(detail)") }
+                return tr("GitHub CLI 认证失败", "GitHub CLI authentication failed")
             }
         }
     }

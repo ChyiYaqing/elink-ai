@@ -57,6 +57,7 @@ enabled).
 - today's total and per-model token count, plus working/idle/offline state
 - hourly (today), daily, and monthly token usage charts with per-model breakdown
 - token-category breakdown (input/output/cache read/cache write/reasoning) per range
+- English and Chinese interface language, switchable in settings at runtime
 - attention border for permission requests
 - smart, partial, periodic full, and manual full refresh
 - stale/offline display, last-frame preview, and persistent device settings
@@ -110,8 +111,9 @@ mascot while busy, dimmed when idle, green check when finished, subagents in a
 collapsible dropdown; discovered via `ps`/`lsof` and session transcripts, only
 polled while the panel is open, and toggleable in settings), the exact PNG last
 sent to the display with page switching and smart/full refresh controls, and a
-settings page for device pairing, launch at login, logs, and about. Settings
-are available from the gear button at the bottom of the panel.
+settings page for device pairing, launch at login, interface language
+(English/中文, follows the system language by default), logs, and about.
+Settings are available from the gear button at the bottom of the panel.
 Verify the bridge with:
 
 ```bash
