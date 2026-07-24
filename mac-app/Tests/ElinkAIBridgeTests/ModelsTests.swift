@@ -253,6 +253,91 @@ final class ModelsTests: XCTestCase {
         ])
     }
 
+    func testRecordHourlyRoundTripAndOverwrite() {
+        let path = NSTemporaryDirectory() + "elink-hourly-\(UUID().uuidString).db"
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let store = UsageStore(path: path)
+
+        store.recordHourly(day: "2026-07-24", provider: "claude",
+                           hours: [14: ["claude-a": 7], 9: ["claude-a": 5, "claude-b": 3]],
+                           expectedBucketTimeZone: nil)
+        XCTAssertEqual(store.hourlyUsage(provider: "claude", day: "2026-07-24"), [
+            HourlyModelUsage(day: "2026-07-24", hour: 9, provider: "claude",
+                             model: "claude-a", tokens: 5),
+            HourlyModelUsage(day: "2026-07-24", hour: 9, provider: "claude",
+                             model: "claude-b", tokens: 3),
+            HourlyModelUsage(day: "2026-07-24", hour: 14, provider: "claude",
+                             model: "claude-a", tokens: 7),
+        ])
+
+        // 覆盖语义：整天替换，旧小时行不残留
+        store.recordHourly(day: "2026-07-24", provider: "claude",
+                           hours: [10: ["claude-a": 4]], expectedBucketTimeZone: nil)
+        XCTAssertEqual(store.hourlyUsage(provider: "claude", day: "2026-07-24"), [
+            HourlyModelUsage(day: "2026-07-24", hour: 10, provider: "claude",
+                             model: "claude-a", tokens: 4),
+        ])
+        XCTAssertEqual(store.hourlyUsage(provider: "codex", day: "2026-07-24"), [])
+    }
+
+    func testRecordHourlyIgnoresEmptySetAndTimeZoneMismatch() {
+        let path = NSTemporaryDirectory() + "elink-hourly-guard-\(UUID().uuidString).db"
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let store = UsageStore(path: path)
+
+        store.recordHourly(day: "2026-07-24", provider: "claude",
+                           hours: [8: ["claude-a": 5]], expectedBucketTimeZone: nil)
+        let expected = [HourlyModelUsage(day: "2026-07-24", hour: 8, provider: "claude",
+                                         model: "claude-a", tokens: 5)]
+
+        // 空集视为日志暂不可读，不清已有数据
+        store.recordHourly(day: "2026-07-24", provider: "claude", hours: [:],
+                           expectedBucketTimeZone: nil)
+        store.recordHourly(day: "2026-07-24", provider: "claude", hours: [8: ["claude-a": 0]],
+                           expectedBucketTimeZone: nil)
+        XCTAssertEqual(store.hourlyUsage(provider: "claude", day: "2026-07-24"), expected)
+
+        // 分桶时区标记不一致时拒绝写入
+        store.recordHourly(day: "2026-07-24", provider: "claude", hours: [9: ["claude-a": 9]],
+                           expectedBucketTimeZone: "Asia/Singapore")
+        XCTAssertEqual(store.hourlyUsage(provider: "claude", day: "2026-07-24"), expected)
+    }
+
+    func testHourKeyMakerAndHourBucketsExtractTargetDay() throws {
+        let utc = try XCTUnwrap(TimeZone(identifier: "UTC"))
+        let hourKey = StatusService.hourKeyMaker(utc)
+        // 2023-11-14 22:13:20 UTC
+        let reference = Date(timeIntervalSince1970: 1_700_000_000)
+        XCTAssertEqual(hourKey(reference), "2023-11-14 22")
+        XCTAssertEqual(hourKey(reference.addingTimeInterval(-3600)), "2023-11-14 21")
+        XCTAssertEqual(hourKey(reference.addingTimeInterval(7200)), "2023-11-15 00")
+
+        let buckets = StatusService.hourBuckets(from: [
+            "2023-11-14 21": ["claude-a": 5],
+            "2023-11-14 22": ["claude-a": 7, "claude-b": 2],
+            "2023-11-15 00": ["claude-a": 9],
+        ], day: "2023-11-14")
+        XCTAssertEqual(buckets, [21: ["claude-a": 5], 22: ["claude-a": 7, "claude-b": 2]])
+    }
+
+    func testHourlyBucketsProduce24BarsWithModelsAtCorrectHours() {
+        let buckets = UsageStats.hourlyBuckets(rows: [
+            HourlyModelUsage(day: "2026-07-24", hour: 9, provider: "claude",
+                             model: "claude-a", tokens: 5),
+            HourlyModelUsage(day: "2026-07-24", hour: 9, provider: "claude",
+                             model: "claude-b", tokens: 3),
+            HourlyModelUsage(day: "2026-07-24", hour: 23, provider: "claude",
+                             model: "claude-a", tokens: 4),
+        ])
+        XCTAssertEqual(buckets.count, 24)
+        XCTAssertEqual(buckets.first?.id, "00")
+        XCTAssertEqual(buckets.last?.id, "23")
+        XCTAssertEqual(buckets[9].models, ["claude-a": 5, "claude-b": 3])
+        XCTAssertEqual(buckets[9].label, "9时")
+        XCTAssertEqual(buckets[23].total, 4)
+        XCTAssertEqual(buckets[0].total, 0)
+    }
+
     func testUsageStoreMigratesExistingDatabaseAndMaintainsTimestamps() throws {
         let path = NSTemporaryDirectory() + "elink-usage-migration-\(UUID().uuidString).db"
         defer { try? FileManager.default.removeItem(atPath: path) }

@@ -123,6 +123,12 @@ final class StatusService {
             day: today, provider: "claude", models: totals,
             expectedBucketTimeZone: timeZone.identifier, preservingResidue: true
         )
+        store?.recordHourly(
+            day: today, provider: "claude",
+            hours: Self.hourBuckets(
+                from: accumulator.dailyTotals(dayKey: Self.hourKeyMaker(timeZone)), day: today),
+            expectedBucketTimeZone: timeZone.identifier
+        )
         let models = Self.sorted(totals)
         return AgentStatus(
             state: state(latest),
@@ -138,13 +144,18 @@ final class StatusService {
         calendar.timeZone = timeZone
         let start = calendar.startOfDay(for: Date())
         let dayKey = Self.dayKeyMaker(timeZone)
+        let hourKey = Self.hourKeyMaker(timeZone)
         var daily: [String: [String: Int]] = [:]
+        var hourlyKeyed: [String: [String: Int]] = [:]
         var latestRateLimits: [String: Any]?
         var latestRateLimitsTimestamp = ""
         for file in files where (modification(file) ?? .distantPast) >= start {
             guard let text = try? String(contentsOf: file, encoding: .utf8) else { continue }
             let lines = text.split(separator: "\n").map(String.init)
-            Self.merge(Self.codexDailyUsage(lines: lines, dayKey: dayKey), into: &daily)
+            // 事件解析一次，按天/按小时各分桶一遍
+            let events = Self.codexUsageEvents(lines: lines)
+            Self.merge(Self.bucketCodexEvents(events, dayKey: dayKey), into: &daily)
+            Self.merge(Self.bucketCodexEvents(events, dayKey: hourKey), into: &hourlyKeyed)
             for line in lines where line.contains("\"token_count\"") {
                 guard let data = line.data(using: .utf8),
                       let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -164,6 +175,11 @@ final class StatusService {
         store?.record(
             day: today, provider: "codex", models: totals,
             expectedBucketTimeZone: timeZone.identifier, preservingResidue: true
+        )
+        store?.recordHourly(
+            day: today, provider: "codex",
+            hours: Self.hourBuckets(from: hourlyKeyed, day: today),
+            expectedBucketTimeZone: timeZone.identifier
         )
         let models = Self.sorted(totals)
         let windows = latestRateLimits.map(UsageFetcher.codexLogWindows)
@@ -380,6 +396,27 @@ final class StatusService {
         formatter.dateFormat = "yyyy-MM-dd"
         formatter.timeZone = timeZone
         return { formatter.string(from: $0) }
+    }
+
+    /// "yyyy-MM-dd HH"，与 dayKeyMaker 相同的固定时区捕获语义，供小时分桶
+    static func hourKeyMaker(_ timeZone: TimeZone) -> (Date) -> String {
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.dateFormat = "yyyy-MM-dd HH"
+        formatter.timeZone = timeZone
+        return { formatter.string(from: $0) }
+    }
+
+    /// 从 hourKey 分桶结果中取出指定 day 的各小时桶（0..23）
+    static func hourBuckets(from keyed: [String: [String: Int]],
+                            day: String) -> [Int: [String: Int]] {
+        var buckets: [Int: [String: Int]] = [:]
+        let prefix = day + " "
+        for (key, models) in keyed where key.hasPrefix(prefix) {
+            guard let hour = Int(key.dropFirst(prefix.count)), (0..<24).contains(hour) else { continue }
+            buckets[hour] = models
+        }
+        return buckets
     }
 
     /// Claude 会话行解析：消息按 id 去重（流式更新/会话续写会跨行、跨文件重复），按天聚合

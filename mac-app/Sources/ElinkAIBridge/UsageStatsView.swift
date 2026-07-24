@@ -2,10 +2,11 @@ import Combine
 import SwiftUI
 
 enum StatsRange: String, CaseIterable {
-    case week, month, year
+    case day, week, month, year
 
     var title: String {
         switch self {
+        case .day: return "日"
         case .week: return "周"
         case .month: return "月"
         case .year: return "年"
@@ -14,6 +15,7 @@ enum StatsRange: String, CaseIterable {
 
     var summaryTitle: String {
         switch self {
+        case .day: return "今日"
         case .week: return "近 7 天"
         case .month: return "近 30 天"
         case .year: return "近 12 个月"
@@ -43,6 +45,9 @@ enum UsageStats {
             byDay[row.day, default: [:]][row.model, default: 0] += row.tokens
         }
         switch range {
+        case .day:
+            // 「日」档走 hourlyBuckets（小时表），不使用天粒度行
+            return []
         case .week, .month:
             let count = range == .week ? 7 : 30
             return (0..<count).reversed().map { offset in
@@ -90,6 +95,18 @@ enum UsageStats {
             }
     }
 
+    /// 今日 0-23 时的小时桶，固定 24 个，id "00".."23"
+    static func hourlyBuckets(rows: [HourlyModelUsage]) -> [StatsBucket] {
+        var byHour: [Int: [String: Int]] = [:]
+        for row in rows {
+            byHour[row.hour, default: [:]][row.model, default: 0] += row.tokens
+        }
+        return (0..<24).map { hour in
+            StatsBucket(id: String(format: "%02d", hour), label: "\(hour)时",
+                        models: byHour[hour] ?? [:])
+        }
+    }
+
     /// 全范围内按总量降序的模型列表，决定堆叠顺序与配色
     static func modelOrder(_ buckets: [StatsBucket]) -> [String] {
         var totals: [String: Int] = [:]
@@ -130,13 +147,17 @@ struct UsageStatsView: View {
 
     @State private var range: StatsRange = .week
     @State private var rows: [DailyModelUsage] = []
+    @State private var hourlyRows: [HourlyModelUsage] = []
     @State private var loaded = false
     @State private var hoveredBucket: String?
     @State private var selectedNodeID = ""
 
     var body: some View {
         let chartRows = effectiveNodeID.map { id in rows.filter { $0.nodeID == id } } ?? rows
-        let buckets = UsageStats.buckets(rows: chartRows, range: range)
+        // 「日」档展示今日 24 小时分布；小时数据仅本机，不参与节点筛选/设备占比
+        let buckets = range == .day
+            ? UsageStats.hourlyBuckets(rows: hourlyRows)
+            : UsageStats.buckets(rows: chartRows, range: range)
         let order = UsageStats.modelOrder(buckets)
         let colors = UsageStats.colors(for: order)
         // 全范围的设备列表决定区块是否展示；悬停某个桶时明细跟随该桶，与 detail 口径一致
@@ -146,7 +167,7 @@ struct UsageStatsView: View {
         } ?? rangeDevices
         return VStack(spacing: 10) {
             header
-            if clusterNodes.count > 1 { nodeFilter }
+            if clusterNodes.count > 1, range != .day { nodeFilter }
             if order.isEmpty {
                 emptyState
             } else {
@@ -154,7 +175,8 @@ struct UsageStatsView: View {
                 ScrollView(.vertical, showsIndicators: false) {
                     VStack(spacing: 10) {
                         detail(buckets: buckets, order: order, colors: colors)
-                        if clusterNodes.count > 1, effectiveNodeID == nil, rangeDevices.count > 1 {
+                        if clusterNodes.count > 1, range != .day, effectiveNodeID == nil,
+                           rangeDevices.count > 1 {
                             deviceSection(devices: devices, order: order, colors: colors,
                                           heading: deviceHeading(buckets))
                         }
@@ -201,7 +223,7 @@ struct UsageStatsView: View {
             }
             .pickerStyle(.segmented)
             .labelsHidden()
-            .frame(width: 120)
+            .frame(width: 160)
         }
     }
 
@@ -243,7 +265,7 @@ struct UsageStatsView: View {
     private func chart(buckets: [StatsBucket], order: [String],
                        colors: [String: Color]) -> some View {
         let maxTotal = buckets.map(\.total).max() ?? 0
-        let spacing: CGFloat = range == .month ? 2 : 4
+        let spacing: CGFloat = (range == .month || range == .day) ? 2 : 4
         return VStack(spacing: 4) {
             HStack {
                 Text("\(range.summaryTitle) · 共 \(UsageFormat.tokens(buckets.reduce(0) { $0 + $1.total })) tokens")
@@ -276,7 +298,8 @@ struct UsageStatsView: View {
     }
 
     private func showsLabel(index: Int, count: Int) -> Bool {
-        count <= 12 || index % 5 == 0 || index == count - 1
+        if range == .day { return index % 6 == 0 || index == count - 1 }
+        return count <= 12 || index % 5 == 0 || index == count - 1
     }
 
     private func bar(_ bucket: StatsBucket, maxTotal: Int, order: [String],
@@ -295,7 +318,7 @@ struct UsageStatsView: View {
                         let segmentHeight = max(1, height * CGFloat(tokens) / CGFloat(total))
                         ZStack {
                             Rectangle().fill(colors[model] ?? .gray)
-                            if range != .month, segmentHeight >= 12 {
+                            if range != .month, range != .day, segmentHeight >= 12 {
                                 Text(Self.percentText(tokens, of: total))
                                     .font(.system(size: 7, weight: .bold, design: .rounded))
                                     .foregroundStyle(.white.opacity(0.95))
@@ -479,11 +502,14 @@ struct UsageStatsView: View {
             StatusService.aggregationCalendar.date(byAdding: .day, value: -366, to: Date()) ?? Date())
         let provider = provider
         if !silent { loaded = false }
+        let today = StatusService.dayKey(Date())
         // 集群启用时 usage() 返回全节点带 nodeID 的行，节点筛选在内存中完成
         DispatchQueue.global(qos: .userInitiated).async {
             let result = UsageStore.shared.usage(provider: provider, since: since)
+            let hourly = UsageStore.shared.hourlyUsage(provider: provider, day: today)
             DispatchQueue.main.async {
                 rows = result
+                hourlyRows = hourly
                 loaded = true
             }
         }

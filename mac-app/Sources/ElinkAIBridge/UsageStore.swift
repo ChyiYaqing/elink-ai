@@ -9,6 +9,14 @@ struct DailyModelUsage: Equatable {
     var nodeID: String? = nil
 }
 
+struct HourlyModelUsage: Equatable {
+    var day: String      // 本地时区 "yyyy-MM-dd"
+    var hour: Int        // 0..23
+    var provider: String
+    var model: String
+    var tokens: Int
+}
+
 typealias DailyUsageTotals = [String: [String: Int]]
 
 struct UsageHistoryTotals: Equatable {
@@ -84,6 +92,19 @@ final class UsageStore {
             } else if !Self.columns(in: db).isSuperset(of: ["created_at", "updated_at"]) {
                 Self.migrateTimestamps(in: db)
             }
+            let createHourly = """
+            CREATE TABLE IF NOT EXISTS hourly_model_usage (
+                day TEXT NOT NULL,
+                hour INTEGER NOT NULL,
+                provider TEXT NOT NULL,
+                model TEXT NOT NULL,
+                tokens INTEGER NOT NULL,
+                PRIMARY KEY (day, hour, provider, model)
+            )
+            """
+            if sqlite3_exec(db, createHourly, nil, nil, nil) != SQLITE_OK {
+                Log.error("hourly usage table create failed", category: "storage")
+            }
             let createCache = """
             CREATE TABLE IF NOT EXISTS provider_usage_cache (
                 provider TEXT NOT NULL,
@@ -146,6 +167,105 @@ final class UsageStore {
         if let descriptor {
             onClusterUsageChange?([descriptor])
             Self.notifyDataChanged()
+        }
+    }
+
+    /// 覆盖写入某天某 provider 的小时分布（仅本机，不参与集群同步/残差/迁移）。
+    /// 空集只会来自暂时读不到日志的场景，直接忽略，避免清掉已有小时数据。
+    func recordHourly(day: String, provider: String, hours: [Int: [String: Int]],
+                      expectedBucketTimeZone: String?) {
+        var rows: [HourlyModelUsage] = []
+        for (hour, models) in hours {
+            for (model, tokens) in models where tokens > 0 {
+                rows.append(HourlyModelUsage(
+                    day: day, hour: hour, provider: provider, model: model, tokens: tokens
+                ))
+            }
+        }
+        guard !rows.isEmpty else { return }
+        let changed: Bool = queue.sync {
+            guard db != nil,
+                  sqlite3_exec(db, "BEGIN IMMEDIATE", nil, nil, nil) == SQLITE_OK else { return false }
+            let marker = metadataValueLocked(Self.bucketTimeZoneMetadataKey)
+            guard marker.succeeded, marker.value == expectedBucketTimeZone else {
+                _ = finishTransactionLocked(false)
+                return false
+            }
+            // 无变化时回滚且不发通知，避免统计页随 5 分钟采集反复重载
+            if let existing = hourlyRowsLocked(day: day, provider: provider),
+               Set(existing.map { "\($0.hour)|\($0.model)|\($0.tokens)" })
+                   == Set(rows.map { "\($0.hour)|\($0.model)|\($0.tokens)" }) {
+                _ = finishTransactionLocked(false)
+                return false
+            }
+            var succeeded = false
+            var deleteStatement: OpaquePointer?
+            if sqlite3_prepare_v2(db, "DELETE FROM hourly_model_usage WHERE day = ? AND provider = ?",
+                                  -1, &deleteStatement, nil) == SQLITE_OK {
+                sqlite3_bind_text(deleteStatement, 1, day, -1, Self.transient)
+                sqlite3_bind_text(deleteStatement, 2, provider, -1, Self.transient)
+                succeeded = sqlite3_step(deleteStatement) == SQLITE_DONE
+            }
+            sqlite3_finalize(deleteStatement)
+            if succeeded {
+                let insert = """
+                INSERT INTO hourly_model_usage (day, hour, provider, model, tokens)
+                VALUES (?, ?, ?, ?, ?)
+                """
+                var statement: OpaquePointer?
+                if sqlite3_prepare_v2(db, insert, -1, &statement, nil) == SQLITE_OK {
+                    for row in rows {
+                        sqlite3_reset(statement)
+                        sqlite3_bind_text(statement, 1, row.day, -1, Self.transient)
+                        sqlite3_bind_int64(statement, 2, Int64(row.hour))
+                        sqlite3_bind_text(statement, 3, row.provider, -1, Self.transient)
+                        sqlite3_bind_text(statement, 4, row.model, -1, Self.transient)
+                        sqlite3_bind_int64(statement, 5, Int64(row.tokens))
+                        if sqlite3_step(statement) != SQLITE_DONE { succeeded = false; break }
+                    }
+                } else {
+                    succeeded = false
+                }
+                sqlite3_finalize(statement)
+            }
+            return finishTransactionLocked(succeeded)
+        }
+        if changed { Self.notifyDataChanged() }
+    }
+
+    /// 读单日小时行；失败返回 nil（与“空日”区分）。须在 queue 内调用
+    private func hourlyRowsLocked(day: String, provider: String) -> [HourlyModelUsage]? {
+        let sql = """
+        SELECT hour, model, tokens FROM hourly_model_usage
+        WHERE day = ? AND provider = ? ORDER BY hour, model
+        """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return nil }
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_text(statement, 1, day, -1, Self.transient)
+        sqlite3_bind_text(statement, 2, provider, -1, Self.transient)
+        var rows: [HourlyModelUsage] = []
+        while true {
+            let result = sqlite3_step(statement)
+            if result == SQLITE_DONE { return rows }
+            guard result == SQLITE_ROW, let model = sqlite3_column_text(statement, 1) else {
+                return nil
+            }
+            rows.append(HourlyModelUsage(
+                day: day,
+                hour: Int(sqlite3_column_int64(statement, 0)),
+                provider: provider,
+                model: String(cString: model),
+                tokens: Int(sqlite3_column_int64(statement, 2))
+            ))
+        }
+    }
+
+    /// 小时数据仅本机记录，不走集群聚合分支
+    func hourlyUsage(provider: String, day: String) -> [HourlyModelUsage] {
+        queue.sync {
+            guard db != nil else { return [] }
+            return hourlyRowsLocked(day: day, provider: provider) ?? []
         }
     }
 

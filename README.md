@@ -42,11 +42,17 @@ The editable source is [docs/architecture.drawio](docs/architecture.drawio)
   <img src="docs/images/codex-usage-stats.png" alt="Codex token usage statistics with daily stacked bars and per-model breakdown" width="390">
 </p>
 
+Each provider card opens stacked bar charts with day/week/month/year ranges.
+The day range shows today's hour-by-hour token distribution (24 bars, local to
+this Mac); hovering a bar reveals the per-model breakdown for that hour, day,
+or month.
+
 ## Current scope
 
 - Claude and Codex side-by-side dashboard
 - 5-hour and weekly usage/reset time
 - today's total and per-model token count, plus working/idle/offline state
+- hourly (today), daily, and monthly token usage charts with per-model breakdown
 - attention border for permission requests
 - smart, partial, periodic full, and manual full refresh
 - stale/offline display, last-frame preview, and persistent device settings
