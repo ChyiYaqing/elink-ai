@@ -129,6 +129,11 @@ final class StatusService {
                 from: accumulator.dailyTotals(dayKey: Self.hourKeyMaker(timeZone)), day: today),
             expectedBucketTimeZone: timeZone.identifier
         )
+        store?.recordCategories(
+            day: today, provider: "claude",
+            categories: accumulator.dailyCategoryTotals(dayKey: dayKey)[today] ?? [:],
+            expectedBucketTimeZone: timeZone.identifier
+        )
         let models = Self.sorted(totals)
         return AgentStatus(
             state: state(latest),
@@ -147,15 +152,17 @@ final class StatusService {
         let hourKey = Self.hourKeyMaker(timeZone)
         var daily: [String: [String: Int]] = [:]
         var hourlyKeyed: [String: [String: Int]] = [:]
+        var dailyCategories: [String: [String: Int]] = [:]
         var latestRateLimits: [String: Any]?
         var latestRateLimitsTimestamp = ""
         for file in files where (modification(file) ?? .distantPast) >= start {
             guard let text = try? String(contentsOf: file, encoding: .utf8) else { continue }
             let lines = text.split(separator: "\n").map(String.init)
-            // 事件解析一次，按天/按小时各分桶一遍
+            // 事件解析一次，按天/按小时/按分类各分桶一遍
             let events = Self.codexUsageEvents(lines: lines)
             Self.merge(Self.bucketCodexEvents(events, dayKey: dayKey), into: &daily)
             Self.merge(Self.bucketCodexEvents(events, dayKey: hourKey), into: &hourlyKeyed)
+            Self.merge(Self.bucketCodexCategories(events, dayKey: dayKey), into: &dailyCategories)
             for line in lines where line.contains("\"token_count\"") {
                 guard let data = line.data(using: .utf8),
                       let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -179,6 +186,11 @@ final class StatusService {
         store?.recordHourly(
             day: today, provider: "codex",
             hours: Self.hourBuckets(from: hourlyKeyed, day: today),
+            expectedBucketTimeZone: timeZone.identifier
+        )
+        store?.recordCategories(
+            day: today, provider: "codex",
+            categories: dailyCategories[today] ?? [:],
             expectedBucketTimeZone: timeZone.identifier
         )
         let models = Self.sorted(totals)
@@ -419,10 +431,19 @@ final class StatusService {
         return buckets
     }
 
+    /// Claude usage 字段 -> 统一分类键；四类互不重叠，加和即消息总量
+    private static let claudeCategoryFields = [
+        ("input_tokens", "input"),
+        ("output_tokens", "output"),
+        ("cache_creation_input_tokens", "cache_write"),
+        ("cache_read_input_tokens", "cache_read"),
+    ]
+
     /// Claude 会话行解析：消息按 id 去重（流式更新/会话续写会跨行、跨文件重复），按天聚合
     final class ClaudeUsageAccumulator {
         // 保存原始时间戳而非 day key，分桶推迟到 dailyTotals，支持按指定时区重分桶
-        private var messages: [String: (date: Date, model: String, tokens: Int)] = [:]
+        private var messages:
+            [String: (date: Date, model: String, tokens: Int, categories: [String: Int])] = [:]
 
         func add(lines: [String]) {
             for line in lines where line.contains("\"usage\"") {
@@ -431,15 +452,19 @@ final class StatusService {
                       let timestamp = StatusService.timestamp(object["timestamp"]),
                       let message = object["message"] as? [String: Any],
                       let usage = message["usage"] as? [String: Any] else { continue }
-                let tokens = ["input_tokens", "output_tokens", "cache_creation_input_tokens",
-                              "cache_read_input_tokens"].reduce(0) {
-                    $0 + ((usage[$1] as? NSNumber)?.intValue ?? 0)
+                var categories: [String: Int] = [:]
+                var tokens = 0
+                for (field, category) in StatusService.claudeCategoryFields {
+                    let value = (usage[field] as? NSNumber)?.intValue ?? 0
+                    tokens += value
+                    if value > 0 { categories[category] = value }
                 }
                 guard tokens > 0 else { continue }
                 let identifier = (message["id"] as? String) ?? (object["uuid"] as? String) ?? line
                 if tokens > (messages[identifier]?.tokens ?? -1) {
                     messages[identifier] = (timestamp,
-                                            StatusService.normalizedModel(message["model"]), tokens)
+                                            StatusService.normalizedModel(message["model"]),
+                                            tokens, categories)
                 }
             }
         }
@@ -451,17 +476,33 @@ final class StatusService {
             }
             return totals
         }
+
+        /// 按天聚合的 token 分类用量，键为 input/output/cache_write/cache_read
+        func dailyCategoryTotals(
+            dayKey: (Date) -> String = StatusService.dayKey
+        ) -> [String: [String: Int]] {
+            var totals: [String: [String: Int]] = [:]
+            for value in messages.values {
+                for (category, tokens) in value.categories {
+                    totals[dayKey(value.date), default: [:]][category, default: 0] += tokens
+                }
+            }
+            return totals
+        }
     }
 
-    /// 单个 Codex 会话文件的行 -> (时间戳, 模型, token 增量) 事件序列。
+    /// 单个 Codex 会话文件的行 -> (时间戳, 模型, token 增量, 分类增量) 事件序列。
     /// 增量计算与分桶时区无关，解析一次即可按多个时区分桶。
     /// subagent 会话会先写 token_count、之后才声明模型；模型声明前的事件
     /// 归属文件首个声明的模型，文件从头到尾没有模型时才落到 "unknown"。
-    static func codexUsageEvents(lines: [String]) -> [(date: Date, model: String, tokens: Int)] {
-        var events: [(date: Date, model: String?, tokens: Int)] = []
+    static func codexUsageEvents(
+        lines: [String]
+    ) -> [(date: Date, model: String, tokens: Int, categories: [String: Int])] {
+        var events: [(date: Date, model: String?, tokens: Int, categories: [String: Int])] = []
         var model: String?
         var firstModel: String?
         var previousTotal: Int?
+        var previousFields: [String: Int] = [:]
         for line in lines {
             guard let data = line.data(using: .utf8),
                   let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -475,32 +516,80 @@ final class StatusService {
                   let total = info["total_token_usage"] as? [String: Any],
                   let cumulative = (total["total_tokens"] as? NSNumber)?.intValue else { continue }
 
-            let last = (info["last_token_usage"] as? [String: Any])
-                .flatMap { ($0["total_tokens"] as? NSNumber)?.intValue }
+            let lastUsage = info["last_token_usage"] as? [String: Any]
+            let last = lastUsage.flatMap { ($0["total_tokens"] as? NSNumber)?.intValue }
+            let cumulativeFields = codexCategoryFieldValues(total)
             let delta: Int
+            let deltaFields: [String: Int]
             if let previousTotal, cumulative == previousTotal {
                 delta = 0
+                deltaFields = [:]
             } else if let last {
                 delta = last
+                deltaFields = lastUsage.map(codexCategoryFieldValues) ?? [:]
             } else if let previousTotal {
                 delta = max(0, cumulative - previousTotal)
+                deltaFields = cumulativeFields.reduce(into: [:]) { result, entry in
+                    result[entry.key] = max(0, entry.value - (previousFields[entry.key] ?? 0))
+                }
             } else {
                 delta = cumulative
+                deltaFields = cumulativeFields
             }
             previousTotal = cumulative
+            previousFields = cumulativeFields
 
             guard delta > 0, let date = timestamp(object["timestamp"]) else { continue }
-            events.append((date, model, delta))
+            events.append((date, model, delta, codexDisjointCategories(deltaFields)))
         }
         return events.map { (date: $0.date, model: normalizedModel($0.model ?? firstModel),
-                             tokens: $0.tokens) }
+                             tokens: $0.tokens, categories: $0.categories) }
     }
 
-    static func bucketCodexEvents(_ events: [(date: Date, model: String, tokens: Int)],
-                                  dayKey: (Date) -> String) -> [String: [String: Int]] {
+    /// Codex token_count 用量字典中与分类相关的原始字段值
+    private static func codexCategoryFieldValues(_ usage: [String: Any]) -> [String: Int] {
+        var values: [String: Int] = [:]
+        for field in ["input_tokens", "cached_input_tokens",
+                      "output_tokens", "reasoning_output_tokens"] {
+            values[field] = (usage[field] as? NSNumber)?.intValue ?? 0
+        }
+        return values
+    }
+
+    /// Codex 的 cached ⊆ input、reasoning ⊆ output，扣除重叠后各分类互不相交
+    static func codexDisjointCategories(_ fields: [String: Int]) -> [String: Int] {
+        let cached = max(0, fields["cached_input_tokens"] ?? 0)
+        let reasoning = max(0, fields["reasoning_output_tokens"] ?? 0)
+        var categories: [String: Int] = [:]
+        let input = max(0, (fields["input_tokens"] ?? 0) - cached)
+        let output = max(0, (fields["output_tokens"] ?? 0) - reasoning)
+        if input > 0 { categories["input"] = input }
+        if output > 0 { categories["output"] = output }
+        if cached > 0 { categories["cache_read"] = cached }
+        if reasoning > 0 { categories["reasoning"] = reasoning }
+        return categories
+    }
+
+    static func bucketCodexEvents(
+        _ events: [(date: Date, model: String, tokens: Int, categories: [String: Int])],
+        dayKey: (Date) -> String
+    ) -> [String: [String: Int]] {
         var totals: [String: [String: Int]] = [:]
         for event in events {
             totals[dayKey(event.date), default: [:]][event.model, default: 0] += event.tokens
+        }
+        return totals
+    }
+
+    static func bucketCodexCategories(
+        _ events: [(date: Date, model: String, tokens: Int, categories: [String: Int])],
+        dayKey: (Date) -> String
+    ) -> [String: [String: Int]] {
+        var totals: [String: [String: Int]] = [:]
+        for event in events {
+            for (category, tokens) in event.categories {
+                totals[dayKey(event.date), default: [:]][category, default: 0] += tokens
+            }
         }
         return totals
     }

@@ -118,6 +118,37 @@ enum UsageStats {
             .map(\.key)
     }
 
+    /// Token 分类的展示顺序、中文名与配色（参考 Input 蓝 / Output 绿 /
+    /// Cache Read 紫 / Cache Write 橙 / Reasoning 红的通用惯例）
+    static let categoryOrder: [(key: String, label: String, color: Color)] = [
+        ("input", "输入", Color(red: 0.36, green: 0.62, blue: 0.98)),
+        ("output", "输出", Color(red: 0.30, green: 0.76, blue: 0.55)),
+        ("cache_read", "缓存读取", Color(red: 0.78, green: 0.38, blue: 0.92)),
+        ("cache_write", "缓存写入", Color(red: 0.95, green: 0.60, blue: 0.25)),
+        ("reasoning", "推理", Color(red: 0.98, green: 0.38, blue: 0.45)),
+    ]
+
+    /// 当前范围窗口内的 token 分类总量；分类数据仅本机、按天累积
+    static func categoryTotals(rows: [DailyCategoryUsage], range: StatsRange,
+                               now: Date = Date()) -> [String: Int] {
+        var totals: [String: Int] = [:]
+        switch range {
+        case .day:
+            let today = StatusService.dayKey(now)
+            for row in rows where row.day == today {
+                totals[row.category, default: 0] += row.tokens
+            }
+        case .week, .month, .year:
+            let keys = Set(buckets(rows: [], range: range, now: now).map(\.id))
+            for row in rows {
+                let key = range == .year ? String(row.day.prefix(7)) : row.day
+                guard keys.contains(key) else { continue }
+                totals[row.category, default: 0] += row.tokens
+            }
+        }
+        return totals
+    }
+
     static let palette: [Color] = [
         Color(red: 0.98, green: 0.55, blue: 0.45), // 珊瑚
         Color(red: 0.30, green: 0.76, blue: 0.71), // 青绿
@@ -148,6 +179,7 @@ struct UsageStatsView: View {
     @State private var range: StatsRange = .week
     @State private var rows: [DailyModelUsage] = []
     @State private var hourlyRows: [HourlyModelUsage] = []
+    @State private var categoryRows: [DailyCategoryUsage] = []
     @State private var loaded = false
     @State private var hoveredBucket: String?
     @State private var selectedNodeID = ""
@@ -175,6 +207,8 @@ struct UsageStatsView: View {
                 ScrollView(.vertical, showsIndicators: false) {
                     VStack(spacing: 10) {
                         detail(buckets: buckets, order: order, colors: colors)
+                        categorySection(
+                            UsageStats.categoryTotals(rows: categoryRows, range: range))
                         if clusterNodes.count > 1, range != .day, effectiveNodeID == nil,
                            rangeDevices.count > 1 {
                             deviceSection(devices: devices, order: order, colors: colors,
@@ -395,6 +429,61 @@ struct UsageStatsView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
+    /// Token 分类区块：占比条 + 各分类数量与百分比。分类数据仅本机记录，
+    /// 从启用后随 5 分钟采集按天累积，历史日期不回填
+    @ViewBuilder
+    private func categorySection(_ totals: [String: Int]) -> some View {
+        let entries = UsageStats.categoryOrder.compactMap {
+            item -> (label: String, color: Color, tokens: Int)? in
+            guard let tokens = totals[item.key], tokens > 0 else { return nil }
+            return (item.label, item.color, tokens)
+        }
+        let total = entries.reduce(0) { $0 + $1.tokens }
+        if total > 0 {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("\(range.summaryTitle) Token 分类")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(theme.textSecondary)
+                GeometryReader { geo in
+                    HStack(spacing: 1) {
+                        ForEach(entries.indices, id: \.self) { index in
+                            Rectangle().fill(entries[index].color)
+                                .frame(width: geo.size.width * CGFloat(entries[index].tokens)
+                                    / CGFloat(max(1, total)))
+                        }
+                    }
+                    .clipShape(Capsule())
+                }
+                .frame(height: 5)
+                ForEach(entries.indices, id: \.self) { index in
+                    let entry = entries[index]
+                    HStack(spacing: 5) {
+                        Circle().fill(entry.color).frame(width: 6, height: 6)
+                        Text(entry.label)
+                            .font(.system(size: 9, weight: .medium))
+                            .foregroundStyle(theme.textPrimary)
+                        Spacer()
+                        Text(UsageFormat.tokens(entry.tokens))
+                            .font(.system(size: 9, weight: .medium, design: .monospaced))
+                            .foregroundStyle(theme.textTertiary)
+                        Text(Self.categoryPercentText(entry.tokens, of: total))
+                            .font(.system(size: 9, weight: .bold, design: .monospaced))
+                            .foregroundStyle(theme.textSecondary)
+                            .frame(width: 40, alignment: .trailing)
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    /// 分类占比保留一位小数；缓存读取通常占绝对多数，整数百分比会把其余项挤成 0%
+    static func categoryPercentText(_ tokens: Int, of total: Int) -> String {
+        guard total > 0, tokens > 0 else { return "0%" }
+        let percent = Double(tokens) / Double(total) * 100
+        return percent < 0.1 ? "<0.1%" : String(format: "%.1f%%", percent)
+    }
+
     /// 悬停某个桶时标题跟随该桶，与 detail 的标题口径一致
     private func deviceHeading(_ buckets: [StatsBucket]) -> String {
         let hovered = hoveredBucket.flatMap { id in buckets.first { $0.id == id } }
@@ -507,9 +596,11 @@ struct UsageStatsView: View {
         DispatchQueue.global(qos: .userInitiated).async {
             let result = UsageStore.shared.usage(provider: provider, since: since)
             let hourly = UsageStore.shared.hourlyUsage(provider: provider, day: today)
+            let categories = UsageStore.shared.categoryUsage(provider: provider, since: since)
             DispatchQueue.main.async {
                 rows = result
                 hourlyRows = hourly
+                categoryRows = categories
                 loaded = true
             }
         }

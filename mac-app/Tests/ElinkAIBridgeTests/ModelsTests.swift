@@ -320,6 +320,97 @@ final class ModelsTests: XCTestCase {
         XCTAssertEqual(buckets, [21: ["claude-a": 5], 22: ["claude-a": 7, "claude-b": 2]])
     }
 
+    func testRecordCategoriesRoundTripOverwriteAndGuards() {
+        let path = NSTemporaryDirectory() + "elink-category-\(UUID().uuidString).db"
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let store = UsageStore(path: path)
+
+        store.recordCategories(day: "2026-07-24", provider: "claude",
+                               categories: ["input": 10, "cache_read": 90, "empty": 0],
+                               expectedBucketTimeZone: nil)
+        XCTAssertEqual(store.categoryUsage(provider: "claude", since: "2026-07-24"), [
+            DailyCategoryUsage(day: "2026-07-24", provider: "claude",
+                               category: "cache_read", tokens: 90),
+            DailyCategoryUsage(day: "2026-07-24", provider: "claude",
+                               category: "input", tokens: 10),
+        ])
+
+        // 覆盖语义：整天替换，消失的分类不残留
+        store.recordCategories(day: "2026-07-24", provider: "claude",
+                               categories: ["output": 7], expectedBucketTimeZone: nil)
+        let expected = [DailyCategoryUsage(day: "2026-07-24", provider: "claude",
+                                           category: "output", tokens: 7)]
+        XCTAssertEqual(store.categoryUsage(provider: "claude", since: "2026-07-24"), expected)
+
+        // 空集与时区不匹配都不动已有数据
+        store.recordCategories(day: "2026-07-24", provider: "claude", categories: [:],
+                               expectedBucketTimeZone: nil)
+        store.recordCategories(day: "2026-07-24", provider: "claude", categories: ["input": 9],
+                               expectedBucketTimeZone: "Asia/Singapore")
+        XCTAssertEqual(store.categoryUsage(provider: "claude", since: "2026-07-24"), expected)
+        XCTAssertEqual(store.categoryUsage(provider: "codex", since: "2026-01-01"), [])
+    }
+
+    func testClaudeUsageAccumulatorSplitsTokenCategories() {
+        let first = #"{"timestamp":"1970-01-01T00:20:00.000Z","uuid":"one","message":{"id":"msg-1","model":"claude-a","usage":{"input_tokens":10,"output_tokens":2,"cache_creation_input_tokens":3,"cache_read_input_tokens":5}}}"#
+        let duplicate = #"{"timestamp":"1970-01-01T00:20:01.000Z","uuid":"two","message":{"id":"msg-1","model":"claude-a","usage":{"input_tokens":10,"output_tokens":2,"cache_creation_input_tokens":3,"cache_read_input_tokens":5}}}"#
+        let second = #"{"timestamp":"1970-01-01T00:20:02.000Z","uuid":"three","message":{"id":"msg-2","model":"claude-b","usage":{"input_tokens":7,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#
+
+        let accumulator = StatusService.ClaudeUsageAccumulator()
+        accumulator.add(lines: [first, duplicate, second])
+
+        let day = StatusService.dayKey(Date(timeIntervalSince1970: 1_200))
+        XCTAssertEqual(accumulator.dailyCategoryTotals(), [
+            day: ["input": 17, "output": 2, "cache_write": 3, "cache_read": 5],
+        ])
+    }
+
+    func testCodexUsageEventsSplitTokenCategoriesDisjointly() {
+        let model = #"{"timestamp":"1970-01-01T00:20:00.000Z","type":"turn_context","payload":{"model":"gpt-a"}}"#
+        // cached ⊆ input、reasoning ⊆ output，分类应扣除重叠
+        let first = #"{"timestamp":"1970-01-01T00:20:01.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":60,"output_tokens":40,"reasoning_output_tokens":10,"total_tokens":140},"last_token_usage":{"input_tokens":100,"cached_input_tokens":60,"output_tokens":40,"reasoning_output_tokens":10,"total_tokens":140}}}}"#
+        let duplicate = #"{"timestamp":"1970-01-01T00:20:02.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":60,"output_tokens":40,"reasoning_output_tokens":10,"total_tokens":140},"last_token_usage":{"input_tokens":100,"cached_input_tokens":60,"output_tokens":40,"reasoning_output_tokens":10,"total_tokens":140}}}}"#
+        // 无 last_token_usage 时按累计值差分
+        let cumulativeOnly = #"{"timestamp":"1970-01-01T00:20:03.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":130,"cached_input_tokens":80,"output_tokens":60,"reasoning_output_tokens":15,"total_tokens":190}}}}"#
+
+        let events = StatusService.codexUsageEvents(
+            lines: [model, first, duplicate, cumulativeOnly])
+
+        XCTAssertEqual(events.count, 2)
+        XCTAssertEqual(events[0].tokens, 140)
+        XCTAssertEqual(events[0].categories,
+                       ["input": 40, "cache_read": 60, "output": 30, "reasoning": 10])
+        XCTAssertEqual(events[1].tokens, 50)
+        XCTAssertEqual(events[1].categories,
+                       ["input": 10, "cache_read": 20, "output": 15, "reasoning": 5])
+
+        let day = StatusService.dayKey(Date(timeIntervalSince1970: 1_200))
+        XCTAssertEqual(StatusService.bucketCodexCategories(events, dayKey: StatusService.dayKey), [
+            day: ["input": 50, "cache_read": 80, "output": 45, "reasoning": 15],
+        ])
+    }
+
+    func testCategoryTotalsFollowRangeWindows() throws {
+        let calendar = StatusService.aggregationCalendar
+        let now = Date()
+        let today = StatusService.dayKey(now)
+        let eightDaysAgo = StatusService.dayKey(
+            try XCTUnwrap(calendar.date(byAdding: .day, value: -8, to: now)))
+        let rows = [
+            DailyCategoryUsage(day: today, provider: "claude", category: "input", tokens: 5),
+            DailyCategoryUsage(day: eightDaysAgo, provider: "claude", category: "input", tokens: 7),
+        ]
+
+        XCTAssertEqual(UsageStats.categoryTotals(rows: rows, range: .day, now: now),
+                       ["input": 5])
+        XCTAssertEqual(UsageStats.categoryTotals(rows: rows, range: .week, now: now),
+                       ["input": 5])
+        XCTAssertEqual(UsageStats.categoryTotals(rows: rows, range: .month, now: now),
+                       ["input": 12])
+        XCTAssertEqual(UsageStats.categoryTotals(rows: rows, range: .year, now: now),
+                       ["input": 12])
+    }
+
     func testHourlyBucketsProduce24BarsWithModelsAtCorrectHours() {
         let buckets = UsageStats.hourlyBuckets(rows: [
             HourlyModelUsage(day: "2026-07-24", hour: 9, provider: "claude",

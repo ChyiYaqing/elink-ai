@@ -17,6 +17,13 @@ struct HourlyModelUsage: Equatable {
     var tokens: Int
 }
 
+struct DailyCategoryUsage: Equatable {
+    var day: String      // 本地时区 "yyyy-MM-dd"
+    var provider: String
+    var category: String // input / output / cache_read / cache_write / reasoning
+    var tokens: Int
+}
+
 typealias DailyUsageTotals = [String: [String: Int]]
 
 struct UsageHistoryTotals: Equatable {
@@ -104,6 +111,18 @@ final class UsageStore {
             """
             if sqlite3_exec(db, createHourly, nil, nil, nil) != SQLITE_OK {
                 Log.error("hourly usage table create failed", category: "storage")
+            }
+            let createCategory = """
+            CREATE TABLE IF NOT EXISTS daily_category_usage (
+                day TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                category TEXT NOT NULL,
+                tokens INTEGER NOT NULL,
+                PRIMARY KEY (day, provider, category)
+            )
+            """
+            if sqlite3_exec(db, createCategory, nil, nil, nil) != SQLITE_OK {
+                Log.error("category usage table create failed", category: "storage")
             }
             let createCache = """
             CREATE TABLE IF NOT EXISTS provider_usage_cache (
@@ -266,6 +285,108 @@ final class UsageStore {
         queue.sync {
             guard db != nil else { return [] }
             return hourlyRowsLocked(day: day, provider: provider) ?? []
+        }
+    }
+
+    /// 覆盖写入某天某 provider 的 token 分类用量（仅本机，不参与集群同步/残差/迁移）。
+    /// 空集只会来自暂时读不到日志的场景，直接忽略，避免清掉已有分类数据。
+    func recordCategories(day: String, provider: String, categories: [String: Int],
+                          expectedBucketTimeZone: String?) {
+        let rows = categories.filter { $0.value > 0 }
+        guard !rows.isEmpty else { return }
+        let changed: Bool = queue.sync {
+            guard db != nil,
+                  sqlite3_exec(db, "BEGIN IMMEDIATE", nil, nil, nil) == SQLITE_OK else { return false }
+            let marker = metadataValueLocked(Self.bucketTimeZoneMetadataKey)
+            guard marker.succeeded, marker.value == expectedBucketTimeZone else {
+                _ = finishTransactionLocked(false)
+                return false
+            }
+            // 无变化时回滚且不发通知，避免统计页随 5 分钟采集反复重载
+            if let existing = categoryRowsLocked(day: day, provider: provider), existing == rows {
+                _ = finishTransactionLocked(false)
+                return false
+            }
+            var succeeded = false
+            var deleteStatement: OpaquePointer?
+            if sqlite3_prepare_v2(db, "DELETE FROM daily_category_usage WHERE day = ? AND provider = ?",
+                                  -1, &deleteStatement, nil) == SQLITE_OK {
+                sqlite3_bind_text(deleteStatement, 1, day, -1, Self.transient)
+                sqlite3_bind_text(deleteStatement, 2, provider, -1, Self.transient)
+                succeeded = sqlite3_step(deleteStatement) == SQLITE_DONE
+            }
+            sqlite3_finalize(deleteStatement)
+            if succeeded {
+                let insert = """
+                INSERT INTO daily_category_usage (day, provider, category, tokens)
+                VALUES (?, ?, ?, ?)
+                """
+                var statement: OpaquePointer?
+                if sqlite3_prepare_v2(db, insert, -1, &statement, nil) == SQLITE_OK {
+                    for (category, tokens) in rows {
+                        sqlite3_reset(statement)
+                        sqlite3_bind_text(statement, 1, day, -1, Self.transient)
+                        sqlite3_bind_text(statement, 2, provider, -1, Self.transient)
+                        sqlite3_bind_text(statement, 3, category, -1, Self.transient)
+                        sqlite3_bind_int64(statement, 4, Int64(tokens))
+                        if sqlite3_step(statement) != SQLITE_DONE { succeeded = false; break }
+                    }
+                } else {
+                    succeeded = false
+                }
+                sqlite3_finalize(statement)
+            }
+            return finishTransactionLocked(succeeded)
+        }
+        if changed { Self.notifyDataChanged() }
+    }
+
+    /// 读单日分类行；失败返回 nil（与“空日”区分）。须在 queue 内调用
+    private func categoryRowsLocked(day: String, provider: String) -> [String: Int]? {
+        let sql = """
+        SELECT category, tokens FROM daily_category_usage WHERE day = ? AND provider = ?
+        """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return nil }
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_text(statement, 1, day, -1, Self.transient)
+        sqlite3_bind_text(statement, 2, provider, -1, Self.transient)
+        var rows: [String: Int] = [:]
+        while true {
+            let result = sqlite3_step(statement)
+            if result == SQLITE_DONE { return rows }
+            guard result == SQLITE_ROW, let category = sqlite3_column_text(statement, 0) else {
+                return nil
+            }
+            rows[String(cString: category)] = Int(sqlite3_column_int64(statement, 1))
+        }
+    }
+
+    /// 分类数据仅本机记录，不走集群聚合分支
+    func categoryUsage(provider: String, since day: String) -> [DailyCategoryUsage] {
+        queue.sync {
+            guard db != nil else { return [] }
+            let sql = """
+            SELECT day, category, tokens FROM daily_category_usage
+            WHERE provider = ? AND day >= ? ORDER BY day, category
+            """
+            var statement: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return [] }
+            defer { sqlite3_finalize(statement) }
+            sqlite3_bind_text(statement, 1, provider, -1, Self.transient)
+            sqlite3_bind_text(statement, 2, day, -1, Self.transient)
+            var result: [DailyCategoryUsage] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                guard let dayText = sqlite3_column_text(statement, 0),
+                      let categoryText = sqlite3_column_text(statement, 1) else { continue }
+                result.append(DailyCategoryUsage(
+                    day: String(cString: dayText),
+                    provider: provider,
+                    category: String(cString: categoryText),
+                    tokens: Int(sqlite3_column_int64(statement, 2))
+                ))
+            }
+            return result
         }
     }
 

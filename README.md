@@ -45,7 +45,10 @@ The editable source is [docs/architecture.drawio](docs/architecture.drawio)
 Each provider card opens stacked bar charts with day/week/month/year ranges.
 The day range shows today's hour-by-hour token distribution (24 bars, local to
 this Mac); hovering a bar reveals the per-model breakdown for that hour, day,
-or month.
+or month. A token-categories section splits the selected range into input,
+output, cache read, cache write, and reasoning tokens with a proportion bar
+and per-category percentages (collected locally from the day the feature is
+enabled).
 
 ## Current scope
 
@@ -53,6 +56,7 @@ or month.
 - 5-hour and weekly usage/reset time
 - today's total and per-model token count, plus working/idle/offline state
 - hourly (today), daily, and monthly token usage charts with per-model breakdown
+- token-category breakdown (input/output/cache read/cache write/reasoning) per range
 - attention border for permission requests
 - smart, partial, periodic full, and manual full refresh
 - stale/offline display, last-frame preview, and persistent device settings
