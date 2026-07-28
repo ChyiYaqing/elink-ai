@@ -6,6 +6,16 @@ and `Removed`.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## 0.1.17-rc2
+
+### Fixed
+
+- macOS launch-at-login now follows the currently installed application after
+  upgrades, preventing an older copy from starting after reboot
+- Agent Sessions now recognizes running Claude Code processes for project
+  paths containing dots, underscores, or other punctuation, so their pet and
+  live state display correctly
+
 ## 0.1.17-rc1
 
 ### Changed
