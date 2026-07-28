@@ -2,6 +2,11 @@ import AppKit
 
 let port: UInt16 = 8765
 Log.info("application v\(AppInfo.version) launching")
+do {
+    try LaunchAtLogin.refreshIfEnabled()
+} catch {
+    Log.warning("refresh launch at login failed: \(error.localizedDescription)", category: "startup")
+}
 let usageStore = UsageStore.shared
 let usage = UsageFetcher(cacheStore: usageStore)
 let cluster = ClusterManager(store: usageStore)

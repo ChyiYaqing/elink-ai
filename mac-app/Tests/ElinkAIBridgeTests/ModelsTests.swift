@@ -1183,6 +1183,30 @@ final class ModelsTests: XCTestCase {
         XCTAssertFalse(LaunchAtLogin.isEnabled(at: path))
     }
 
+    func testLaunchAtLoginRefreshesStaleExecutablePath() throws {
+        let path = NSTemporaryDirectory() + "elink-test-\(UUID().uuidString)/launch.plist"
+        defer { try? FileManager.default.removeItem(atPath: (path as NSString).deletingLastPathComponent) }
+        let stalePlist: [String: Any] = [
+            "Label": "local.elink-ai-bridge",
+            "ProgramArguments": ["/Applications/Elink AI old.app/Contents/MacOS/ElinkAIBridge"],
+            "RunAtLoad": true,
+        ]
+        let staleData = try PropertyListSerialization.data(
+            fromPropertyList: stalePlist, format: .xml, options: 0)
+        try FileManager.default.createDirectory(
+            atPath: (path as NSString).deletingLastPathComponent,
+            withIntermediateDirectories: true)
+        try staleData.write(to: URL(fileURLWithPath: path))
+
+        try LaunchAtLogin.refreshIfEnabled(at: path)
+
+        let data = try Data(contentsOf: URL(fileURLWithPath: path))
+        let plist = try XCTUnwrap(
+            try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any])
+        let executable = Bundle.main.executablePath ?? CommandLine.arguments[0]
+        XCTAssertEqual((plist["ProgramArguments"] as? [String])?.first, executable)
+    }
+
     func testApplicationLogUsesPersistentUserLibraryLocation() {
         XCTAssertTrue(AppInfo.logPath.contains("/Library/Logs/Elink AI/"))
         XCTAssertFalse(AppInfo.logPath.hasPrefix("/tmp/"))

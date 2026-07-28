@@ -24,6 +24,11 @@ enum LaunchAtLogin {
         FileManager.default.fileExists(atPath: path)
     }
 
+    static func refreshIfEnabled(at path: String = defaultPlistPath) throws {
+        guard isEnabled(at: path) else { return }
+        try setEnabled(true, at: path)
+    }
+
     static func setEnabled(_ enabled: Bool, at path: String = defaultPlistPath) throws {
         guard enabled else {
             try? FileManager.default.removeItem(atPath: path)
