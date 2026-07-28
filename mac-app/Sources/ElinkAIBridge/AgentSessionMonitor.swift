@@ -8,6 +8,10 @@ import Foundation
 
 enum AgentKind: String { case claude = "Claude Code", codex = "Codex" }
 
+private func sanitizedClaudeProjectPath(_ path: String) -> String {
+    path.replacingOccurrences(of: "[^a-zA-Z0-9]", with: "-", options: .regularExpression)
+}
+
 struct AgentSession: Identifiable {
     let id: String
     let kind: AgentKind
@@ -140,7 +144,7 @@ final class ProcessDiscovery {
         // 一个 claude 进程可能打开多个项目 transcript；优先取编码后
         // 项目目录与进程 cwd 匹配的那个
         if all.count > 1, let cwd {
-            let encoded = cwd.replacingOccurrences(of: "/", with: "-")
+            let encoded = sanitizedClaudeProjectPath(cwd)
             if let preferred = all.first(where: { $0.contains(encoded) }) { return preferred }
         }
         return all.first
@@ -425,7 +429,7 @@ struct LivenessTracker {
             if let path = snap.transcriptPath {
                 seen.insert(path)
             } else if snap.kind == .claude, let cwd = snap.cwd {
-                let encoded = cwd.replacingOccurrences(of: "/", with: "-")
+                let encoded = sanitizedClaudeProjectPath(cwd)
                 let i = cwdIndex[encoded, default: 0]
                 cwdIndex[encoded] = i + 1
                 seen.insert("cwd#\(encoded)#\(i)")

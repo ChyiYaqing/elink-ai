@@ -210,6 +210,24 @@ final class AgentSessionMonitorTests: XCTestCase {
         XCTAssertEqual(liveIDs, [try canonicalPath(newer)])
     }
 
+    func testClaudeCwdFallbackUsesClaudeProjectDirectoryEncoding() throws {
+        let now = Self.iso.string(from: Date())
+        try write([
+            #"{"type":"user","message":{"content":"hi"},"timestamp":"\#(now)"}"#,
+        ], to: "-Users-me-go-src-github-com-acme-my-api/sess.jsonl", under: claudeRoot)
+        var tracker = LivenessTracker()
+        let snapshot = ProcessDiscovery.Snapshot(
+            kind: .claude, transcriptPath: nil,
+            cwd: "/Users/me/go/src/github.com/acme/my_api")
+        let tracked = tracker.update(snapshots: [snapshot])
+
+        let session = try XCTUnwrap(scanner().scan(
+            live: tracked.live,
+            claudeCwdCounts: tracked.claudeCwdCounts
+        ).first)
+        XCTAssertTrue(session.isLive)
+    }
+
     // MARK: - 设置开关
 
     func testAgentSessionsEnabledDefaultsOn() throws {
