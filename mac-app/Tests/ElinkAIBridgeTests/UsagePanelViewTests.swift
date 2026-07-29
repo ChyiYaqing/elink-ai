@@ -237,6 +237,81 @@ final class UsagePanelViewTests: XCTestCase {
             "仍有旧版 6 位配对码文案残留"
         )
     }
+
+    func testClusterNodeDetailsResolveAddressForRemoteAndLocalNodes() {
+        let remote = UsagePanelView.clusterNodeDetails(
+            ClusterNodeRecord(nodeID: "node-b", name: "Studio",
+                              endpoint: "http://10.1.7.106:8765",
+                              lastSeenAt: Date(timeIntervalSince1970: 1_700_000_000),
+                              lastSyncAt: nil),
+            isLocal: false, localEndpoint: "http://192.168.1.2:8765", peers: []
+        ).map(\.value)
+        XCTAssertEqual(remote.first, "http://10.1.7.106:8765")
+        XCTAssertTrue(remote.contains("node-b"), "详情应包含节点 ID，实际：\(remote)")
+        XCTAssertTrue(remote.contains("尚未同步"), "从未同步的节点应说明未同步，实际：\(remote)")
+
+        // 尚未记录 endpoint 时回落到 Bonjour 发现结果
+        let discovered = UsagePanelView.clusterNodeDetails(
+            ClusterNodeRecord(nodeID: "node-b", name: "Studio", endpoint: nil,
+                              lastSeenAt: nil, lastSyncAt: nil),
+            isLocal: false, localEndpoint: nil,
+            peers: [DiscoveredClusterPeer(nodeID: "node-b", name: "Studio",
+                                          endpoint: "http://10.1.7.9:8765",
+                                          clusterID: "cluster-test", pairable: false)]
+        ).map(\.value)
+        XCTAssertEqual(discovered.first, "http://10.1.7.9:8765")
+
+        // 本机节点记录不含 endpoint，改用局域网地址
+        let local = UsagePanelView.clusterNodeDetails(
+            ClusterNodeRecord(nodeID: "local-node", name: "Air", endpoint: nil,
+                              lastSeenAt: Date(), lastSyncAt: nil),
+            isLocal: true, localEndpoint: "http://192.168.1.2:8765", peers: []
+        ).map(\.value)
+        XCTAssertEqual(local, ["http://192.168.1.2:8765", "local-node"])
+    }
+
+    @MainActor
+    func testTappedClusterNodeRevealsConnectionDetail() {
+        let path = NSTemporaryDirectory() + "elink-panel-\(UUID().uuidString).db"
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let store = UsageStore(path: path)
+        store.upsertClusterNode(ClusterNodeRecord(
+            nodeID: "node-b", name: "Studio",
+            endpoint: "http://10.1.7.106:8765",
+            lastSeenAt: Date(), lastSyncAt: Date()
+        ))
+        let cluster = ClusterManager(store: store, credentials: ClusterCredentials(
+            nodeID: "local-node",
+            nodeName: "Local Host",
+            clusterID: "cluster-test",
+            clusterSecret: Data(repeating: 1, count: 32).base64EncodedString(),
+            timezone: "Asia/Singapore"
+        ))
+
+        func clusterCardHeight(expandedNodeID: String?) -> CGFloat {
+            let model = PanelModel()
+            model.showSettings = true
+            model.panelMaxHeight = 3000
+            let view = UsagePanelView(
+                model: model,
+                updater: UpdateChecker(currentVersion: "0.1.17-rc2"),
+                cluster: cluster,
+                initialClusterExpanded: true,
+                initialExpandedNodeID: expandedNodeID
+            )
+            let host = NSHostingView(rootView: view)
+            host.frame = NSRect(x: 0, y: 0, width: 440, height: 1)
+            host.layoutSubtreeIfNeeded()
+            return host.fittingSize.height
+        }
+
+        XCTAssertGreaterThan(clusterCardHeight(expandedNodeID: "node-b"),
+                             clusterCardHeight(expandedNodeID: nil),
+                             "点击节点后应展开连接信息，面板应变高")
+        XCTAssertEqual(clusterCardHeight(expandedNodeID: "missing-node"),
+                       clusterCardHeight(expandedNodeID: nil),
+                       "只有被点击的节点会展开")
+    }
 }
 
 private extension NSView {

@@ -85,6 +85,10 @@ final class ClusterManager: ObservableObject {
 
     var nodeID: String { lock.holding { credentials.nodeID } }
     var nodeName: String { lock.holding { credentials.nodeName } }
+    /// 本机节点记录不保存 endpoint，节点详情用局域网地址加同步端口展示
+    var localEndpoint: String? {
+        DeviceClient.localIPv4().map { endpoint(host: $0, port: Int(port)) }
+    }
     private var isClusteredNow: Bool { lock.holding { credentials.isClustered } }
     private var currentClusterID: String? { lock.holding { credentials.clusterID } }
 

@@ -49,15 +49,18 @@ struct UsagePanelView: View {
     @State private var pairingCodeCopied = false
     @State private var showClusterAdvanced = false
     @State private var showLeaveClusterConfirmation = false
+    @State private var expandedNodeID: String?
 
     init(model: PanelModel, updater: UpdateChecker, cluster: ClusterManager,
          initialDeviceSettingsExpanded: Bool = false,
-         initialClusterExpanded: Bool = false) {
+         initialClusterExpanded: Bool = false,
+         initialExpandedNodeID: String? = nil) {
         self.model = model
         self.updater = updater
         self.cluster = cluster
         _deviceSettingsExpanded = State(initialValue: initialDeviceSettingsExpanded)
         _clusterExpanded = State(initialValue: initialClusterExpanded)
+        _expandedNodeID = State(initialValue: initialExpandedNodeID)
     }
 
     var body: some View {
@@ -663,7 +666,53 @@ struct UsagePanelView: View {
     private func clusterNodeRow(_ node: ClusterNodeRecord, theme: PanelTheme) -> some View {
         let local = node.nodeID == cluster.nodeID
         let online = node.isOnline()
-        return HStack(spacing: 8) {
+        let expanded = expandedNodeID == node.nodeID
+        return VStack(alignment: .leading, spacing: 6) {
+            Button {
+                Log.user(expanded ? "collapse cluster node detail" : "expand cluster node detail")
+                withAnimation(.easeOut(duration: 0.16)) {
+                    expandedNodeID = expanded ? nil : node.nodeID
+                }
+            } label: {
+                clusterNodeSummary(node, local: local, online: online,
+                                   expanded: expanded, theme: theme)
+            }
+            .buttonStyle(.plain)
+            .accessibilityValue(expanded ? tr("已展开", "Expanded") : tr("已折叠", "Collapsed"))
+
+            if expanded {
+                VStack(alignment: .leading, spacing: 3) {
+                    ForEach(Self.clusterNodeDetails(node, isLocal: local,
+                                                    localEndpoint: cluster.localEndpoint,
+                                                    peers: cluster.discoveredPeers), id: \.label) { row in
+                        HStack(alignment: .top, spacing: 6) {
+                            Text(row.label)
+                                .font(.system(size: 8, weight: .medium))
+                                .foregroundStyle(theme.textTertiary)
+                                .frame(width: 54, alignment: .leading)
+                            Text(row.value)
+                                .font(.system(size: 8, weight: .semibold, design: .rounded))
+                                .foregroundStyle(theme.textSecondary)
+                                .textSelection(.enabled)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            Spacer(minLength: 0)
+                        }
+                    }
+                }
+                .padding(.leading, 34)
+            }
+        }
+        .padding(8)
+        .background(
+            RoundedRectangle(cornerRadius: 9)
+                .fill(theme.glassBackground.opacity(theme.dark ? 0.72 : 0.58))
+        )
+    }
+
+    private func clusterNodeSummary(_ node: ClusterNodeRecord, local: Bool, online: Bool,
+                                    expanded: Bool, theme: PanelTheme) -> some View {
+        HStack(spacing: 8) {
             Image(systemName: local ? "laptopcomputer" : "desktopcomputer")
                 .font(.system(size: 10, weight: .semibold))
                 .foregroundStyle(online ? Color(red: 0.32, green: 0.58, blue: 0.96) : theme.textTertiary)
@@ -701,12 +750,45 @@ struct UsagePanelView: View {
                 text: online ? tr("在线", "Online") : tr("离线", "Offline"),
                 color: online ? theme.statusHealthy : theme.textTertiary
             )
+            Image(systemName: "chevron.down")
+                .font(.system(size: 7, weight: .bold))
+                .foregroundStyle(theme.textTertiary)
+                .rotationEffect(.degrees(expanded ? 0 : -90))
         }
-        .padding(8)
-        .background(
-            RoundedRectangle(cornerRadius: 9)
-                .fill(theme.glassBackground.opacity(theme.dark ? 0.72 : 0.58))
-        )
+        .contentShape(Rectangle())
+    }
+
+    struct ClusterNodeDetailRow: Equatable {
+        let label: String
+        let value: String
+    }
+
+    /// 节点详情：连接地址优先用已记录的 endpoint，其次用 Bonjour 发现结果，本机则用局域网地址
+    static func clusterNodeDetails(_ node: ClusterNodeRecord, isLocal: Bool,
+                                   localEndpoint: String?,
+                                   peers: [DiscoveredClusterPeer]) -> [ClusterNodeDetailRow] {
+        let address = isLocal
+            ? localEndpoint
+            : (node.endpoint ?? peers.first { $0.nodeID == node.nodeID }?.endpoint)
+        var rows = [
+            ClusterNodeDetailRow(label: tr("连接地址", "Address"),
+                                 value: address ?? tr("未知", "Unknown")),
+            ClusterNodeDetailRow(label: tr("节点 ID", "Node ID"), value: node.nodeID)
+        ]
+        guard !isLocal else { return rows }
+        rows.append(ClusterNodeDetailRow(
+            label: tr("最后在线", "Last seen"),
+            value: node.lastSeenAt.map(Self.clusterTimestamp) ?? tr("未知", "Unknown")
+        ))
+        rows.append(ClusterNodeDetailRow(
+            label: tr("最后同步", "Last sync"),
+            value: node.lastSyncAt.map(Self.clusterTimestamp) ?? tr("尚未同步", "Not synced yet")
+        ))
+        return rows
+    }
+
+    private static func clusterTimestamp(_ date: Date) -> String {
+        date.formatted(date: .abbreviated, time: .shortened)
     }
 
     private func clusterFeedback(_ message: String, forceError: Bool,
