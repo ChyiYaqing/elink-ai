@@ -371,6 +371,7 @@ dependencies = [
  "clap",
  "dirs",
  "if-addrs",
+ "libc",
  "mdns-sd",
  "png",
  "ratatui",

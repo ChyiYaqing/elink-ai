@@ -17,6 +17,8 @@ final class PanelModel: ObservableObject {
     /// 本机出口的 NAT 观测，由 LinkMonitor 经 PreviewPopoverController 同步过来
     @Published var natObservation: StunObservation?
     @Published var natUnavailable = false
+    @Published var lighthouseURL = ""
+    var onSaveLighthouse: ((String) -> Void)?
     @Published var launchAtLogin = false
     @Published var deviceHost = ""
     @Published var bridgeAddress = ""
@@ -42,6 +44,7 @@ struct UsagePanelView: View {
     @ObservedObject var model: PanelModel
     @ObservedObject var updater: UpdateChecker
     @ObservedObject var cluster: ClusterManager
+    @ObservedObject var mesh: MeshMonitor
     @Environment(\.colorScheme) private var scheme
     @State private var updatesExpanded = false
     @State private var deviceSettingsExpanded = false
@@ -53,14 +56,20 @@ struct UsagePanelView: View {
     @State private var showClusterAdvanced = false
     @State private var showLeaveClusterConfirmation = false
     @State private var expandedNodeID: String?
+    @State private var meshExpanded = false
+    @State private var meshSelected: String?
+    @State private var meshHovered: MeshBucketPoint?
+    @State private var meshHistory: [MeshBucketPoint] = []
 
     init(model: PanelModel, updater: UpdateChecker, cluster: ClusterManager,
+         mesh: MeshMonitor,
          initialDeviceSettingsExpanded: Bool = false,
          initialClusterExpanded: Bool = false,
          initialExpandedNodeID: String? = nil) {
         self.model = model
         self.updater = updater
         self.cluster = cluster
+        self.mesh = mesh
         _deviceSettingsExpanded = State(initialValue: initialDeviceSettingsExpanded)
         _clusterExpanded = State(initialValue: initialClusterExpanded)
         _expandedNodeID = State(initialValue: initialExpandedNodeID)
@@ -93,6 +102,7 @@ struct UsagePanelView: View {
                         if model.agentSessionsEnabled && !model.agentSessions.isEmpty {
                             AgentSessionsCard(sessions: model.agentSessions, theme: theme)
                         }
+                        meshCard(theme)
                         if model.deviceConnectionEnabled || model.showSettings || model.statsProvider != nil {
                             deviceCard(theme)
                         }
@@ -688,7 +698,6 @@ struct UsagePanelView: View {
                     ForEach(Self.clusterNodeDetails(node, isLocal: local,
                                                     localEndpoint: cluster.localEndpoint,
                                                     peers: cluster.discoveredPeers,
-                                                    link: cluster.linkAggregates[node.nodeID],
                                                     stun: local ? model.natObservation : nil,
                                                     stunUnavailable: local && model.natUnavailable),
                             id: \.label) { row in
@@ -765,28 +774,267 @@ struct UsagePanelView: View {
         .contentShape(Rectangle())
     }
 
+
+    // MARK: - Nebula overlay
+
+    /// 微秒是存储单位，因为到同网段主机的 overlay 往返不到一毫秒；亚毫秒保留两位小数，
+    /// 否则它们会全都渲染成同一个 "0ms"。
+    static func meshLatency(_ micros: Int) -> String {
+        let millis = Double(micros) / 1000
+        return millis < 10 ? String(format: "%.2fms", millis) : String(format: "%.0fms", millis)
+    }
+
+    /// 说出依据而不只是结论：判「隧道坏」是在断言别人的机器没问题，
+    /// 而这个断言只因为 lighthouse 够得着本机够不着的那台才立得住。
+    static func meshStateText(_ host: MeshHostView) -> String {
+        switch host.state {
+        case .online: return tr("在线", "online")
+        case .tunnelDown:
+            guard let rtt = host.lighthouseRttUs else { return tr("隧道未通", "tunnel down") }
+            return tr("隧道未通（lighthouse \(meshLatency(rtt))）",
+                      "tunnel down (lighthouse \(meshLatency(rtt)))")
+        case .offline: return tr("离线", "offline")
+        case .unreachable: return tr("不可达，原因未知", "unreachable, cause unknown")
+        }
+    }
+
+    static func meshStateColor(_ state: MeshState, theme: PanelTheme) -> Color {
+        switch state {
+        case .online: return theme.statusHealthy
+        case .offline: return theme.textTertiary
+        case .tunnelDown, .unreachable: return theme.statusWarning
+        }
+    }
+
+    /// nebula overlay：每一台有证书的设备，以及本机能到达哪些。
+    /// 与多机同步刻意分开——那是另一批机器，回答的是另一个问题。
+    private func meshCard(_ theme: PanelTheme) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+                Log.user(meshExpanded ? "collapse nebula overlay" : "expand nebula overlay")
+                withAnimation(.easeOut(duration: 0.2)) { meshExpanded.toggle() }
+            } label: {
+                // 紧凑头部：与主列表里的 Agent 会话、电子纸屏幕保持同一套样式。
+                // settingsHeader 那种 26pt 彩色圆加副标题是设置页的样式，混进来会让
+                // 这张卡比邻居高出一截。
+                HStack(spacing: 6) {
+                    Image(systemName: "network")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(theme.textSecondary)
+                    Text(tr("Nebula 网络", "Nebula Overlay"))
+                        .font(.system(size: 12, weight: .semibold, design: .rounded))
+                        .foregroundStyle(theme.textPrimary)
+                    Spacer()
+                    StateBadge(
+                        text: "\(mesh.hosts.filter { $0.state == .online }.count)/\(mesh.hosts.count)",
+                        color: mesh.hosts.isEmpty || mesh.hosts.contains { $0.state != .online }
+                            ? theme.statusWarning : theme.statusHealthy
+                    )
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(theme.textTertiary)
+                        .rotationEffect(.degrees(meshExpanded ? 90 : 0))
+                }
+                .padding(12)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(tr("Nebula 网络", "Nebula Overlay"))
+            .accessibilityValue(meshExpanded ? tr("已展开", "Expanded") : tr("已折叠", "Collapsed"))
+
+            if meshExpanded {
+                VStack(alignment: .leading, spacing: 7) {
+                    Text(Self.meshSubtitle(
+                        total: mesh.hosts.count,
+                        reachable: mesh.hosts.filter { $0.state == .online }.count,
+                        updatedAt: mesh.updatedAt
+                    ))
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(theme.textTertiary)
+                    if !mesh.icmpAvailable {
+                        meshNotice(tr("无法打开 ICMP socket，本机可达性暂时测不了",
+                                      "No ICMP socket: reachability unavailable on this host"),
+                                   theme: theme)
+                    }
+                    if !mesh.lighthouseReachable {
+                        meshNotice(tr("lighthouse 不可达，显示的是上一次的名册",
+                                      "Lighthouse unreachable: showing the last known roster"),
+                                   theme: theme)
+                    }
+                    if let nat = Self.clusterNatDetail(model.natObservation,
+                                                       unavailable: model.natUnavailable) {
+                        HStack(alignment: .top, spacing: 6) {
+                            Text(tr("出口 NAT", "Egress NAT"))
+                                .font(.system(size: 8, weight: .medium))
+                                .foregroundStyle(theme.textTertiary)
+                                .frame(width: 54, alignment: .leading)
+                            Text(nat)
+                                .font(.system(size: 8, design: .monospaced))
+                                .foregroundStyle(theme.textSecondary)
+                        }
+                    }
+                    if mesh.hosts.isEmpty {
+                        Text(tr("等待第一份名册…", "Waiting for the first roster…"))
+                            .font(.system(size: 9))
+                            .foregroundStyle(theme.textTertiary)
+                    }
+                    HStack(spacing: 6) {
+                        TextField(tr("lighthouse 地址，例如 192.168.100.200:8767",
+                                     "Lighthouse address, e.g. 192.168.100.200:8767"),
+                                  text: $model.lighthouseURL)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(size: 9, design: .monospaced))
+                        PillButton(title: tr("保存", "Save"), icon: "checkmark", theme: theme) {
+                            model.onSaveLighthouse?(model.lighthouseURL)
+                        }
+                    }
+                    Text(tr("设备清单由跑着 elink-tui --headless 的 lighthouse 提供；留空则关闭本视图。",
+                            "The roster comes from a lighthouse running elink-tui --headless; empty disables this view."))
+                        .font(.system(size: 8, weight: .medium))
+                        .foregroundStyle(theme.textTertiary)
+                    ForEach(mesh.hosts, id: \.name) { host in
+                        VStack(alignment: .leading, spacing: 6) {
+                            Button {
+                                let opening = meshSelected != host.name
+                                Log.user(opening ? "open nebula host history" : "close nebula host history")
+                                withAnimation(.easeOut(duration: 0.16)) {
+                                    meshSelected = opening ? host.name : nil
+                                }
+                                meshHovered = nil
+                                meshHistory = opening ? mesh.history(for: host.name) : []
+                            } label: {
+                                meshHostRow(host, theme: theme)
+                                    .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityValue(meshSelected == host.name
+                                ? tr("已展开", "Expanded") : tr("已折叠", "Collapsed"))
+
+                            if meshSelected == host.name {
+                                meshHistoryDetail(host, theme: theme)
+                            }
+                        }
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.bottom, 12)
+                .transition(.opacity)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .glassCard(theme)
+    }
+
+
+    /// 陈旧必须可见。一个 30 秒前的 221ms 和刚测出来的 221ms 长得一模一样，而这块
+    /// 面板是用来判断「现在通不通」的——不写出数据年龄，旧数据就会冒充实时数据。
+    static func meshSubtitle(total: Int, reachable: Int, updatedAt: Date?,
+                             now: Date = Date()) -> String {
+        let head = tr("\(total) 台设备 · \(reachable) 台本机可达",
+                      "\(total) devices · \(reachable) reachable from here")
+        guard let updatedAt else {
+            return head + tr(" · 尚未探测", " · not probed yet")
+        }
+        let age = Int(max(0, now.timeIntervalSince(updatedAt)))
+        let ago = age < 60
+            ? tr("\(age) 秒前", "\(age)s ago")
+            : tr("\(age / 60) 分钟前", "\(age / 60)m ago")
+        return head + " · " + ago
+    }
+
+    /// 悬停时说明这一个桶，否则说明整段窗口。两者都要标出丢样，因为「平均 1.4ms」
+    /// 配上「三分之一探测没回来」是完全不同的一件事。
+    static func meshHistorySummary(points: [MeshBucketPoint],
+                                   hovered: MeshBucketPoint?) -> String {
+        if let hovered {
+            let time = DateFormatter.localizedString(from: hovered.bucketAt,
+                                                     dateStyle: .none, timeStyle: .short)
+            guard let low = hovered.rttMinUs, let high = hovered.rttMaxUs else {
+                return tr("\(time) · 全部丢失（\(hovered.samples) 次探测）",
+                          "\(time) · all lost (\(hovered.samples) probes)")
+            }
+            let range = low == high
+                ? meshLatency(low)
+                : "\(meshLatency(low))–\(meshLatency(high))"
+            guard hovered.lostSamples > 0 else {
+                return tr("\(time) · \(range)", "\(time) · \(range)")
+            }
+            return tr("\(time) · \(range) · 丢 \(hovered.lostSamples)/\(hovered.samples)",
+                      "\(time) · \(range) · \(hovered.lostSamples)/\(hovered.samples) lost")
+        }
+        let samples = points.reduce(0) { $0 + $1.samples }
+        guard samples > 0 else { return tr("暂无历史数据", "No history yet") }
+        let lost = points.reduce(0) { $0 + $1.lostSamples }
+        let lows = points.compactMap(\.rttMinUs)
+        let highs = points.compactMap(\.rttMaxUs)
+        guard let low = lows.min(), let high = highs.max() else {
+            return tr("\(samples) 次探测全部丢失", "all \(samples) probes lost")
+        }
+        let head = tr("\(meshLatency(low))–\(meshLatency(high)) · \(samples) 次探测",
+                      "\(meshLatency(low))–\(meshLatency(high)) · \(samples) probes")
+        guard lost > 0 else { return head }
+        return head + tr(" · 丢 \(lost)", " · \(lost) lost")
+    }
+
+    private func meshHistoryDetail(_ host: MeshHostView, theme: PanelTheme) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(Self.meshHistorySummary(points: meshHistory, hovered: meshHovered))
+                .font(.system(size: 8, design: .monospaced))
+                .foregroundStyle(theme.textSecondary)
+            let chart = MeshLatencyChart(points: meshHistory, theme: theme) { point in
+                meshHovered = point
+            }
+            chart.frame(height: chart.hasPlottableData ? 34 : 8)
+            if chart.hasPlottableData {
+                Text(tr("折线为 5 分钟均值，淡带为同段最低–最高；红点为整段不通。",
+                        "Line: 5-minute average · band: its min–max · red dot: nothing got through."))
+                    .font(.system(size: 7, weight: .medium))
+                    .foregroundStyle(theme.textTertiary)
+            }
+        }
+        .padding(.leading, 13)
+        .padding(.trailing, 2)
+        .transition(.opacity)
+    }
+
+    private func meshNotice(_ text: String, theme: PanelTheme) -> some View {
+        Text(text)
+            .font(.system(size: 8, weight: .medium))
+            .foregroundStyle(theme.statusWarning)
+    }
+
+    private func meshHostRow(_ host: MeshHostView, theme: PanelTheme) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Circle()
+                .fill(Self.meshStateColor(host.state, theme: theme))
+                .frame(width: 5, height: 5)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(host.name)
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(theme.textPrimary)
+                Text(host.overlay)
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(theme.textTertiary)
+            }
+            Spacer(minLength: 6)
+            VStack(alignment: .trailing, spacing: 1) {
+                Text(host.latestRttUs.map { Self.meshLatency(Int($0)) } ?? "—")
+                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(theme.textPrimary)
+                Text(Self.meshStateText(host))
+                    .font(.system(size: 8, weight: .medium))
+                    .foregroundStyle(Self.meshStateColor(host.state, theme: theme))
+            }
+        }
+    }
+
     struct ClusterNodeDetailRow: Equatable {
         let label: String
         let value: String
     }
 
     /// 节点详情：连接地址优先用已记录的 endpoint，其次用 Bonjour 发现结果，本机则用局域网地址
-    /// 标签是“同步往返”而不是“延迟”：这个数字含对端处理时间，是上界不是链路指标。
-    static func clusterLinkDetail(_ value: LinkAggregate) -> String {
-        let latency: String
-        if let low = value.rttMinMs, let average = value.rttAvgMs, let high = value.rttMaxMs {
-            latency = "\(low)/\(average)/\(high)ms"
-        } else {
-            // 窗口内每个样本都失败，没有延迟可报，只剩中断本身
-            latency = tr("无响应", "No reply")
-        }
-        guard value.lostSamples > 0 else {
-            return latency + tr(" · \(value.samples) 次采样", " · \(value.samples) samples")
-        }
-        return latency + tr(" · \(value.lostSamples)/\(value.samples) 丢样",
-                            " · \(value.lostSamples)/\(value.samples) lost")
-    }
-
     /// 陈述事实而非好坏：保端口是端口争抢的前提条件，被改写反而不参与争抢，
     /// 所以两种结果都不加警示色，只有判据本身失效时才需要提醒。
     static func clusterNatDetail(_ value: StunObservation?, unavailable: Bool) -> String? {
@@ -806,7 +1054,6 @@ struct UsagePanelView: View {
     static func clusterNodeDetails(_ node: ClusterNodeRecord, isLocal: Bool,
                                    localEndpoint: String?,
                                    peers: [DiscoveredClusterPeer],
-                                   link: LinkAggregate? = nil,
                                    stun: StunObservation? = nil,
                                    stunUnavailable: Bool = false) -> [ClusterNodeDetailRow] {
         let address = isLocal
@@ -830,12 +1077,6 @@ struct UsagePanelView: View {
             label: tr("最后同步", "Last sync"),
             value: node.lastSyncAt.map(Self.clusterTimestamp) ?? tr("尚未同步", "Not synced yet")
         ))
-        if let link, link.samples > 0 {
-            rows.append(ClusterNodeDetailRow(
-                label: tr("同步往返", "Sync RTT"),
-                value: Self.clusterLinkDetail(link)
-            ))
-        }
         return rows
     }
 

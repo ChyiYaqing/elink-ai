@@ -6,8 +6,18 @@
 //! the 2026-07-28 root cause was found, by aggregating `journalctl -u nebula`
 //! per node and looking at the source ports the NAT handed out.
 //!
-//! This module parses those log lines and folds them into bounded buckets. It is
-//! deliberately read-only: nothing here talks to nebula or changes its config.
+//! This module parses those log lines and folds them into bounded buckets.
+//!
+//! It also keeps the mesh roster and probes it. Liveness cannot be read out of
+//! the log: nebula logs state *changes*, so a tunnel that has been up for a day
+//! is silent while a node stuck in a handshake loop is the noisiest thing in
+//! the file — the log's most active node is usually its most broken one. Only
+//! an active probe answers "is this node reachable right now", and the
+//! lighthouse's answer is what lets a client tell "that node is down" apart
+//! from "only my tunnel to it is down".
+//!
+//! Nothing here changes nebula's configuration or talks to its control plane;
+//! the only packets it originates are ICMP echoes on the overlay.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -18,6 +28,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use chrono::DateTime;
 use rusqlite::Connection;
 
 /// Matches the probe bucket width so both views line up on the same time axis.
@@ -75,6 +86,79 @@ fn field(line: &str, key: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
 }
 
+/// One node's overlay address as the lighthouse sees it.
+///
+/// Unlike a contention sample this needs no source address, so heartbeat and
+/// teardown lines count too. That is the point: the roster doubles as the
+/// liveness signal clients cannot produce themselves, and restricting it to
+/// handshakes would blind it to a node that is connected and simply quiet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RosterEntry {
+    pub cert_name: String,
+    pub overlay: String,
+    /// The line's own timestamp, not the moment it was read.
+    pub seen_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RosterHost {
+    pub cert_name: String,
+    pub overlay: String,
+    /// Last handshake, roam or teardown involving this node. Deliberately not a
+    /// liveness signal: nebula logs state *changes*, so a tunnel that has been
+    /// up for a day is silent while a node stuck in a handshake loop is the
+    /// noisiest thing in the log. Kept as context for the port-contention view.
+    pub last_activity_at: i64,
+    /// When the lighthouse last probed this node, and the round trip it got.
+    /// `probed_at: None` means never probed; `rtt_us: None` with a `probed_at`
+    /// means the probe ran and nothing came back.
+    pub probed_at: Option<i64>,
+    pub rtt_us: Option<i64>,
+}
+
+impl RosterHost {
+    pub fn reachable(&self) -> Option<bool> {
+        self.probed_at.map(|_| self.rtt_us.is_some())
+    }
+}
+
+/// Extracts `certName` and the node's overlay address from one log line.
+pub fn parse_roster_line(line: &str) -> Option<RosterEntry> {
+    let cert_name = field(line, "certName=")?;
+    // Nebula declares this field as a list. Every observed line carries exactly
+    // one address, but a node with several overlay addresses would be reachable
+    // at any of them, so the first is as good a probe target as any.
+    let overlay = field(line, "vpnAddrs=")?
+        .split_whitespace()
+        .next()?
+        .to_string();
+    if cert_name.is_empty() || overlay.is_empty() {
+        return None;
+    }
+    Some(RosterEntry {
+        cert_name,
+        overlay,
+        seen_at: line_time(line),
+    })
+}
+
+/// Reads the RFC3339 `time=` field nebula stamps on every line.
+///
+/// Using it rather than the moment of ingestion matters on the first read of a
+/// log file: the entire backlog would otherwise be stamped "now" and every
+/// long-dead host would be reported as just seen.
+pub fn line_time(line: &str) -> Option<i64> {
+    let start = line.find("time=\"")? + "time=\"".len();
+    let value = line[start..].split('"').next()?;
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|stamp| stamp.timestamp())
+}
+
+pub fn parse_roster(text: &str) -> Vec<RosterEntry> {
+    text.lines().filter_map(parse_roster_line).collect()
+}
+
 pub fn bucket_start(time: f64) -> i64 {
     ((time / BUCKET_WIDTH_S).floor() * BUCKET_WIDTH_S) as i64
 }
@@ -90,8 +174,119 @@ pub fn create_schema(connection: &Connection) -> rusqlite::Result<()> {
             PRIMARY KEY (bucket_at, cert_name, wan_ip, source_port)
         );
         CREATE INDEX IF NOT EXISTS idx_lighthouse_bucket
-            ON lighthouse_observation(bucket_at);",
+            ON lighthouse_observation(bucket_at);
+        CREATE TABLE IF NOT EXISTS lighthouse_host (
+            cert_name TEXT PRIMARY KEY,
+            overlay_addr TEXT NOT NULL,
+            last_activity_at INTEGER NOT NULL,
+            probed_at INTEGER,
+            rtt_us INTEGER
+        );",
     )
+}
+
+/// Upserts the roster, keeping the newest sighting per node.
+///
+/// `last_activity_at` only ever moves forward: a batch may contain lines in any
+/// order, and re-reading an old file must not drag a node's liveness backwards.
+pub fn record_roster(
+    connection: &Connection,
+    entries: &[RosterEntry],
+    fallback_at: i64,
+) -> rusqlite::Result<()> {
+    for entry in entries {
+        connection.execute(
+            "INSERT INTO lighthouse_host (cert_name, overlay_addr, last_activity_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(cert_name) DO UPDATE SET
+               overlay_addr = excluded.overlay_addr,
+               last_activity_at = MAX(last_activity_at, excluded.last_activity_at)",
+            rusqlite::params![
+                entry.cert_name,
+                entry.overlay,
+                entry.seen_at.unwrap_or(fallback_at)
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+/// The lighthouse never handshakes with itself, so it is absent from its own
+/// log and has to be announced explicitly. It is alive by definition whenever
+/// this collector is running, so its sighting is refreshed on every tick.
+pub fn register_self(
+    connection: &Connection,
+    cert_name: &str,
+    overlay: &str,
+    at: i64,
+) -> rusqlite::Result<()> {
+    if cert_name.is_empty() || overlay.is_empty() {
+        return Ok(());
+    }
+    connection.execute(
+        "INSERT INTO lighthouse_host (cert_name, overlay_addr, last_activity_at)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(cert_name) DO UPDATE SET
+           overlay_addr = excluded.overlay_addr,
+           last_activity_at = excluded.last_activity_at",
+        rusqlite::params![cert_name, overlay, at],
+    )?;
+    Ok(())
+}
+
+pub fn hosts(connection: &Connection) -> rusqlite::Result<Vec<RosterHost>> {
+    let mut statement = connection.prepare(
+        "SELECT cert_name, overlay_addr, last_activity_at, probed_at, rtt_us
+         FROM lighthouse_host ORDER BY cert_name",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(RosterHost {
+            cert_name: row.get(0)?,
+            overlay: row.get(1)?,
+            last_activity_at: row.get(2)?,
+            probed_at: row.get(3)?,
+            rtt_us: row.get(4)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// Stores one probe outcome. A miss is written just as deliberately as a hit:
+/// leaving `rtt_us` alone on failure would keep serving the last good round
+/// trip and make an unreachable node look merely stale.
+pub fn record_probe(
+    connection: &Connection,
+    cert_name: &str,
+    at: i64,
+    rtt_us: Option<u32>,
+) -> rusqlite::Result<()> {
+    connection.execute(
+        "UPDATE lighthouse_host SET probed_at = ?2, rtt_us = ?3 WHERE cert_name = ?1",
+        rusqlite::params![cert_name, at, rtt_us.map(i64::from)],
+    )?;
+    Ok(())
+}
+
+/// Pings every node on the roster and records the outcome.
+///
+/// This is the liveness signal the log cannot provide, and it is why the
+/// lighthouse is worth asking at all: a node it can reach but the client cannot
+/// is a broken tunnel, while a node neither can reach is simply down.
+pub fn probe_roster(connection: &Connection, timeout: Duration) -> rusqlite::Result<usize> {
+    let roster = hosts(connection)?;
+    let mut probed = 0;
+    for (index, host) in roster.iter().enumerate() {
+        let Ok(address) = host.overlay.parse::<std::net::Ipv4Addr>() else {
+            continue;
+        };
+        // Sequence numbers only have to distinguish this sweep's replies from
+        // each other; a stale reply carrying an earlier host's number is
+        // rejected by the payload token anyway.
+        let rtt = crate::icmp::ping(address, index as u16 + 1, timeout);
+        record_probe(connection, &host.cert_name, crate::util::epoch_now(), rtt)?;
+        probed += 1;
+    }
+    Ok(probed)
 }
 
 /// Folds a batch of samples into their bucket. Row count is bounded by bucket
@@ -194,6 +389,11 @@ pub struct LighthouseConfig {
     pub default_port: u16,
     pub listen: String,
     pub interval: Duration,
+    /// This lighthouse's own `certName` and overlay address. Absent from its own
+    /// log, so without these two the roster is short exactly one node — the one
+    /// every other node depends on.
+    pub self_name: Option<String>,
+    pub self_overlay: Option<String>,
 }
 
 /// Reads whatever arrived since the last call.
@@ -259,7 +459,12 @@ pub fn parse_batch(text: &str) -> Vec<LighthouseSample> {
     text.lines().filter_map(parse_line).collect()
 }
 
-pub fn snapshot_json(rows: &[LighthouseRow], default_port: u16, now: i64) -> String {
+pub fn snapshot_json(
+    rows: &[LighthouseRow],
+    roster: &[RosterHost],
+    default_port: u16,
+    now: i64,
+) -> String {
     let views = contention(rows, default_port);
     let wan = views
         .iter()
@@ -281,8 +486,26 @@ pub fn snapshot_json(rows: &[LighthouseRow], default_port: u16, now: i64) -> Str
         })
         .collect::<Vec<_>>()
         .join(",");
+    let hosts = roster
+        .iter()
+        .map(|host| {
+            let optional = |value: Option<i64>| match value {
+                Some(value) => value.to_string(),
+                None => "null".to_string(),
+            };
+            format!(
+                r#"{{"name":{},"overlay":{},"last_activity_at":{},"probed_at":{},"rtt_us":{}}}"#,
+                serde_json::Value::String(host.cert_name.clone()),
+                serde_json::Value::String(host.overlay.clone()),
+                host.last_activity_at,
+                optional(host.probed_at),
+                optional(host.rtt_us)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
     format!(
-        r#"{{"schema_version":1,"generated_at":{now},"default_port":{default_port},"wan":[{wan}]}}"#
+        r#"{{"schema_version":2,"generated_at":{now},"default_port":{default_port},"hosts":[{hosts}],"wan":[{wan}]}}"#
     )
 }
 
@@ -296,22 +519,42 @@ pub fn run_headless(database: &Path, config: LighthouseConfig) -> anyhow::Result
     create_schema(&connection)?;
     let listener = TcpListener::bind(&config.listen)?;
     listener.set_nonblocking(true)?;
+    spawn_prober(database, config.interval);
     let mut reader = LogReader::new(config.source.clone());
     let mut last_collect = Instant::now()
         .checked_sub(config.interval)
         .unwrap_or_else(Instant::now);
+    let mut window = BOOTSTRAP_WINDOW;
 
     loop {
         if last_collect.elapsed() >= config.interval {
-            match reader.read_new(config.interval) {
+            if let (Some(name), Some(overlay)) = (&config.self_name, &config.self_overlay) {
+                let _ = register_self(&connection, name, overlay, crate::util::epoch_now());
+            }
+            match reader.read_new(window) {
                 Ok(text) => {
-                    let samples = parse_batch(&text);
-                    if !samples.is_empty() {
-                        let _ = record(&connection, &samples, crate::util::epoch_now() as f64);
+                    let now = crate::util::epoch_now();
+                    // Source ports are bucketed by ingest time, so the bootstrap
+                    // pass must not feed them: a day of history would collapse
+                    // into the current five-minute bucket and report a burst of
+                    // contention that never happened. Discovering *who exists*
+                    // is the only thing that read is for.
+                    if window != BOOTSTRAP_WINDOW {
+                        let samples = parse_batch(&text);
+                        if !samples.is_empty() {
+                            let _ = record(&connection, &samples, now as f64);
+                        }
                     }
+                    let entries = parse_roster(&text);
+                    if !entries.is_empty() {
+                        let _ = record_roster(&connection, &entries, now);
+                    }
+                    window = config.interval;
                 }
                 // A transient read failure must not kill the collector; the next
                 // tick retries and the endpoint keeps serving what is stored.
+                // The window stays wide until one read succeeds, so a lighthouse
+                // that starts before journald is ready still gets its history.
                 Err(error) => eprintln!("lighthouse: log read failed: {error}"),
             }
             last_collect = Instant::now();
@@ -319,7 +562,13 @@ pub fn run_headless(database: &Path, config: LighthouseConfig) -> anyhow::Result
         match listener.accept() {
             Ok((stream, _)) => {
                 let stored = rows(&connection, 0).unwrap_or_default();
-                let body = snapshot_json(&stored, config.default_port, crate::util::epoch_now());
+                let roster = hosts(&connection).unwrap_or_default();
+                let body = snapshot_json(
+                    &stored,
+                    &roster,
+                    config.default_port,
+                    crate::util::epoch_now(),
+                );
                 let _ = respond(stream, &body);
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -328,6 +577,62 @@ pub fn run_headless(database: &Path, config: LighthouseConfig) -> anyhow::Result
             Err(error) => return Err(error.into()),
         }
     }
+}
+
+/// How far back the first journal read reaches.
+///
+/// The roster is built from state-change lines, so the healthiest nodes are the
+/// slowest to appear: a stable tunnel logs nothing, while a node stuck in a
+/// handshake loop shows up within seconds. Starting from a bare interval would
+/// therefore populate the roster with the broken nodes first and leave the
+/// working ones missing.
+///
+/// A week rather than a day because a day is measurably too short: on the mesh
+/// this was built for, a NAS held one tunnel open for 25 hours without logging a
+/// line and was missing from the roster entirely. The window has to outlast the
+/// quietest healthy node, not the average one.
+///
+/// Re-reading history is free: `last_activity_at` comes from each line's own
+/// timestamp, so a wider window cannot misdate anything. Only the journal source
+/// needs this — a file reader already starts at offset zero.
+const BOOTSTRAP_WINDOW: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// How long a single node gets to answer. Two seconds covers the ~220 ms
+/// intercontinental hops on this mesh with room to spare, without letting one
+/// dead node stretch the sweep.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Runs the ICMP sweep on its own thread with its own connection.
+///
+/// It cannot share the collector's loop: a sweep of a mesh where several nodes
+/// are down costs seconds of timeouts, and the HTTP endpoint has to keep
+/// answering throughout. WAL plus the busy timeout is what makes the second
+/// writer safe, the same way every other thread here gets its own connection.
+fn spawn_prober(database: &Path, interval: Duration) {
+    let database = database.to_path_buf();
+    std::thread::spawn(move || {
+        if !crate::icmp::available() {
+            // Saying so once beats reporting the entire mesh as unreachable.
+            eprintln!(
+                "lighthouse: no ICMP socket available; reachability will stay unknown. \
+                 Grant CAP_NET_RAW or widen net.ipv4.ping_group_range."
+            );
+            return;
+        }
+        let connection = match crate::source::local::db::open_db(&database) {
+            Ok(connection) => connection,
+            Err(error) => {
+                eprintln!("lighthouse: prober cannot open the database: {error}");
+                return;
+            }
+        };
+        loop {
+            if let Err(error) = probe_roster(&connection, PROBE_TIMEOUT) {
+                eprintln!("lighthouse: probe sweep failed: {error}");
+            }
+            std::thread::sleep(interval);
+        }
+    });
 }
 
 fn respond(mut stream: TcpStream, body: &str) -> std::io::Result<()> {
@@ -484,19 +789,43 @@ mod tests {
                 packets: 5,
             },
         ];
-        let body = snapshot_json(&rows, 4242, 1_700_000_000);
+        let roster = vec![
+            RosterHost {
+                cert_name: "DS925".into(),
+                overlay: "192.168.100.125".into(),
+                last_activity_at: 1_699_999_900,
+                probed_at: Some(1_700_000_000),
+                rtt_us: Some(211_517),
+            },
+            RosterHost {
+                cert_name: "iMac".into(),
+                overlay: "192.168.100.12".into(),
+                last_activity_at: 1_699_000_000,
+                probed_at: Some(1_700_000_000),
+                rtt_us: None,
+            },
+        ];
+        let body = snapshot_json(&rows, &roster, 4242, 1_700_000_000);
         let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
         assert_eq!(parsed["default_port"], 4242);
         assert_eq!(parsed["wan"][0]["wan_ip"], "123.158.49.251");
         assert_eq!(parsed["wan"][0]["holder"], "DS925");
         assert_eq!(parsed["wan"][0]["rewritten"][0], "MBA-M2");
+        assert_eq!(parsed["hosts"][0]["name"], "DS925");
+        assert_eq!(parsed["hosts"][0]["overlay"], "192.168.100.125");
+        assert_eq!(parsed["hosts"][0]["last_activity_at"], 1_699_999_900_i64);
+        assert_eq!(parsed["hosts"][0]["rtt_us"], 211_517);
+        // An unreachable node must be a probed miss, not an absent measurement.
+        assert_eq!(parsed["hosts"][1]["probed_at"], 1_700_000_000_i64);
+        assert!(parsed["hosts"][1]["rtt_us"].is_null());
     }
 
     #[test]
     fn snapshot_json_survives_an_empty_database_and_absent_holder() {
         let empty: serde_json::Value =
-            serde_json::from_str(&snapshot_json(&[], 4242, 1)).expect("valid JSON");
+            serde_json::from_str(&snapshot_json(&[], &[], 4242, 1)).expect("valid JSON");
         assert_eq!(empty["wan"].as_array().map(Vec::len), Some(0));
+        assert_eq!(empty["hosts"].as_array().map(Vec::len), Some(0));
 
         let rows = vec![LighthouseRow {
             bucket_at: 0,
@@ -506,7 +835,7 @@ mod tests {
             packets: 4,
         }];
         let parsed: serde_json::Value =
-            serde_json::from_str(&snapshot_json(&rows, 4242, 1)).expect("valid JSON");
+            serde_json::from_str(&snapshot_json(&rows, &[], 4242, 1)).expect("valid JSON");
         assert!(parsed["wan"][0]["holder"].is_null());
     }
 
@@ -536,6 +865,151 @@ mod tests {
         let after_truncation = reader.read_new(Duration::from_secs(60)).unwrap();
         assert_eq!(parse_batch(&after_truncation).len(), 1);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Verbatim lines from the Bandwagon2 lighthouse. The second one carries no
+    /// `from=`, which is the whole reason the roster is parsed separately: a
+    /// connected but quiet node still has to count as seen.
+    #[test]
+    fn roster_reads_overlay_and_the_line_s_own_timestamp() {
+        let handshake = r#"Jul 29 14:05:54 sweet-node-2 nebula[394263]: time="2026-07-29T14:05:54+08:00" level=info msg="Handshake message received" certName=WSL certVersion=1 from="124.90.54.149:4242" vpnAddrs="[192.168.100.26]""#;
+        assert_eq!(
+            parse_roster_line(handshake),
+            Some(RosterEntry {
+                cert_name: "WSL".into(),
+                overlay: "192.168.100.26".into(),
+                seen_at: Some(1_785_305_154),
+            })
+        );
+
+        let heartbeat = r#"Jul 29 14:06:04 sweet-node-2 nebula[394263]: time="2026-07-29T14:06:04+08:00" level=info msg="Tunnel status" certName=WSL localIndex=6132250 tunnelCheck="map[method:active state:dead]" vpnAddrs="[192.168.100.26]""#;
+        assert_eq!(
+            parse_roster_line(heartbeat).and_then(|entry| entry.seen_at),
+            Some(1_785_305_164)
+        );
+    }
+
+    /// The lighthouse's own line uses `vpnNetworks` with a CIDR suffix, so it
+    /// must not be mistaken for a roster entry — that is what `register_self`
+    /// is for. Handshake timeouts carry no `certName` at all.
+    #[test]
+    fn roster_rejects_lines_without_a_usable_overlay() {
+        let myself = r#"time="2026-07-28T10:51:26+08:00" level=error msg="Refusing to handshake with myself" certName=Bandwagon2 from="107.182.186.158:4242" vpnNetworks="[192.168.100.200/24]""#;
+        assert!(parse_roster_line(myself).is_none());
+        assert!(parse_roster_line(r#"msg="Handshake timed out" udpAddr="1.2.3.4:4242""#).is_none());
+        assert!(parse_roster_line("").is_none());
+    }
+
+    /// A line with no parsable timestamp still counts, but only at ingest time.
+    #[test]
+    fn roster_falls_back_to_ingest_time() {
+        let entry = parse_roster_line(r#"certName=3B vpnAddrs="[192.168.100.7]""#).unwrap();
+        assert_eq!(entry.seen_at, None);
+
+        let connection = Connection::open_in_memory().unwrap();
+        create_schema(&connection).unwrap();
+        record_roster(&connection, &[entry], 1_785_000_000).unwrap();
+        assert_eq!(hosts(&connection).unwrap()[0].last_activity_at, 1_785_000_000);
+    }
+
+    /// Re-reading an old file must not drag a node's liveness backwards, or a
+    /// log rotation would report every host as long gone.
+    #[test]
+    fn roster_last_seen_only_moves_forward() {
+        let connection = Connection::open_in_memory().unwrap();
+        create_schema(&connection).unwrap();
+        let entry = |seen: i64| RosterEntry {
+            cert_name: "WSL".into(),
+            overlay: "192.168.100.26".into(),
+            seen_at: Some(seen),
+        };
+        record_roster(&connection, &[entry(1_785_305_164)], 0).unwrap();
+        record_roster(&connection, &[entry(1_785_000_000)], 0).unwrap();
+
+        let stored = hosts(&connection).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].last_activity_at, 1_785_305_164);
+        assert_eq!(stored[0].overlay, "192.168.100.26");
+    }
+
+    /// The lighthouse is alive by definition while the collector runs, so its
+    /// own sighting is overwritten rather than kept at the maximum.
+    #[test]
+    fn self_registration_refreshes_rather_than_accumulates() {
+        let connection = Connection::open_in_memory().unwrap();
+        create_schema(&connection).unwrap();
+        register_self(&connection, "Bandwagon2", "192.168.100.200", 1_785_000_000).unwrap();
+        register_self(&connection, "Bandwagon2", "192.168.100.200", 1_785_305_164).unwrap();
+        register_self(&connection, "", "192.168.100.201", 1).unwrap();
+
+        let stored = hosts(&connection).unwrap();
+        assert_eq!(stored.len(), 1, "an unnamed lighthouse must not be stored");
+        assert_eq!(stored[0].cert_name, "Bandwagon2");
+        assert_eq!(stored[0].last_activity_at, 1_785_305_164);
+    }
+
+    /// The three states a client has to tell apart, and the fourth — never
+    /// probed — that must not be mistaken for any of them.
+    #[test]
+    fn probe_results_distinguish_unreachable_from_unprobed() {
+        let connection = Connection::open_in_memory().unwrap();
+        create_schema(&connection).unwrap();
+        let seen = |name: &str, overlay: &str| RosterEntry {
+            cert_name: name.into(),
+            overlay: overlay.into(),
+            seen_at: Some(1_785_000_000),
+        };
+        record_roster(
+            &connection,
+            &[
+                seen("Mini-M4", "192.168.100.24"),
+                seen("iMac", "192.168.100.12"),
+                seen("WSL", "192.168.100.26"),
+            ],
+            0,
+        )
+        .unwrap();
+
+        record_probe(&connection, "Mini-M4", 1_785_305_164, Some(1_390)).unwrap();
+        record_probe(&connection, "iMac", 1_785_305_164, None).unwrap();
+
+        let by_name: HashMap<String, RosterHost> = hosts(&connection)
+            .unwrap()
+            .into_iter()
+            .map(|host| (host.cert_name.clone(), host))
+            .collect();
+        assert_eq!(by_name["Mini-M4"].reachable(), Some(true));
+        assert_eq!(by_name["Mini-M4"].rtt_us, Some(1_390));
+        assert_eq!(by_name["iMac"].reachable(), Some(false));
+        assert_eq!(by_name["WSL"].reachable(), None, "never probed is not down");
+    }
+
+    /// A node that stops answering must lose its last good round trip, or the
+    /// view keeps showing a latency for something it can no longer reach.
+    #[test]
+    fn a_failed_probe_clears_the_previous_round_trip() {
+        let connection = Connection::open_in_memory().unwrap();
+        create_schema(&connection).unwrap();
+        record_roster(
+            &connection,
+            &[RosterEntry {
+                cert_name: "DS925".into(),
+                overlay: "192.168.100.125".into(),
+                seen_at: Some(1_785_000_000),
+            }],
+            0,
+        )
+        .unwrap();
+
+        record_probe(&connection, "DS925", 1_785_000_100, Some(211_517)).unwrap();
+        record_probe(&connection, "DS925", 1_785_000_200, None).unwrap();
+
+        let host = hosts(&connection).unwrap().remove(0);
+        assert_eq!(host.rtt_us, None);
+        assert_eq!(host.probed_at, Some(1_785_000_200));
+        assert_eq!(host.reachable(), Some(false));
+        // The log-derived timestamp is a separate axis and must not move.
+        assert_eq!(host.last_activity_at, 1_785_000_000);
     }
 
     /// Nobody on the default port is a valid state: every node was rewritten.

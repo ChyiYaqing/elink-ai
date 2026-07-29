@@ -6,6 +6,7 @@ use ratatui::crossterm::event::{self, Event, KeyEventKind};
 
 use elink_tui::app::{App, LocalData};
 use elink_tui::config::{AppCommand, Cli, Config};
+use elink_tui::source::local::mesh::MeshMonitor;
 use elink_tui::source::{self, Command, SourceKind};
 use elink_tui::ui;
 
@@ -90,6 +91,16 @@ fn run_tui(config: Config) -> Result<()> {
     let device_url = config.device_url.clone();
     let hook_listen = config.hook_listen.clone();
     let status_poll_s = config.status_poll_s;
+    // Started before the source so the first roster fetch overlaps with the
+    // initial usage scan rather than following it.
+    let mesh = config.mesh.as_ref().map(|mesh| {
+        std::sync::Arc::new(MeshMonitor::spawn(
+            config.usage_db.clone(),
+            mesh.lighthouse_url.clone(),
+            mesh.interval,
+            mesh.window_s,
+        ))
+    });
     let handle = source::spawn(config, initial).map_err(|error| anyhow!(error))?;
     let mut app = App::new(
         initial,
@@ -97,6 +108,7 @@ fn run_tui(config: Config) -> Result<()> {
         LocalData {
             history: handle.history.clone(),
             cluster: handle.cluster.clone(),
+            mesh,
         },
         device_url,
         hook_listen,

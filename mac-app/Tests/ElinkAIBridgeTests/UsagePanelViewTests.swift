@@ -116,7 +116,8 @@ final class UsagePanelViewTests: XCTestCase {
         let view = UsagePanelView(
             model: model,
             updater: UpdateChecker(currentVersion: "0.1.17-rc3"),
-            cluster: cluster
+            cluster: cluster,
+            mesh: MeshMonitor(store: UsageStore.shared, lighthouseURL: nil)
         )
         let host = NSHostingView(rootView: view)
         let size = host.fittingSize
@@ -190,6 +191,7 @@ final class UsagePanelViewTests: XCTestCase {
             model: model,
             updater: UpdateChecker(currentVersion: "0.1.17-rc3"),
             cluster: cluster,
+            mesh: MeshMonitor(store: UsageStore.shared, lighthouseURL: nil),
             initialDeviceSettingsExpanded: expanded
         )
         let host = NSHostingView(rootView: view)
@@ -218,6 +220,7 @@ final class UsagePanelViewTests: XCTestCase {
             model: model,
             updater: UpdateChecker(currentVersion: "0.1.17-rc3"),
             cluster: cluster,
+            mesh: MeshMonitor(store: UsageStore.shared, lighthouseURL: nil),
             initialClusterExpanded: true
         )
         let host = NSHostingView(rootView: view)
@@ -296,6 +299,7 @@ final class UsagePanelViewTests: XCTestCase {
                 model: model,
                 updater: UpdateChecker(currentVersion: "0.1.17-rc3"),
                 cluster: cluster,
+                mesh: MeshMonitor(store: UsageStore.shared, lighthouseURL: nil),
                 initialClusterExpanded: true,
                 initialExpandedNodeID: expandedNodeID
             )

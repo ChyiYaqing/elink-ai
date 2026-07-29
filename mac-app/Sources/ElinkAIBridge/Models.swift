@@ -39,21 +39,11 @@ struct AgentStatus: Codable, Equatable {
     var usageCached = false
 }
 
-/// 一个节点在观测窗口内的同步往返汇总。
-/// 只带节点名和指标：endpoint 属于内网拓扑，不进无认证的 /v1/status。
-struct ClusterLinkSummary: Codable, Equatable {
-    var node: String
-    var rttAvgMs: Int?
-    var lostPct: Double
-    var samples: Int
-}
-
 struct ClusterSummary: Codable, Equatable {
     var enabled = false
     var nodeCount = 1
     var onlineCount = 1
     var lastSyncedAt: Date?
-    var link: [ClusterLinkSummary] = []
 }
 
 struct BridgeSnapshot: Codable {
@@ -96,14 +86,6 @@ struct BridgeSnapshot: Codable {
                 "node_count": cluster.nodeCount,
                 "online_count": cluster.onlineCount,
                 "last_synced_at": nullable(cluster.lastSyncedAt.map { Int($0.timeIntervalSince1970) }),
-                "link": cluster.link.map {
-                    [
-                        "node": $0.node,
-                        "rtt_avg_ms": nullable($0.rttAvgMs),
-                        "lost_pct": $0.lostPct,
-                        "samples": $0.samples,
-                    ]
-                },
             ],
             "claude": provider(claude, claude: true),
             "codex": provider(codex, claude: false),

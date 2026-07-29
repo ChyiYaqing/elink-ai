@@ -10,6 +10,7 @@ use crate::cluster::ClusterService;
 use crate::device::{self, DeviceCommand, DeviceLink};
 use crate::model::Snapshot;
 use crate::source::local::history::{History, StatsRange};
+use crate::source::local::mesh::MeshMonitor;
 use crate::source::{Command, SourceKind, Update};
 use crate::update::{SharedUpdate, UpdateInfo, UpdateSlot};
 
@@ -40,11 +41,18 @@ pub enum View {
     Stats,
     Device,
     Cluster,
+    /// The nebula overlay. Separate from `Cluster` on purpose: that view is
+    /// about the handful of hosts sharing usage, this one is about every device
+    /// on the VPN, most of which will never run this app.
+    Mesh,
 }
 
 pub struct LocalData {
     pub history: Arc<History>,
     pub cluster: Arc<ClusterService>,
+    /// Absent when no `[mesh] lighthouse_url` is configured: without a roster
+    /// there is no list of devices to show.
+    pub mesh: Option<Arc<MeshMonitor>>,
 }
 
 pub struct App {
@@ -64,6 +72,7 @@ pub struct App {
     pub device: Option<DeviceLink>,
     pub update_available: Option<UpdateInfo>,
     pub cluster: Arc<ClusterService>,
+    pub mesh: Option<Arc<MeshMonitor>>,
     device_url: Option<String>,
     hook_listen: String,
     local_bridge_ready: Arc<AtomicBool>,
@@ -100,6 +109,7 @@ impl App {
             device: device_url.clone().map(DeviceLink::spawn),
             update_available: None,
             cluster: local.cluster,
+            mesh: local.mesh,
             device_url,
             hook_listen,
             local_bridge_ready,
@@ -209,6 +219,12 @@ impl App {
                     self.set_hint("cluster management is available in local mode");
                 }
             }
+            KeyCode::Char('v') => match (self.view, self.mesh.is_some()) {
+                (View::Mesh, _) => self.set_view(View::Dashboard),
+                (_, true) => self.set_view(View::Mesh),
+                (_, false) => self.set_hint("set [mesh] lighthouse_url to see the nebula overlay"),
+            },
+            KeyCode::Esc if self.view == View::Mesh => self.set_view(View::Dashboard),
             KeyCode::Char('u') => {
                 crate::update::spawn_check(Arc::clone(&self.update_slot));
                 self.set_hint("checking for updates…");
@@ -427,6 +443,7 @@ mod tests {
                     ClusterService::load(temp_db("cluster"), Some("test-node"))
                         .expect("load cluster state"),
                 ),
+                mesh: None,
             },
             None,
             listen.to_string(),

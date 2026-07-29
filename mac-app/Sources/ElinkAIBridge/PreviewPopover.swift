@@ -9,6 +9,7 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
     private let cluster: ClusterManager
     private let updater = UpdateChecker()
     private let link: LinkMonitor
+    private let mesh: MeshMonitor
     private let port: UInt16
     private var pollTimer: Timer?
     private var clickMonitor: Any?
@@ -19,11 +20,12 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
     private var loadingSessions = false
 
     init(status: StatusService, usage: UsageFetcher, cluster: ClusterManager,
-         link: LinkMonitor, port: UInt16) {
+         link: LinkMonitor, mesh: MeshMonitor, port: UInt16) {
         self.status = status
         self.usage = usage
         self.cluster = cluster
         self.link = link
+        self.mesh = mesh
         self.port = port
         super.init()
         model.deviceConnectionEnabled = DeviceClient.isEnabled
@@ -150,7 +152,8 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
             NSWorkspace.shared.open(base.appendingPathComponent("v1/device"))
         }
         let hosting = NSHostingController(
-            rootView: UsagePanelView(model: model, updater: updater, cluster: cluster)
+            rootView: UsagePanelView(model: model, updater: updater, cluster: cluster,
+                                     mesh: mesh)
         )
         hosting.sizingOptions = .preferredContentSize
         popover.contentViewController = hosting
@@ -167,6 +170,13 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
         Log.user("open menu panel")
         model.deviceConnectionEnabled = DeviceClient.isEnabled
         model.deviceHost = DeviceClient.host
+        model.lighthouseURL = MeshMonitor.lighthouse
+        model.onSaveLighthouse = { [weak self] text in
+            Log.user("save nebula lighthouse address")
+            MeshMonitor.lighthouse = text
+            self?.model.lighthouseURL = text
+            self?.mesh.reconfigure(lighthouseURL: MeshMonitor.lighthouseURL(from: text))
+        }
         model.bridgeAddress = "http://\(DeviceClient.localIPv4() ?? "127.0.0.1"):\(port)/v1/status"
         model.settingsMessage = nil
         model.launchAtLogin = LaunchAtLogin.isEnabled()

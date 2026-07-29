@@ -59,6 +59,28 @@ struct FileConfig {
     device: FileDevice,
     cluster: FileCluster,
     lighthouse: FileLighthouse,
+    mesh: FileMesh,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct FileMesh {
+    /// Where a lighthouse collector publishes the roster, e.g.
+    /// `http://192.168.100.200:8767`. Absent disables the mesh view: without a
+    /// roster there is no list of devices to probe.
+    lighthouse_url: Option<String>,
+    interval_s: Option<u64>,
+    /// How far back the rendered min/avg/max reaches.
+    window_s: Option<i64>,
+}
+
+/// Client-side view of the nebula overlay. Separate from `[lighthouse]`, which
+/// configures the collector: a node is normally one or the other, not both.
+#[derive(Debug, Clone)]
+pub struct MeshConfig {
+    pub lighthouse_url: String,
+    pub interval: Duration,
+    pub window_s: i64,
 }
 
 #[derive(Deserialize, Default)]
@@ -71,6 +93,10 @@ struct FileLighthouse {
     default_port: Option<u16>,
     listen: Option<String>,
     interval_s: Option<u64>,
+    /// This lighthouse's own certName and overlay address; it never appears in
+    /// its own log, so the roster misses it unless it is named here.
+    self_name: Option<String>,
+    self_overlay: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -135,6 +161,8 @@ pub struct Config {
     pub device_url: Option<String>,
     /// Present only when the config file has a usable `[lighthouse]` section.
     pub lighthouse: Option<LighthouseConfig>,
+    /// Present only when `[mesh] lighthouse_url` names a collector to poll.
+    pub mesh: Option<MeshConfig>,
 }
 
 impl Config {
@@ -267,8 +295,21 @@ impl Config {
                         .filter(|value| !value.is_empty())
                         .unwrap_or_else(|| "0.0.0.0:8767".to_string()),
                     interval: Duration::from_secs(lighthouse.interval_s.unwrap_or(60).max(5)),
+                    self_name: lighthouse.self_name.filter(|value| !value.is_empty()),
+                    self_overlay: lighthouse.self_overlay.filter(|value| !value.is_empty()),
                 })
             },
+            mesh: file
+                .mesh
+                .lighthouse_url
+                .filter(|value| !value.is_empty())
+                .map(|lighthouse_url| MeshConfig {
+                    lighthouse_url,
+                    // Thirty seconds keeps a node's recovery visible quickly
+                    // without making the mesh a meaningful source of traffic.
+                    interval: Duration::from_secs(file.mesh.interval_s.unwrap_or(30).max(5)),
+                    window_s: file.mesh.window_s.unwrap_or(3_600).max(300),
+                }),
         })
     }
 }

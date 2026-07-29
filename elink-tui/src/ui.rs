@@ -5,10 +5,10 @@ use ratatui::widgets::{Bar, BarChart, BarGroup, Block, Clear, Paragraph, Sparkli
 use ratatui::Frame;
 
 use crate::app::{App, View};
-use crate::cluster::LinkSummary;
 use crate::device::Preview;
 use crate::model::{ProviderStatus, Snapshot};
 use crate::source::local::history::{range_stats, RangeStats, StatsRange};
+use crate::source::local::mesh::{MeshHostView, MeshState};
 use crate::source::local::stun::StunObservation;
 use crate::util::{epoch_now, format_age, format_minutes, format_tokens};
 
@@ -36,6 +36,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         View::Stats => draw_stats(frame, rows[next], app),
         View::Device => draw_device(frame, rows[next], app),
         View::Cluster => draw_cluster(frame, rows[next], app),
+        View::Mesh => draw_mesh(frame, rows[next], app),
     }
     frame.render_widget(footer(app), rows[next + 1]);
 
@@ -141,11 +142,12 @@ fn banner(app: &App) -> Paragraph<'static> {
 fn footer(app: &App) -> Paragraph<'static> {
     let keybar = match app.view {
         View::Dashboard => {
-            " q quit  r refresh  ⇥ focus  s stats  c cluster  d device  u update  m mode  ? help"
+            " q quit  r refresh  ⇥ focus  s stats  c cluster  v nebula  d device  u update  ? help"
         }
         View::Stats => " s back  w/m/y range  n source  ⇥ focus  q quit  ? help",
         View::Device => " d back  1/2/3 mode  p smart  f full  b bridge→here  q quit",
         View::Cluster => " c back  p pair  r sync  q quit  ? help",
+        View::Mesh => " v back  q quit  ? help",
     };
     let mut spans = vec![Span::styled(keybar, Style::new().dim())];
     if let Some(hint) = app.hint() {
@@ -444,10 +446,6 @@ fn draw_cluster(frame: &mut Frame, area: Rect, app: &App) {
             " Timezone  {}",
             view.timezone.as_deref().unwrap_or("—")
         )),
-        Line::raw(format!(" Egress    {}", {
-            let (observation, unavailable) = app.cluster.nat_observation();
-            format_nat(observation, unavailable)
-        })),
         Line::raw(""),
     ];
     if let Some(code) = &view.pairing_code {
@@ -480,16 +478,9 @@ fn draw_cluster(frame: &mut Frame, area: Rect, app: &App) {
         lines.push(Line::raw(""));
     }
     lines.push(Line::styled(" Nodes", Style::new().bold()));
-    // Labelled as a sync round trip on purpose: the figure includes peer
-    // processing time and must not be read as link latency.
-    lines.push(Line::styled(
-        "  sync round-trip min/avg/max over the last hour",
-        Style::new().dim(),
-    ));
     if view.nodes.is_empty() {
         lines.push(Line::styled("  no known nodes", Style::new().dim()));
     } else {
-        let summaries = app.cluster.link_summaries(3_600);
         for node in view
             .nodes
             .iter()
@@ -499,13 +490,9 @@ fn draw_cluster(frame: &mut Frame, area: Rect, app: &App) {
                 .last_seen_at
                 .map(|seen| format!("{} ago", format_age(epoch_now() - seen as i64)))
                 .unwrap_or_else(|| "never seen".to_string());
-            let link = summaries
-                .get(&node.node_id)
-                .map(format_link_summary)
-                .unwrap_or_else(|| "—".to_string());
             lines.push(two_column(
                 &format!("  {}", node.name),
-                &format!("{link}  {seen}"),
+                &seen,
                 inner.width as usize,
                 Style::new(),
             ));
@@ -518,6 +505,130 @@ fn draw_cluster(frame: &mut Frame, area: Rect, app: &App) {
         ));
     }
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The nebula overlay: every device with a certificate, and what this node can
+/// reach. Deliberately not the cluster view — those are different machines
+/// answering a different question.
+fn draw_mesh(frame: &mut Frame, area: Rect, app: &App) {
+    let block = Block::bordered().title(" Nebula overlay ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let Some(monitor) = app.mesh.as_ref() else {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                " set [mesh] lighthouse_url to see the overlay",
+                Style::new().dim(),
+            )),
+            inner,
+        );
+        return;
+    };
+    let snapshot = monitor.snapshot();
+    let (observation, unavailable) = app.cluster.nat_observation();
+
+    let mut lines = vec![
+        Line::raw(format!(" Egress    {}", format_nat(observation, unavailable))),
+        Line::raw(format!(
+            " Devices   {} on the overlay, {} reachable from here",
+            snapshot.hosts.len(),
+            snapshot
+                .hosts
+                .iter()
+                .filter(|host| host.state == MeshState::Online)
+                .count()
+        )),
+    ];
+    if !snapshot.icmp_available {
+        lines.push(Line::styled(
+            " No ICMP socket: reachability unavailable on this host",
+            Style::new().fg(Color::Yellow),
+        ));
+    }
+    if !snapshot.lighthouse_reachable {
+        lines.push(Line::styled(
+            " Lighthouse unreachable: showing the last known roster",
+            Style::new().fg(Color::Yellow),
+        ));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        format!(
+            " {:<12} {:<17} {:>9}  {:>23}   {}",
+            "DEVICE", "OVERLAY", "NOW", "MIN/AVG/MAX", "STATE"
+        ),
+        Style::new().bold(),
+    ));
+
+    if snapshot.hosts.is_empty() {
+        lines.push(Line::styled(
+            "  waiting for the first roster…",
+            Style::new().dim(),
+        ));
+    }
+    for host in &snapshot.hosts {
+        let summary = &host.summary;
+        let window = match (summary.rtt_min_us, summary.rtt_avg_us(), summary.rtt_max_us) {
+            (Some(min), Some(avg), Some(max)) => format!(
+                "{}/{}/{}",
+                format_millis(min),
+                format_millis(avg),
+                format_millis(max)
+            ),
+            _ => "—".to_string(),
+        };
+        let now = host
+            .latest_rtt_us
+            .map(|rtt| format_millis(i64::from(rtt)))
+            .unwrap_or_else(|| "—".to_string());
+        lines.push(Line::from(vec![
+            Span::raw(format!(
+                " {:<12} {:<17} {:>9}  {:>23}   ",
+                host.name,
+                host.overlay.to_string(),
+                now,
+                window
+            )),
+            Span::styled(mesh_state_label(host), mesh_state_style(host.state)),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Microseconds are the storage unit because an overlay hop to a LAN peer runs
+/// under a millisecond; sub-millisecond values keep two decimals so they do not
+/// all render as the same "0ms".
+fn format_millis(micros: i64) -> String {
+    let millis = micros as f64 / 1000.0;
+    if millis < 10.0 {
+        format!("{millis:.2}ms")
+    } else {
+        format!("{millis:.0}ms")
+    }
+}
+
+/// Names the evidence, not just the verdict: a broken tunnel is only a claim
+/// worth making because the lighthouse reached what this node could not.
+fn mesh_state_label(host: &MeshHostView) -> String {
+    match host.state {
+        MeshState::Online => "online".to_string(),
+        MeshState::TunnelDown => match host.lighthouse_rtt_us {
+            Some(rtt) => format!("tunnel down (lighthouse {})", format_millis(rtt)),
+            None => "tunnel down".to_string(),
+        },
+        MeshState::Offline => "offline".to_string(),
+        MeshState::Unreachable => "unreachable, cause unknown".to_string(),
+    }
+}
+
+fn mesh_state_style(state: MeshState) -> Style {
+    match state {
+        MeshState::Online => Style::new().fg(Color::Green),
+        MeshState::TunnelDown => Style::new().fg(Color::Yellow),
+        MeshState::Offline => Style::new().dim(),
+        MeshState::Unreachable => Style::new().fg(Color::Yellow),
+    }
 }
 
 /// States the fact rather than a verdict: port preservation is the precondition
@@ -537,23 +648,6 @@ fn format_nat(observation: Option<StunObservation>, unavailable: bool) -> String
         ),
         None if unavailable => "STUN unreachable, port test unavailable".to_string(),
         None => "—".to_string(),
-    }
-}
-
-/// Renders as `min/avg/max ms`, with a lost-sample count appended only when
-/// samples were actually lost, so a healthy row stays quiet.
-fn format_link_summary(summary: &LinkSummary) -> String {
-    let lost = summary.lost_samples();
-    let latency = match (summary.rtt_min_ms, summary.rtt_avg_ms(), summary.rtt_max_ms) {
-        (Some(min), Some(avg), Some(max)) => format!("{min}/{avg}/{max}ms"),
-        // Every sample in the window failed: no latency exists to report.
-        _ if summary.samples > 0 => "no reply".to_string(),
-        _ => "—".to_string(),
-    };
-    if lost > 0 {
-        format!("{latency} ⚠{lost}/{} lost", summary.samples)
-    } else {
-        latency
     }
 }
 
@@ -960,40 +1054,45 @@ mod tests {
         assert_eq!(format_nat(None, false), "—");
     }
 
+    /// Sub-millisecond overlay hops are the common case on a LAN, so they must
+    /// not all collapse into the same "0ms".
     #[test]
-    fn link_summary_stays_quiet_when_nothing_was_lost() {
-        let summary = LinkSummary {
-            samples: 240,
-            ok_samples: 240,
-            rtt_min_ms: Some(203),
-            rtt_max_ms: Some(228),
-            rtt_sum_ms: 240 * 215,
-        };
-        assert_eq!(format_link_summary(&summary), "203/215/228ms");
+    fn latency_keeps_sub_millisecond_detail_but_not_noise() {
+        assert_eq!(format_millis(360), "0.36ms");
+        assert_eq!(format_millis(1_390), "1.39ms");
+        assert_eq!(format_millis(9_999), "10.00ms");
+        assert_eq!(format_millis(61_450), "61ms");
+        assert_eq!(format_millis(221_180), "221ms");
     }
 
+    /// A broken tunnel is a claim about someone else's machine, so the label
+    /// carries the evidence: the lighthouse reached what this node could not.
     #[test]
-    fn link_summary_reports_lost_samples_and_total_outage() {
-        let partial = LinkSummary {
-            samples: 240,
-            ok_samples: 236,
-            rtt_min_ms: Some(203),
-            rtt_max_ms: Some(228),
-            rtt_sum_ms: 236 * 215,
+    fn mesh_state_label_names_its_evidence() {
+        let host = |state, lighthouse_rtt_us| MeshHostView {
+            name: "WSL".into(),
+            overlay: std::net::Ipv4Addr::new(192, 168, 100, 26),
+            state,
+            latest_rtt_us: None,
+            summary: Default::default(),
+            lighthouse_rtt_us,
+            last_activity_at: 0,
         };
-        assert_eq!(format_link_summary(&partial), "203/215/228ms ⚠4/240 lost");
-
-        // Every sample failed: there is no latency to report, only the outage.
-        let dead = LinkSummary {
-            samples: 240,
-            ok_samples: 0,
-            rtt_min_ms: None,
-            rtt_max_ms: None,
-            rtt_sum_ms: 0,
-        };
-        assert_eq!(format_link_summary(&dead), "no reply ⚠240/240 lost");
-
-        assert_eq!(format_link_summary(&LinkSummary::default()), "—");
+        assert_eq!(mesh_state_label(&host(MeshState::Online, None)), "online");
+        assert_eq!(
+            mesh_state_label(&host(MeshState::TunnelDown, Some(211_517))),
+            "tunnel down (lighthouse 212ms)"
+        );
+        // Without the lighthouse's number there is no evidence to quote.
+        assert_eq!(
+            mesh_state_label(&host(MeshState::TunnelDown, None)),
+            "tunnel down"
+        );
+        assert_eq!(mesh_state_label(&host(MeshState::Offline, None)), "offline");
+        assert_eq!(
+            mesh_state_label(&host(MeshState::Unreachable, None)),
+            "unreachable, cause unknown"
+        );
     }
 
     #[test]

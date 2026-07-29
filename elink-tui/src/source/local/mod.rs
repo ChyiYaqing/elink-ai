@@ -3,6 +3,7 @@ pub mod db;
 pub mod history;
 pub mod hooks;
 pub mod link;
+pub mod mesh;
 pub mod quota;
 pub mod sessions;
 pub mod store;
@@ -376,6 +377,7 @@ mod tests {
             hook_listen: String::new(),
             device_url: None,
             lighthouse: None,
+            mesh: None,
         }
     }
 

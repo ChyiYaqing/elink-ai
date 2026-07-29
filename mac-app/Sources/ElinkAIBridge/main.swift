@@ -13,6 +13,11 @@ let cluster = ClusterManager(store: usageStore)
 let status = StatusService(usage: usage, store: usageStore, cluster: cluster)
 // 出口 NAT 是本机属性，与集群同步无关，因此独立于 ClusterManager 驱动
 let linkMonitor = LinkMonitor(store: usageStore, nodeID: { cluster.nodeID })
+// nebula overlay 也和用量集群无关：那是 VPN 上的每一台设备，不只是配对过的那几台
+let meshMonitor = MeshMonitor(
+    store: usageStore,
+    lighthouseURL: MeshMonitor.lighthouseURL(from: MeshMonitor.lighthouse)
+)
 cluster.localStatusProvider = { status.localSnapshotForSync() }
 // backfill 和时区重分桶共用一条串行队列：并发解析会读到可变的全局时区，产生混合桶。
 // runUsageMaintenance 自查“已应用分桶时区”与当前时区，过期任务自然变成 no-op，
@@ -73,8 +78,10 @@ do {
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
 let menu = MenuBarController(usage: usage, status: status, cluster: cluster,
-                             link: linkMonitor, port: port)
+                             link: linkMonitor, mesh: meshMonitor, port: port)
 _ = menu
 linkMonitor.start()
+// 没配 lighthouse 就不起探测：没有名册就没有设备清单，空转只会白发包
+if MeshMonitor.lighthouseURL(from: MeshMonitor.lighthouse) != nil { meshMonitor.start() }
 usage.start()
 app.run()

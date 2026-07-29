@@ -24,41 +24,30 @@ struct DailyCategoryUsage: Equatable {
     var tokens: Int
 }
 
-/// 一个 5 分钟窗口内对某节点的同步往返观测。
-/// rtt 含对端处理时间，是同步往返而非链路延迟，UI 不得标注为网络延迟。
-struct LinkProbeBucket: Equatable {
-    var nodeID: String
-    var bucketAt: Date   // 桶起始时间，按 300 秒对齐
+/// 一个五分钟桶。`rttAvgUs` 为 nil 表示这五分钟一次都没通——必须与「0ms」区分，
+/// 否则图上会画出一条根本不存在的零延迟线。
+struct MeshBucketPoint: Equatable {
+    var bucketAt: Date
     var samples: Int
     var okSamples: Int
-    var rttMinMs: Int?   // 本桶全部失败时为 nil
-    var rttMaxMs: Int?
-    var rttSumMs: Int?
+    var rttMinUs: Int?
+    var rttMaxUs: Int?
+    var rttAvgUs: Int?
 
-    var rttAvgMs: Int? {
-        guard okSamples > 0, let sum = rttSumMs else { return nil }
-        return sum / okSamples
-    }
+    var lostSamples: Int { max(0, samples - okSamples) }
+    var fullyLost: Bool { samples > 0 && okSamples == 0 }
 }
 
 /// 某节点在一个窗口内所有桶的合并结果。
-struct LinkAggregate: Equatable {
+struct MeshAggregate: Equatable {
     var samples = 0
     var okSamples = 0
-    var rttMinMs: Int?
-    var rttMaxMs: Int?
-    var rttSumMs = 0
-
-    var rttAvgMs: Int? { okSamples > 0 ? rttSumMs / okSamples : nil }
-    var lostSamples: Int { max(0, samples - okSamples) }
-    var lostPercent: Double {
-        samples > 0 ? (Double(lostSamples) / Double(samples) * 1000).rounded() / 10 : 0
-    }
+    var rttMinUs: Int?
+    var rttMaxUs: Int?
+    var rttSumUs = 0
 }
 
 enum LinkEventKind: String {
-    case online
-    case offline
     /// 外部 IP 变化：NAT 映射已清空，随后通常伴随一轮端口重新抢占
     case wanRebind = "wan_rebind"
     /// 出口保留了源端口，本机因此位于端口争抢池里——这不是“正常”，是风险条件
@@ -1506,113 +1495,118 @@ final class UsageStore {
 
     // MARK: - Link health
 
-    static let linkBucketWidth: TimeInterval = 300
+    /// 与其余探测表保持一致，让应用里所有时间轴对得上。
+    static let meshBucketWidth: TimeInterval = 300
 
-    /// 桶宽与 15 秒探测间隔绑定（每桶约 20 个样本）。放大探测间隔时必须同比放大桶宽，
-    /// 否则每桶样本过少会让 min/max 剧烈跳动，失去判读价值。
-    static func linkBucketStart(_ time: Date) -> Date {
+    static func meshBucketStart(_ time: Date) -> Date {
         Date(timeIntervalSince1970:
-                (time.timeIntervalSince1970 / linkBucketWidth).rounded(.down) * linkBucketWidth)
+                (time.timeIntervalSince1970 / meshBucketWidth).rounded(.down) * meshBucketWidth)
     }
 
-    /// 记录一次对某节点的同步往返观测；`rttMs` 为 nil 表示未收到 HTTP 响应。
-    /// 每个样本直接 UPSERT 进所属桶：行数由桶宽而非样本数决定，写入量对 SQLite
-    /// 可忽略，且不需要内存累进，进程崩溃不会丢掉当前窗口。
-    func recordLinkSample(nodeID: String, at time: Date = Date(), rttMs: Int?) {
-        guard !nodeID.isEmpty else { return }
-        let bucketAt = Self.linkBucketStart(time).timeIntervalSince1970
+    /// 记录一次网格探测。行数由桶宽而非样本数决定，因此和其余聚合表一样不需要清理。
+    func recordMeshSample(hostName: String, at time: Date = Date(), rttUs: UInt32?) {
+        guard !hostName.isEmpty else { return }
+        let bucketAt = Self.meshBucketStart(time).timeIntervalSince1970
+        let rtt = rttUs.map { Int($0) }
         queue.sync {
             guard db != nil else { return }
             let sql = """
-            INSERT INTO link_probe_bucket
-              (node_id, bucket_at, samples, ok_samples, rtt_min_ms, rtt_max_ms, rtt_sum_ms)
+            INSERT INTO mesh_probe_bucket
+              (host_name, bucket_at, samples, ok_samples, rtt_min_us, rtt_max_us, rtt_sum_us)
             VALUES (?, ?, 1, ?, ?, ?, ?)
-            ON CONFLICT(node_id, bucket_at) DO UPDATE SET
+            ON CONFLICT(host_name, bucket_at) DO UPDATE SET
               samples = samples + 1,
               ok_samples = ok_samples + excluded.ok_samples,
-              rtt_min_ms = MIN(COALESCE(rtt_min_ms, excluded.rtt_min_ms),
-                               COALESCE(excluded.rtt_min_ms, rtt_min_ms)),
-              rtt_max_ms = MAX(COALESCE(rtt_max_ms, excluded.rtt_max_ms),
-                               COALESCE(excluded.rtt_max_ms, rtt_max_ms)),
-              rtt_sum_ms = CASE WHEN excluded.rtt_sum_ms IS NULL THEN rtt_sum_ms
-                                ELSE COALESCE(rtt_sum_ms, 0) + excluded.rtt_sum_ms END
+              rtt_min_us = MIN(COALESCE(rtt_min_us, excluded.rtt_min_us),
+                               COALESCE(excluded.rtt_min_us, rtt_min_us)),
+              rtt_max_us = MAX(COALESCE(rtt_max_us, excluded.rtt_max_us),
+                               COALESCE(excluded.rtt_max_us, rtt_max_us)),
+              rtt_sum_us = CASE WHEN excluded.rtt_sum_us IS NULL THEN rtt_sum_us
+                                ELSE COALESCE(rtt_sum_us, 0) + excluded.rtt_sum_us END
             """
             var statement: OpaquePointer?
-            guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
-                sqlite3_finalize(statement)
-                Log.error("link sample prepare failed", category: "storage")
-                return
-            }
-            sqlite3_bind_text(statement, 1, nodeID, -1, Self.transient)
+            guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return }
+            sqlite3_bind_text(statement, 1, hostName, -1, Self.transient)
             sqlite3_bind_double(statement, 2, bucketAt)
-            sqlite3_bind_int(statement, 3, rttMs == nil ? 0 : 1)
-            if let rttMs {
-                let value = Int32(clamping: rttMs)
-                sqlite3_bind_int(statement, 4, value)
-                sqlite3_bind_int(statement, 5, value)
-                sqlite3_bind_int(statement, 6, value)
-            } else {
-                sqlite3_bind_null(statement, 4)
-                sqlite3_bind_null(statement, 5)
-                sqlite3_bind_null(statement, 6)
+            sqlite3_bind_int(statement, 3, rtt == nil ? 0 : 1)
+            for index in Int32(4)...Int32(6) {
+                if let rtt { sqlite3_bind_int(statement, index, Int32(rtt)) }
+                else { sqlite3_bind_null(statement, index) }
             }
             if sqlite3_step(statement) != SQLITE_DONE {
-                Log.error("link sample write failed", category: "storage")
+                Log.error("mesh sample write failed", category: "storage")
             }
             sqlite3_finalize(statement)
         }
     }
 
-    func linkBuckets(since: Date, nodeID: String? = nil) -> [LinkProbeBucket] {
+    /// 某节点的逐桶历史，按时间正序。桶内的 min/max 保留了那五分钟里的抖动幅度，
+    /// 这正是“波动情况”要看的东西——只画平均值会把尖峰抹平。
+    func meshHistory(hostName: String, since: Date) -> [MeshBucketPoint] {
         queue.sync {
             guard db != nil else { return [] }
-            var sql = """
-            SELECT node_id, bucket_at, samples, ok_samples, rtt_min_ms, rtt_max_ms, rtt_sum_ms
-            FROM link_probe_bucket WHERE bucket_at >= ?
+            let sql = """
+            SELECT bucket_at, samples, ok_samples, rtt_min_us, rtt_max_us, rtt_sum_us
+            FROM mesh_probe_bucket WHERE host_name = ? AND bucket_at >= ?
+            ORDER BY bucket_at
             """
-            if nodeID != nil { sql += " AND node_id = ?" }
-            sql += " ORDER BY bucket_at"
             var statement: OpaquePointer?
-            guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
-                sqlite3_finalize(statement)
-                return []
-            }
+            guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return [] }
             defer { sqlite3_finalize(statement) }
-            sqlite3_bind_double(statement, 1, since.timeIntervalSince1970)
-            if let nodeID { sqlite3_bind_text(statement, 2, nodeID, -1, Self.transient) }
-            var rows: [LinkProbeBucket] = []
+            sqlite3_bind_text(statement, 1, hostName, -1, Self.transient)
+            sqlite3_bind_double(statement, 2, since.timeIntervalSince1970)
+            var points: [MeshBucketPoint] = []
             while sqlite3_step(statement) == SQLITE_ROW {
-                let optional: (Int32) -> Int? = { index in
-                    sqlite3_column_type(statement, index) == SQLITE_NULL
-                        ? nil : Int(sqlite3_column_int(statement, index))
-                }
-                rows.append(LinkProbeBucket(
-                    nodeID: String(cString: sqlite3_column_text(statement, 0)),
-                    bucketAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 1)),
-                    samples: Int(sqlite3_column_int(statement, 2)),
-                    okSamples: Int(sqlite3_column_int(statement, 3)),
-                    rttMinMs: optional(4),
-                    rttMaxMs: optional(5),
-                    rttSumMs: optional(6)
+                let ok = Int(sqlite3_column_int(statement, 2))
+                let minimum = sqlite3_column_type(statement, 3) == SQLITE_NULL
+                    ? nil : Int(sqlite3_column_int(statement, 3))
+                let maximum = sqlite3_column_type(statement, 4) == SQLITE_NULL
+                    ? nil : Int(sqlite3_column_int(statement, 4))
+                let sum = sqlite3_column_type(statement, 5) == SQLITE_NULL
+                    ? 0 : Int(sqlite3_column_int(statement, 5))
+                points.append(MeshBucketPoint(
+                    bucketAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 0)),
+                    samples: Int(sqlite3_column_int(statement, 1)),
+                    okSamples: ok,
+                    rttMinUs: minimum, rttMaxUs: maximum,
+                    rttAvgUs: ok > 0 ? sum / ok : nil
                 ))
             }
-            return rows
+            return points
         }
     }
 
-    /// 把窗口内的桶按节点合并；没有任何样本的节点不会出现在结果里。
-    func linkAggregates(since: Date) -> [String: LinkAggregate] {
-        var result: [String: LinkAggregate] = [:]
-        for bucket in linkBuckets(since: since) {
-            var value = result[bucket.nodeID] ?? LinkAggregate()
-            value.samples += bucket.samples
-            value.okSamples += bucket.okSamples
-            value.rttSumMs += bucket.rttSumMs ?? 0
-            value.rttMinMs = [value.rttMinMs, bucket.rttMinMs].compactMap { $0 }.min()
-            value.rttMaxMs = [value.rttMaxMs, bucket.rttMaxMs].compactMap { $0 }.max()
-            result[bucket.nodeID] = value
+    /// 把窗口内的桶按节点合并；一次样本都没有的节点不会出现在结果里。
+    func meshAggregates(since: Date) -> [String: MeshAggregate] {
+        queue.sync {
+            guard db != nil else { return [:] }
+            let sql = """
+            SELECT host_name, samples, ok_samples, rtt_min_us, rtt_max_us, rtt_sum_us
+            FROM mesh_probe_bucket WHERE bucket_at >= ?
+            """
+            var statement: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return [:] }
+            defer { sqlite3_finalize(statement) }
+            sqlite3_bind_double(statement, 1, since.timeIntervalSince1970)
+            var result: [String: MeshAggregate] = [:]
+            while sqlite3_step(statement) == SQLITE_ROW {
+                let name = String(cString: sqlite3_column_text(statement, 0))
+                var value = result[name] ?? MeshAggregate()
+                value.samples += Int(sqlite3_column_int(statement, 1))
+                value.okSamples += Int(sqlite3_column_int(statement, 2))
+                let minimum = sqlite3_column_type(statement, 3) == SQLITE_NULL
+                    ? nil : Int(sqlite3_column_int(statement, 3))
+                let maximum = sqlite3_column_type(statement, 4) == SQLITE_NULL
+                    ? nil : Int(sqlite3_column_int(statement, 4))
+                if sqlite3_column_type(statement, 5) != SQLITE_NULL {
+                    value.rttSumUs += Int(sqlite3_column_int(statement, 5))
+                }
+                value.rttMinUs = [value.rttMinUs, minimum].compactMap { $0 }.min()
+                value.rttMaxUs = [value.rttMaxUs, maximum].compactMap { $0 }.max()
+                result[name] = value
+            }
+            return result
         }
-        return result
     }
 
     /// 上一次 STUN 观测到的外部端点，跨进程保留：家庭出口一天可能重拨数次，
@@ -1733,19 +1727,18 @@ final class UsageStore {
         }
     }
 
-    /// 链路观测是本库唯一的无界时序数据，因此只落 5 分钟聚合桶和稀疏事件，
-    /// 两者行数均天然有界，与其余聚合表一样不需要清理逻辑。
+    /// 只记录出口 NAT 的状态跃迁，行数天然有界，与其余聚合表一样不需要清理逻辑。
     private static func createLinkTables(in db: OpaquePointer?) {
         let sql = """
-        CREATE TABLE IF NOT EXISTS link_probe_bucket (
-          node_id TEXT NOT NULL,
+        CREATE TABLE IF NOT EXISTS mesh_probe_bucket (
+          host_name TEXT NOT NULL,
           bucket_at REAL NOT NULL,
           samples INTEGER NOT NULL,
           ok_samples INTEGER NOT NULL,
-          rtt_min_ms INTEGER,
-          rtt_max_ms INTEGER,
-          rtt_sum_ms INTEGER,
-          PRIMARY KEY (node_id, bucket_at)
+          rtt_min_us INTEGER,
+          rtt_max_us INTEGER,
+          rtt_sum_us INTEGER,
+          PRIMARY KEY (host_name, bucket_at)
         );
         CREATE TABLE IF NOT EXISTS link_event (
           occurred_at REAL NOT NULL,

@@ -119,15 +119,15 @@ fn create_schema(connection: &Connection) -> rusqlite::Result<()> {
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
-        CREATE TABLE IF NOT EXISTS link_probe_bucket (
-            node_id TEXT NOT NULL,
+        CREATE TABLE IF NOT EXISTS mesh_probe_bucket (
+            host_name TEXT NOT NULL,
             bucket_at REAL NOT NULL,
             samples INTEGER NOT NULL,
             ok_samples INTEGER NOT NULL,
-            rtt_min_ms INTEGER,
-            rtt_max_ms INTEGER,
-            rtt_sum_ms INTEGER,
-            PRIMARY KEY (node_id, bucket_at)
+            rtt_min_us INTEGER,
+            rtt_max_us INTEGER,
+            rtt_sum_us INTEGER,
+            PRIMARY KEY (host_name, bucket_at)
         );
         CREATE TABLE IF NOT EXISTS link_event (
             occurred_at REAL NOT NULL,

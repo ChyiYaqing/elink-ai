@@ -7,11 +7,11 @@ final class MenuBarController: NSObject {
     private let status: StatusService
 
     init(usage: UsageFetcher, status: StatusService, cluster: ClusterManager,
-         link: LinkMonitor, port: UInt16) {
+         link: LinkMonitor, mesh: MeshMonitor, port: UInt16) {
         self.usage = usage
         self.status = status
         self.preview = PreviewPopoverController(status: status, usage: usage, cluster: cluster,
-                                                link: link, port: port)
+                                                link: link, mesh: mesh, port: port)
         super.init()
         if let button = item.button {
             button.image = Self.menuBarImage(percent: nil)

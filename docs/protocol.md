@@ -13,17 +13,20 @@ token count, as objects containing `model` and `tokens`. See
 
 When Multi-Host Sync is enabled, token/model fields contain the sum of all known
 node snapshots. The additive `cluster` object reports `enabled`, `node_count`,
-`online_count`, `last_synced_at`, and `link`. Existing v1 clients may ignore it.
+`online_count`, and `last_synced_at`. Existing v1 clients may ignore it.
 
-`link` holds one entry per node observed over the last hour, with `node`,
-`rtt_avg_ms`, `lost_pct`, and `samples`. The round trip is measured on the
-existing 15-second peer synchronization and includes peer processing time, so it
-is an upper bound on link latency and must not be presented as network latency.
-Nodes without samples in the window are omitted rather than reported as zero.
+The `cluster` object describes usage synchronization only. It carries no network
+quality, and deliberately so: its members are the few hosts that run this app and
+have paired, which is a different and much smaller set than the devices on the
+nebula overlay. A `link` field once reported a round trip measured on the
+15-second peer sync; it was removed because that figure included peer processing
+time and, for Bonjour-discovered peers, travelled the LAN rather than the tunnel
+it appeared to describe. Overlay reachability and latency now come from ICMP
+against overlay addresses — see `elink-tui --headless` and the mesh view.
 
-Entries carry the node name only. Overlay addresses and ports stay on the
-observing host, because port 8765 is unauthenticated: exposing them here would
-publish internal network topology to anything that can reach the bridge.
+Node names are the only identifier published here. Overlay addresses and ports
+stay on the observing host, because port 8765 is unauthenticated: exposing them
+would publish internal network topology to anything that can reach the bridge.
 
 `POST /v1/event` accepts:
 

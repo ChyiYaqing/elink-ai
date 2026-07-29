@@ -3,6 +3,7 @@ pub mod cluster;
 pub mod config;
 pub mod device;
 pub mod discovery;
+pub mod icmp;
 pub mod lighthouse;
 pub mod model;
 pub mod source;

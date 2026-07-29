@@ -5,7 +5,6 @@ final class ClusterManager: ObservableObject {
     @Published private(set) var enabled = false
     @Published private(set) var clusterID: String?
     @Published private(set) var nodes: [ClusterNodeRecord] = []
-    @Published private(set) var linkAggregates: [String: LinkAggregate] = [:]
     @Published private(set) var discoveredPeers: [DiscoveredClusterPeer] = []
     @Published private(set) var pairingCode: String?
     @Published private(set) var lastError: String?
@@ -33,7 +32,6 @@ final class ClusterManager: ObservableObject {
     private var liveStatuses: [String: ClusterLiveStatus] = [:]
     private var replayNonces: [String: Date] = [:]
     // 每个 endpoint 上一次的可达性，只在跃迁时写 link_event；nil 表示尚未观测过
-    private var linkReachable: [String: Bool] = [:]
     // 每次保存凭据（建群/入群/退群）时 +1；在途同步回包若代数不符则丢弃，
     // 避免旧集群的响应写进新集群的数据库
     private var credentialsGeneration = 0
@@ -45,7 +43,6 @@ final class ClusterManager: ObservableObject {
     private let session: URLSession
     private let manualPeersKey = "elink_cluster_manual_peers_v2"
     /// 链路汇总的观测窗口，与 TUI 的集群页保持一致
-    static let linkWindow: TimeInterval = 3600
 
     init(store: UsageStore, credentials: ClusterCredentials? = nil,
          credentialStore: ClusterCredentialStore? = nil,
@@ -364,21 +361,11 @@ final class ClusterManager: ObservableObject {
         )
         let records = store.clusterNodes()
         let online = records.filter { $0.isOnline(at: now) }.count
-        let aggregates = store.linkAggregates(since: now.addingTimeInterval(-Self.linkWindow))
         result.cluster = ClusterSummary(
             enabled: true,
             nodeCount: max(1, records.count),
             onlineCount: max(1, online),
-            lastSyncedAt: records.compactMap(\.lastSyncAt).max(),
-            link: records.compactMap { record in
-                guard let value = aggregates[record.nodeID], value.samples > 0 else { return nil }
-                return ClusterLinkSummary(
-                    node: record.name,
-                    rttAvgMs: value.rttAvgMs,
-                    lostPct: value.lostPercent,
-                    samples: value.samples
-                )
-            }.sorted { $0.node < $1.node }
+            lastSyncedAt: records.compactMap(\.lastSyncAt).max()
         )
         return result
     }
@@ -563,10 +550,8 @@ final class ClusterManager: ObservableObject {
             method: "GET", path: "/v2/cluster/manifest", body: Data(),
             nodeID: nodeID, key: key
         ).forEach { request.setValue($0.value, forHTTPHeaderField: $0.key) }
-        let probeStartedAt = Date()
         session.dataTask(with: request) { [weak self] data, response, error in
             guard let self else { completion?(BridgeError.message(tr("同步服务已停止", "Sync service stopped"))); return }
-            self.recordProbe(endpoint: endpoint, startedAt: probeStartedAt, reachable: response != nil)
             if let error { completion?(error); return }
             guard let http = response as? HTTPURLResponse else {
                 completion?(BridgeError.message(tr("节点 \(endpoint) 没有返回有效响应",
@@ -684,29 +669,6 @@ final class ClusterManager: ObservableObject {
         }.resume()
     }
 
-    /// 记录一次同步往返观测。判据是“是否收到 HTTP 响应”而不是“同步是否成功”：
-    /// 401 未入群、解密失败、集群不符都说明链路是通的，把它们记成丢样会把配置
-    /// 问题显示成网络故障，正是排障时最容易被带偏的方向。
-    private func recordProbe(endpoint: String, startedAt: Date, reachable: Bool) {
-        // 尚未成功握手过的 endpoint 无法归属到节点，不记录：宁可缺样本也不记错主体
-        guard let nodeID = store.clusterNodes().first(where: { $0.endpoint == endpoint })?.nodeID,
-              nodeID != self.nodeID else { return }
-        let now = Date()
-        let rttMs = reachable ? max(0, Int(now.timeIntervalSince(startedAt) * 1000)) : nil
-        store.recordLinkSample(nodeID: nodeID, at: now, rttMs: rttMs)
-        let previous = lock.holding { () -> Bool? in
-            let value = linkReachable[endpoint]
-            linkReachable[endpoint] = reachable
-            return value
-        }
-        // 首次观测不算跃迁，否则每次进程启动都会给每个节点写一条 online
-        guard let previous, previous != reachable else { return }
-        store.recordLinkEvent(LinkEvent(
-            occurredAt: now, nodeID: nodeID,
-            kind: reachable ? .online : .offline,
-            detail: endpoint
-        ))
-    }
 
     private func pull(_ keys: [ClusterSnapshotKey], from endpoint: String, key: SymmetricKey,
                       generation: Int, epoch: Int, completion: ((Error?) -> Void)? = nil) {
@@ -861,15 +823,11 @@ final class ClusterManager: ObservableObject {
 
     private func refreshPublishedState() {
         let records = store.clusterNodes()
-        // 随每轮同步刷新（15 秒一次），面板因此不必在每次重绘时查库
-        let link = store.linkAggregates(since: Date().addingTimeInterval(-Self.linkWindow))
         if Thread.isMainThread {
             nodes = records
-            linkAggregates = link
         } else {
             DispatchQueue.main.async { [weak self] in
                 self?.nodes = records
-                self?.linkAggregates = link
             }
         }
     }
