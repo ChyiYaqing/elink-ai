@@ -6,6 +6,17 @@ and `Removed`.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## 0.1.17-rc4
+
+### Added
+
+- macOS and `elink-tui` now show the Nebula overlay with per-host reachability,
+  latency history, outage markers, and lighthouse-assisted tunnel diagnosis
+- STUN checks now report the current external endpoint and whether NAT preserves
+  or rewrites the local source port
+- `elink-tui --headless` can expose Nebula lighthouse observations so clients
+  can compare remote activity with their own overlay reachability
+
 ## 0.1.17-rc3
 
 ### Added
