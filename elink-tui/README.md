@@ -53,7 +53,7 @@ GitHub Release 提供 `arm64` Linux 预编译包，文件名为
 
 ### 本地模式
 
-本地模式是默认模式，不需要 Mac：
+本地模式是默认模式，不需要 mac-app bridge：
 
 ```bash
 elink-tui

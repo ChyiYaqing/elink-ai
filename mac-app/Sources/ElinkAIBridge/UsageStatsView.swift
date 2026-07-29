@@ -241,7 +241,7 @@ struct UsageStatsView: View {
             hoveredBucket = nil
         }
         .onChange(of: clusterNodes.map(\.nodeID)) { ids in
-            // 选中的节点离开集群后清空选择，回退为全部 Mac
+            // 选中的节点离开集群后清空选择，回退为全部主机
             if !selectedNodeID.isEmpty, !ids.contains(selectedNodeID) {
                 selectedNodeID = ""
             }
@@ -278,7 +278,7 @@ struct UsageStatsView: View {
                 .foregroundStyle(theme.textSecondary)
             Spacer()
             Picker(tr("数据来源", "Data Source"), selection: $selectedNodeID) {
-                Text(tr("全部主机", "All Macs")).tag("")
+                Text(tr("全部主机", "All Hosts")).tag("")
                 ForEach(clusterNodes) { node in
                     Text(node.name).tag(node.nodeID)
                 }
@@ -584,7 +584,7 @@ struct UsageStatsView: View {
     }
 
     private func deviceName(_ nodeID: String?) -> String {
-        guard let nodeID else { return tr("本机", "This Mac") }
+        guard let nodeID else { return tr("本机", "This Host") }
         return clusterNodes.first { $0.nodeID == nodeID }?.name
             ?? tr("未知设备 \(nodeID.prefix(8))", "Unknown device \(nodeID.prefix(8))")
     }
@@ -594,7 +594,7 @@ struct UsageStatsView: View {
         return "\(Int((Double(tokens) / Double(total) * 100).rounded()))%"
     }
 
-    /// 选中的节点若已离开集群，则回退为全部 Mac，避免统计停留在已消失节点上
+    /// 选中的节点若已离开集群，则回退为全部主机，避免统计停留在已消失节点上
     private var effectiveNodeID: String? {
         clusterNodes.contains { $0.nodeID == selectedNodeID } ? selectedNodeID : nil
     }

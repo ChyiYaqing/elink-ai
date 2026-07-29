@@ -57,7 +57,7 @@ enum ClusterCrypto {
         )
     }
 
-    // 配对码 16 字符（~78 bit 熵），只在两台 Mac 的屏幕间带外传递、绝不上网线：
+    // 配对码 16 字符（~78 bit 熵），只在两台主机的屏幕间带外传递、绝不上网线：
     // 它同时充当 ECDH 密钥的盐和入群证明的 HMAC 密钥，主动中间人替换公钥后
     // 也无法在可行时间内离线暴破出会话密钥
     static let pairingCodeLength = 16
@@ -231,7 +231,7 @@ final class ClusterCredentialStore {
             return value
         }
 
-        let name = Host.current().localizedName ?? "Mac"
+        let name = Host.current().localizedName ?? "Host"
         let value = ClusterCredentials(
             nodeID: UUID().uuidString.lowercased(),
             nodeName: name,

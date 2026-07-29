@@ -1067,7 +1067,7 @@ final class UsageStore {
         queue.sync { clusterDataEpochValue }
     }
 
-    /// Removes data learned from a previous cluster while preserving this Mac's own history.
+    /// Removes data learned from a previous cluster while preserving this host's own history.
     func resetRemoteClusterData(localNodeID: String) {
         queue.sync {
             clusterDataEpochValue += 1

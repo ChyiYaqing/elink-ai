@@ -96,17 +96,17 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
                     level: found == nil ? .warning : .info
                 )
                 self.model.settingsMessage = found.map { tr("配对成功：\($0)", "Paired: \($0)") }
-                    ?? tr("未找到屏幕，请确认树莓派与 Mac 在同一局域网",
-                          "No screen found. Make sure the Raspberry Pi and Mac are on the same LAN")
+                    ?? tr("未找到屏幕，请确认树莓派与本机在同一局域网",
+                          "No screen found. Make sure the Raspberry Pi and this host are on the same LAN")
                 self.reload()
             }
         }
         model.onPointHere = { [weak self] in
             guard let self else { return }
-            Log.user("set this Mac as device bridge")
+            Log.user("set this host as device bridge")
             guard let ip = DeviceClient.localIPv4() else {
                 Log.warning("set bridge failed: local IPv4 unavailable", category: "user")
-                self.model.settingsMessage = tr("无法取得本机局域网地址", "Cannot get this Mac's LAN address")
+                self.model.settingsMessage = tr("无法取得本机局域网地址", "Cannot get this host's LAN address")
                 return
             }
             let url = "http://\(ip):\(self.port)"

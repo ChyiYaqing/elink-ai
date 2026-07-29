@@ -1,6 +1,6 @@
 # HTTP protocol v1
 
-The Mac bridge listens on TCP 8765 and the Raspberry Pi agent listens on TCP
+The host bridge listens on TCP 8765 and the Raspberry Pi agent listens on TCP
 8766. Both are plain HTTP services intended for a trusted LAN.
 
 ## Bridge
@@ -11,7 +11,7 @@ zero. Each provider may also include `model_usage_today`, sorted by descending
 token count, as objects containing `model` and `tokens`. See
 `fixtures/status-v1.json` for the complete shape.
 
-When Multi-Mac Sync is enabled, token/model fields contain the sum of all known
+When Multi-Host Sync is enabled, token/model fields contain the sum of all known
 node snapshots. The additive `cluster` object reports `enabled`, `node_count`,
 `online_count`, and `last_synced_at`. Existing v1 clients may ignore it.
 
@@ -35,9 +35,9 @@ lifecycle event arrives.
 
 No endpoint accepts or returns OAuth tokens or raw session logs.
 
-## Mac peer sync protocol v2
+## Host peer sync protocol v2
 
-Mac bridges advertise `_elink-ai._tcp` over Bonjour. TXT records contain only
+Host bridges advertise `_elink-ai._tcp` over Bonjour. TXT records contain only
 protocol version, node ID, cluster ID, and whether a two-minute pairing window
 is open. VPN deployments may configure a peer address manually.
 
@@ -66,10 +66,10 @@ directory uses `0700` permissions and the database uses `0600`. Cluster
 credentials are never stored in or read from macOS Keychain.
 
 The first protocol version uses one shared secret for the cluster and does not
-support individual-node revocation. To exclude a previously trusted Mac,
-create a new cluster and pair the remaining Macs again.
+support individual-node revocation. To exclude a previously trusted host,
+create a new cluster and pair the remaining hosts again.
 
 Snapshots are absolute, not deltas. Receivers replace a source/day/provider
-only when its revision increases, so retries, relay through another Mac, and
+only when its revision increases, so retries, relay through another host, and
 out-of-order delivery are idempotent. Offline nodes' last synchronized values
 remain part of aggregate history.

@@ -136,7 +136,7 @@ struct UsagePanelView: View {
             if cluster.enabled {
                 StateBadge(
                     text: tr("\(max(1, cluster.nodes.filter { $0.isOnline() }.count))/\(max(1, cluster.nodes.count)) 台",
-                             "\(max(1, cluster.nodes.filter { $0.isOnline() }.count))/\(max(1, cluster.nodes.count)) Macs"),
+                             "\(max(1, cluster.nodes.filter { $0.isOnline() }.count))/\(max(1, cluster.nodes.count)) Hosts"),
                     color: cluster.nodes.allSatisfy { $0.isOnline() }
                         ? theme.statusHealthy : theme.statusWarning
                 )
@@ -280,7 +280,7 @@ struct UsagePanelView: View {
                         title: tr("屏幕连接", "Screen Connection"),
                         subtitle: model.deviceConnectionEnabled
                             ? tr("树莓派电子纸的地址与配对", "Raspberry Pi e-paper address and pairing")
-                            : tr("已关闭 · 本机仅采集与同步用量", "Off · this Mac only collects and syncs usage"),
+                            : tr("已关闭 · 本机仅采集与同步用量", "Off · this host only collects and syncs usage"),
                         expanded: deviceSettingsExpanded
                     )
                     .contentShape(Rectangle())
@@ -432,11 +432,11 @@ struct UsagePanelView: View {
                     theme,
                     icon: "macbook.and.iphone",
                     color: Color(red: 0.32, green: 0.58, blue: 0.96),
-                    title: tr("多机同步", "Multi-Mac Sync"),
+                    title: tr("多机同步", "Multi-Host Sync"),
                     subtitle: cluster.enabled
                         ? tr("\(max(1, cluster.nodes.filter { $0.isOnline() }.count))/\(max(1, cluster.nodes.count)) 台在线",
                              "\(max(1, cluster.nodes.filter { $0.isOnline() }.count))/\(max(1, cluster.nodes.count)) online")
-                        : tr("独立模式 · 本机数据不会广播", "Standalone · this Mac's data isn't broadcast"),
+                        : tr("独立模式 · 本机数据不会广播", "Standalone · this host's data isn't broadcast"),
                     expanded: clusterExpanded
                 )
                 .padding(12)
@@ -462,7 +462,7 @@ struct UsagePanelView: View {
                                     .frame(width: 24, height: 24)
                                     .background(Circle().fill(Color.blue.opacity(theme.dark ? 0.18 : 0.09)))
                                 VStack(alignment: .leading, spacing: 1) {
-                                    Text(tr("在另一台主机输入配对码", "Enter the pairing code on another Mac"))
+                                    Text(tr("在另一台主机输入配对码", "Enter the pairing code on another host"))
                                         .font(.system(size: 9, weight: .semibold, design: .rounded))
                                         .foregroundStyle(theme.textPrimary)
                                     Text(tr("两分钟内有效", "Valid for two minutes"))
@@ -518,7 +518,7 @@ struct UsagePanelView: View {
                             }
                             .disabled(cluster.syncing)
                             PillButton(
-                                title: cluster.pairingCode == nil ? tr("添加主机", "Add Mac") : tr("停止配对", "Stop Pairing"),
+                                title: cluster.pairingCode == nil ? tr("添加主机", "Add Host") : tr("停止配对", "Stop Pairing"),
                                 icon: cluster.pairingCode == nil ? "plus" : "xmark",
                                 theme: theme
                             ) {
@@ -539,14 +539,14 @@ struct UsagePanelView: View {
                                         .font(.system(size: 9, weight: .semibold, design: .rounded))
                                         .foregroundStyle(theme.textPrimary)
                                     Text(tr("输入另一台主机显示的地址和配对码",
-                                            "Enter the address and pairing code shown on another Mac"))
+                                            "Enter the address and pairing code shown on another host"))
                                         .font(.system(size: 8, weight: .medium))
                                         .foregroundStyle(theme.textTertiary)
                                 }
                             }
 
                             Text(tr("加入后将替换本机的单节点集群配置，本机历史用量会保留。",
-                                    "Joining replaces this Mac's single-node cluster; its usage history is kept."))
+                                    "Joining replaces this host's single-node cluster; its usage history is kept."))
                                 .font(.system(size: 8, weight: .medium))
                                 .foregroundStyle(theme.statusWarning)
                             clusterJoinFields(theme, buttonTitle: tr("加入已有集群", "Join Existing Cluster"))
@@ -656,7 +656,7 @@ struct UsagePanelView: View {
             Button(tr("离开", "Leave"), role: .destructive) { cluster.leaveCluster() }
         } message: {
             Text(tr("本机将停止同步；本地采集数据不会删除。重新加入需要新的配对码。",
-                    "This Mac will stop syncing; locally collected data isn't deleted. Rejoining needs a new pairing code."))
+                    "This host will stop syncing; locally collected data isn't deleted. Rejoining needs a new pairing code."))
         }
     }
 
@@ -679,7 +679,7 @@ struct UsagePanelView: View {
                         .foregroundStyle(theme.textPrimary)
                         .lineLimit(1)
                     if local {
-                        Text(tr("本机", "This Mac"))
+                        Text(tr("本机", "This Host"))
                             .font(.system(size: 7, weight: .bold, design: .rounded))
                             .foregroundStyle(theme.textSecondary)
                             .padding(.horizontal, 4)
@@ -787,7 +787,7 @@ struct UsagePanelView: View {
                 }
             }
         Text(tr("在集群主机点击“添加主机”生成配对码；验证码有效期为两分钟。",
-                "Click “Add Mac” on the cluster host to generate a pairing code; it's valid for two minutes."))
+                "Click “Add Host” on the cluster host to generate a pairing code; it's valid for two minutes."))
             .font(.system(size: 8, weight: .medium))
             .foregroundStyle(theme.textTertiary)
         if let peer = Self.preferredPairingPeer(in: cluster.discoveredPeers) {
@@ -823,7 +823,7 @@ struct UsagePanelView: View {
                                     "Pairing failed: \(error.localizedDescription)")
             } else {
                 clusterMessage = tr("配对成功，正在同步其他主机的历史用量",
-                                    "Paired · syncing other Macs' usage history")
+                                    "Paired · syncing other hosts' usage history")
                 clusterAddress = ""
                 clusterCode = ""
             }
@@ -1423,7 +1423,7 @@ private struct DestructiveButton: View {
         .animation(.easeOut(duration: 0.15), value: hovering)
         .onHover { hovering = $0 }
         .accessibilityHint(tr("停止与其他主机同步，本机历史数据会保留",
-                              "Stops syncing with other Macs; this Mac's history is kept"))
+                              "Stops syncing with other hosts; this host's history is kept"))
     }
 }
 

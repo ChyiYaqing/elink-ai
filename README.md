@@ -11,7 +11,7 @@ It has two deliberately separate processes:
 - `elink-agent/`: a Raspberry Pi service. It polls the bridge, renders a 1-bit
   dashboard, applies refresh throttling, and drives the panel over SPI/GPIO.
 
-OAuth tokens and raw session logs never leave the Mac.
+OAuth tokens and raw session logs never leave the host.
 
 ## Architecture
 
@@ -44,7 +44,7 @@ The editable source is [docs/architecture.drawio](docs/architecture.drawio)
 
 Each provider card opens stacked bar charts with day/week/month/year ranges.
 The day range shows today's hour-by-hour token distribution (24 bars, local to
-this Mac); hovering a bar reveals the per-model breakdown for that hour, day,
+this host); hovering a bar reveals the per-model breakdown for that hour, day,
 or month. A token-categories section splits the selected range into input,
 output, cache read, cache write, and reasoning tokens with a proportion bar
 and per-category percentages (collected locally from the day the feature is
@@ -64,7 +64,7 @@ enabled).
 - menu-bar device discovery, DHCP/bridge self-healing, and detailed quota/reset status
 - exact last-frame preview with page switching and smart/full refresh controls
 - restart-safe quota caching with per-provider freshness and fallback status
-- encrypted peer-to-peer usage aggregation across paired Macs on the same LAN/VPN
+- encrypted peer-to-peer usage aggregation across paired hosts on the same LAN/VPN
 - manual and periodic GitHub Release checks with direct access to the newest DMG
 - live Claude Code / Codex terminal-session list in the panel with running,
   idle, and finished states plus collapsible subagents
@@ -120,17 +120,17 @@ Verify the bridge with:
 curl -s http://localhost:8765/v1/status | python3 -m json.tool
 ```
 
-### Sync usage across Macs
+### Sync usage across hosts
 
-Open Settings → Multi-Mac Sync on the first Mac and create a sync cluster.
-Choose “Add Mac” to show a six-digit code, then enter that code and the first
-Mac's address on another Mac. Bonjour discovers peers on a normal LAN; a manual
+Open Settings → Multi-Host Sync on the first host and create a sync cluster.
+Choose “Add Host” to show a six-digit code, then enter that code and the first
+host's address on another host. Bonjour discovers peers on a normal LAN; a manual
 `host:8765` address also works when a VPN does not forward multicast discovery.
-If both Macs accidentally created separate one-node clusters, use “Join Another
-Cluster” on either Mac; entering all six digits submits pairing automatically
-and keeps that Mac's local usage history.
+If both hosts accidentally created separate one-node clusters, use “Join Another
+Cluster” on either host; entering all six digits submits pairing automatically
+and keeps that host's local usage history.
 
-Each Mac keeps the latest per-node daily/model snapshots. The dashboard and
+Each host keeps the latest per-node daily/model snapshots. The dashboard and
 `/v1/status` return the cluster-wide sum, while quota windows use the freshest
 observation because quota percentages are account-level values and must not be
 added together. Pairing and sync never transfer OAuth credentials or raw logs.
@@ -187,7 +187,7 @@ in two modes:
 
 - **local** (default): reads `~/.claude` and `~/.codex` on the Linux machine
   and fetches quota directly, with the same statusline-cache and session-log
-  fallbacks as the macOS app. No Mac required.
+  fallbacks as the macOS app. No mac-app bridge required.
 - **remote**: polls an existing mac-app bridge over the LAN.
 
 ```bash
