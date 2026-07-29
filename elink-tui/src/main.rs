@@ -35,6 +35,12 @@ fn main() -> Result<()> {
         println!("{}", cluster.run_command(command)?);
         return Ok(());
     }
+    if cli.headless {
+        let lighthouse = config.lighthouse.clone().ok_or_else(|| {
+            anyhow!("--headless requires a [lighthouse] section with journal_unit or log_file")
+        })?;
+        return elink_tui::lighthouse::run_headless(&config.usage_db, lighthouse);
+    }
     if cli.once || cli.compact {
         return run_once(&config, cli.compact);
     }

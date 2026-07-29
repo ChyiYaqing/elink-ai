@@ -119,8 +119,26 @@ fn create_schema(connection: &Connection) -> rusqlite::Result<()> {
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS link_probe_bucket (
+            node_id TEXT NOT NULL,
+            bucket_at REAL NOT NULL,
+            samples INTEGER NOT NULL,
+            ok_samples INTEGER NOT NULL,
+            rtt_min_ms INTEGER,
+            rtt_max_ms INTEGER,
+            rtt_sum_ms INTEGER,
+            PRIMARY KEY (node_id, bucket_at)
+        );
+        CREATE TABLE IF NOT EXISTS link_event (
+            occurred_at REAL NOT NULL,
+            node_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            detail TEXT,
+            PRIMARY KEY (occurred_at, node_id, kind)
+        );
         CREATE INDEX IF NOT EXISTS idx_cluster_usage_provider_day
-            ON cluster_usage_snapshots(provider, day);",
+            ON cluster_usage_snapshots(provider, day);
+        CREATE INDEX IF NOT EXISTS idx_link_event_time ON link_event(occurred_at);",
     )?;
 
     // Databases created by the first SQLite development build did not carry

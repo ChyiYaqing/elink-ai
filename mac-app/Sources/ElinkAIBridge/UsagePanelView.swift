@@ -14,6 +14,9 @@ final class PanelModel: ObservableObject {
     @Published var refreshingUsage = false
     @Published var showSettings = false
     @Published var statsProvider: String?
+    /// 本机出口的 NAT 观测，由 LinkMonitor 经 PreviewPopoverController 同步过来
+    @Published var natObservation: StunObservation?
+    @Published var natUnavailable = false
     @Published var launchAtLogin = false
     @Published var deviceHost = ""
     @Published var bridgeAddress = ""
@@ -684,7 +687,11 @@ struct UsagePanelView: View {
                 VStack(alignment: .leading, spacing: 3) {
                     ForEach(Self.clusterNodeDetails(node, isLocal: local,
                                                     localEndpoint: cluster.localEndpoint,
-                                                    peers: cluster.discoveredPeers), id: \.label) { row in
+                                                    peers: cluster.discoveredPeers,
+                                                    link: cluster.linkAggregates[node.nodeID],
+                                                    stun: local ? model.natObservation : nil,
+                                                    stunUnavailable: local && model.natUnavailable),
+                            id: \.label) { row in
                         HStack(alignment: .top, spacing: 6) {
                             Text(row.label)
                                 .font(.system(size: 8, weight: .medium))
@@ -764,9 +771,44 @@ struct UsagePanelView: View {
     }
 
     /// 节点详情：连接地址优先用已记录的 endpoint，其次用 Bonjour 发现结果，本机则用局域网地址
+    /// 标签是“同步往返”而不是“延迟”：这个数字含对端处理时间，是上界不是链路指标。
+    static func clusterLinkDetail(_ value: LinkAggregate) -> String {
+        let latency: String
+        if let low = value.rttMinMs, let average = value.rttAvgMs, let high = value.rttMaxMs {
+            latency = "\(low)/\(average)/\(high)ms"
+        } else {
+            // 窗口内每个样本都失败，没有延迟可报，只剩中断本身
+            latency = tr("无响应", "No reply")
+        }
+        guard value.lostSamples > 0 else {
+            return latency + tr(" · \(value.samples) 次采样", " · \(value.samples) samples")
+        }
+        return latency + tr(" · \(value.lostSamples)/\(value.samples) 丢样",
+                            " · \(value.lostSamples)/\(value.samples) lost")
+    }
+
+    /// 陈述事实而非好坏：保端口是端口争抢的前提条件，被改写反而不参与争抢，
+    /// 所以两种结果都不加警示色，只有判据本身失效时才需要提醒。
+    static func clusterNatDetail(_ value: StunObservation?, unavailable: Bool) -> String? {
+        guard let value else {
+            return unavailable
+                ? tr("STUN 不可达，端口判据暂时失效",
+                     "STUN unreachable, port test unavailable")
+                : nil
+        }
+        return value.portPreserved
+            ? tr("\(value.externalEndpoint) · 保端口，在争抢池内",
+                 "\(value.externalEndpoint) · port-preserving, in contention")
+            : tr("\(value.externalEndpoint) · 端口被改写，不参与争抢",
+                 "\(value.externalEndpoint) · port rewritten, not in contention")
+    }
+
     static func clusterNodeDetails(_ node: ClusterNodeRecord, isLocal: Bool,
                                    localEndpoint: String?,
-                                   peers: [DiscoveredClusterPeer]) -> [ClusterNodeDetailRow] {
+                                   peers: [DiscoveredClusterPeer],
+                                   link: LinkAggregate? = nil,
+                                   stun: StunObservation? = nil,
+                                   stunUnavailable: Bool = false) -> [ClusterNodeDetailRow] {
         let address = isLocal
             ? localEndpoint
             : (node.endpoint ?? peers.first { $0.nodeID == node.nodeID }?.endpoint)
@@ -775,6 +817,10 @@ struct UsagePanelView: View {
                                  value: address ?? tr("未知", "Unknown")),
             ClusterNodeDetailRow(label: tr("节点 ID", "Node ID"), value: node.nodeID)
         ]
+        // 出口 NAT 是本机自己的属性，只挂在本机这一行上
+        if isLocal, let nat = Self.clusterNatDetail(stun, unavailable: stunUnavailable) {
+            rows.append(ClusterNodeDetailRow(label: tr("出口 NAT", "Egress NAT"), value: nat))
+        }
         guard !isLocal else { return rows }
         rows.append(ClusterNodeDetailRow(
             label: tr("最后在线", "Last seen"),
@@ -784,6 +830,12 @@ struct UsagePanelView: View {
             label: tr("最后同步", "Last sync"),
             value: node.lastSyncAt.map(Self.clusterTimestamp) ?? tr("尚未同步", "Not synced yet")
         ))
+        if let link, link.samples > 0 {
+            rows.append(ClusterNodeDetailRow(
+                label: tr("同步往返", "Sync RTT"),
+                value: Self.clusterLinkDetail(link)
+            ))
+        }
         return rows
     }
 

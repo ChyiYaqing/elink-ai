@@ -2,9 +2,11 @@ pub mod creds;
 pub mod db;
 pub mod history;
 pub mod hooks;
+pub mod link;
 pub mod quota;
 pub mod sessions;
 pub mod store;
+pub mod stun;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -373,6 +375,7 @@ mod tests {
             cluster_node_name: Some("test-node".to_string()),
             hook_listen: String::new(),
             device_url: None,
+            lighthouse: None,
         }
     }
 

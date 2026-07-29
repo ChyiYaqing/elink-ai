@@ -5,7 +5,10 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use serde::Deserialize;
 
+use std::time::Duration;
+
 use crate::cluster::ClusterCommand;
+use crate::lighthouse::{LighthouseConfig, LogSource};
 use crate::source::SourceKind;
 use crate::util::expand_tilde;
 
@@ -28,6 +31,10 @@ pub struct Cli {
     /// Collect one snapshot, print a one-line summary (for tmux/waybar), exit
     #[arg(long, conflicts_with = "once")]
     pub compact: bool,
+    /// Run as a lighthouse collector: no TUI, no usage, no cluster pairing.
+    /// Reads the local nebula log and serves the source-port aggregate.
+    #[arg(long, conflicts_with_all = ["once", "compact"])]
+    pub headless: bool,
     #[command(subcommand)]
     pub command: Option<AppCommand>,
 }
@@ -51,6 +58,19 @@ struct FileConfig {
     hooks: FileHooks,
     device: FileDevice,
     cluster: FileCluster,
+    lighthouse: FileLighthouse,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct FileLighthouse {
+    /// systemd unit to read with `journalctl -u <unit>`
+    journal_unit: Option<String>,
+    /// Plain log file; takes precedence over `journal_unit` when both are set
+    log_file: Option<String>,
+    default_port: Option<u16>,
+    listen: Option<String>,
+    interval_s: Option<u64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -113,6 +133,8 @@ pub struct Config {
     pub hook_listen: String,
     /// Pi agent base URL such as `http://pi:8766`; enables the device page.
     pub device_url: Option<String>,
+    /// Present only when the config file has a usable `[lighthouse]` section.
+    pub lighthouse: Option<LighthouseConfig>,
 }
 
 impl Config {
@@ -217,6 +239,36 @@ impl Config {
                 .url
                 .map(|value| value.trim_end_matches('/').to_string())
                 .filter(|value| !value.is_empty()),
+            lighthouse: {
+                let lighthouse = file.lighthouse;
+                // A file path wins over a journal unit: it is the more specific
+                // instruction and needs no elevated journal access.
+                let source = lighthouse
+                    .log_file
+                    .as_deref()
+                    .filter(|value| !value.is_empty())
+                    .map(|value| LogSource::File {
+                        path: expand_tilde(value),
+                    })
+                    .or_else(|| {
+                        lighthouse
+                            .journal_unit
+                            .as_deref()
+                            .filter(|value| !value.is_empty())
+                            .map(|unit| LogSource::Journal {
+                                unit: unit.to_string(),
+                            })
+                    });
+                source.map(|source| LighthouseConfig {
+                    source,
+                    default_port: lighthouse.default_port.unwrap_or(4242),
+                    listen: lighthouse
+                        .listen
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or_else(|| "0.0.0.0:8767".to_string()),
+                    interval: Duration::from_secs(lighthouse.interval_s.unwrap_or(60).max(5)),
+                })
+            },
         })
     }
 }
@@ -242,6 +294,7 @@ mod tests {
                 config: Some(path.clone()),
                 once: false,
                 compact: false,
+                headless: false,
                 command: None,
             };
 

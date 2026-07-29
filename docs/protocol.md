@@ -13,7 +13,17 @@ token count, as objects containing `model` and `tokens`. See
 
 When Multi-Host Sync is enabled, token/model fields contain the sum of all known
 node snapshots. The additive `cluster` object reports `enabled`, `node_count`,
-`online_count`, and `last_synced_at`. Existing v1 clients may ignore it.
+`online_count`, `last_synced_at`, and `link`. Existing v1 clients may ignore it.
+
+`link` holds one entry per node observed over the last hour, with `node`,
+`rtt_avg_ms`, `lost_pct`, and `samples`. The round trip is measured on the
+existing 15-second peer synchronization and includes peer processing time, so it
+is an upper bound on link latency and must not be presented as network latency.
+Nodes without samples in the window are omitted rather than reported as zero.
+
+Entries carry the node name only. Overlay addresses and ports stay on the
+observing host, because port 8765 is unauthenticated: exposing them here would
+publish internal network topology to anything that can reach the bridge.
 
 `POST /v1/event` accepts:
 

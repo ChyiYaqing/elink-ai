@@ -22,7 +22,13 @@ use rusqlite::{Connection, OptionalExtension};
 
 use crate::model::{Cluster, ModelUsage, ProviderStatus, Snapshot};
 use crate::source::local::db::open_db;
+
+/// NAT classification beat; independent of the 15-second sync interval.
+const STUN_INTERVAL: Duration = Duration::from_secs(60);
+use crate::source::local::db;
 use crate::source::local::history::{DayTotals, History};
+use crate::source::local::link::{self, LinkEvent, LinkEventKind};
+use crate::source::local::stun;
 use crate::util::epoch_now;
 
 const PROTOCOL_VERSION: u32 = 2;
@@ -272,6 +278,33 @@ struct RuntimeState {
     pending_announcements: Vec<ClusterSnapshotDescriptor>,
     generation: u64,
     last_error: Option<String>,
+    /// Last observed reachability per endpoint; a missing entry means the
+    /// endpoint has not been probed yet, so no transition is recorded.
+    link_reachable: HashMap<String, bool>,
+    nat: link::NatState,
+    nat_observation: Option<stun::StunObservation>,
+}
+
+/// Aggregate of one node's probe buckets over a window. `rtt_*` describe the
+/// synchronization round trip, which includes peer processing time — an upper
+/// bound on link latency, never to be labelled as network latency.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LinkSummary {
+    pub samples: i64,
+    pub ok_samples: i64,
+    pub rtt_min_ms: Option<i64>,
+    pub rtt_max_ms: Option<i64>,
+    pub rtt_sum_ms: i64,
+}
+
+impl LinkSummary {
+    pub fn rtt_avg_ms(&self) -> Option<i64> {
+        (self.ok_samples > 0).then(|| self.rtt_sum_ms / self.ok_samples)
+    }
+
+    pub fn lost_samples(&self) -> i64 {
+        (self.samples - self.ok_samples).max(0)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -398,6 +431,9 @@ impl ClusterService {
                 live_statuses: HashMap::new(),
                 replay_nonces: HashMap::new(),
                 pairing: None,
+                link_reachable: HashMap::new(),
+                nat: link::NatState::default(),
+                nat_observation: None,
                 pending_announcements: Vec::new(),
                 generation: 0,
                 last_error: None,
@@ -1476,6 +1512,9 @@ impl ClusterService {
             let mut last_sync = Instant::now()
                 .checked_sub(interval)
                 .unwrap_or_else(Instant::now);
+            let mut last_stun = Instant::now()
+                .checked_sub(STUN_INTERVAL)
+                .unwrap_or_else(Instant::now);
             loop {
                 thread::sleep(Duration::from_secs(1));
                 let Some(service) = weak.upgrade() else {
@@ -1495,8 +1534,51 @@ impl ClusterService {
                     }
                     last_sync = Instant::now();
                 }
+                // The NAT judgement changes far more slowly than tunnel latency
+                // and costs one UDP packet, so it runs on its own longer beat.
+                if last_stun.elapsed() >= STUN_INTERVAL {
+                    service.probe_nat();
+                    last_stun = Instant::now();
+                }
             }
         });
+    }
+
+    /// Classifies the local egress NAT and records only the transitions.
+    fn probe_nat(&self) {
+        let observation = stun::DEFAULT_SERVERS
+            .iter()
+            .find_map(|server| stun::probe(server, Duration::from_secs(5)));
+        let node_id = self.lock().stored.credentials.node_id.clone();
+        let Ok(connection) = self.conn.lock() else {
+            return;
+        };
+        let previous = db::metadata_get(&connection, link::LAST_ENDPOINT_KEY)
+            .ok()
+            .flatten();
+        if let Some(observation) = observation {
+            let _ = db::metadata_set(
+                &connection,
+                link::LAST_ENDPOINT_KEY,
+                &observation.external_endpoint(),
+            );
+        }
+        let events = {
+            let mut state = self.lock();
+            state.nat_observation = observation;
+            let servers = stun::DEFAULT_SERVERS.join(", ");
+            link::evaluate_nat(
+                observation,
+                previous.as_deref(),
+                &mut state.nat,
+                &node_id,
+                epoch_now() as f64,
+                &servers,
+            )
+        };
+        for event in &events {
+            let _ = link::record_event(&connection, event);
+        }
     }
 
     fn announce(&self, agent: &ureq::Agent, descriptors: Vec<ClusterSnapshotDescriptor>) {
@@ -1534,6 +1616,95 @@ impl ClusterService {
         }
     }
 
+    /// Current egress NAT classification, plus whether every STUN server failed.
+    pub fn nat_observation(&self) -> (Option<stun::StunObservation>, bool) {
+        let state = self.lock();
+        (
+            state.nat_observation,
+            state.nat.last_available == Some(false),
+        )
+    }
+
+    /// Per-node probe aggregate over the last `window_s` seconds, keyed by node ID.
+    pub fn link_summaries(&self, window_s: i64) -> HashMap<String, LinkSummary> {
+        let since = (epoch_now() - window_s) as f64;
+        let Ok(connection) = self.conn.lock() else {
+            return HashMap::new();
+        };
+        let Ok(rows) = link::buckets(&connection, since, None) else {
+            return HashMap::new();
+        };
+        let mut summaries: HashMap<String, LinkSummary> = HashMap::new();
+        for row in rows {
+            let entry = summaries.entry(row.node_id).or_default();
+            entry.samples += row.samples;
+            entry.ok_samples += row.ok_samples;
+            entry.rtt_sum_ms += row.rtt_sum_ms.unwrap_or(0);
+            entry.rtt_min_ms = match (entry.rtt_min_ms, row.rtt_min_ms) {
+                (Some(current), Some(value)) => Some(current.min(value)),
+                (current, value) => current.or(value),
+            };
+            entry.rtt_max_ms = match (entry.rtt_max_ms, row.rtt_max_ms) {
+                (Some(current), Some(value)) => Some(current.max(value)),
+                (current, value) => current.or(value),
+            };
+        }
+        summaries
+    }
+
+    /// Records one synchronization round trip. The test is "did an HTTP response
+    /// arrive", not "did the sync succeed": a 401 from a peer that has not joined,
+    /// a decryption failure and a cluster mismatch all mean the link is up.
+    /// Counting those as lost samples would render a configuration problem as a
+    /// network fault, which is exactly the wrong direction to send a diagnosis in.
+    fn record_probe(&self, endpoint: &str, started: Instant, reachable: bool) {
+        let (node_id, previous) = {
+            let mut state = self.lock();
+            let local = state.stored.credentials.node_id.clone();
+            let node_id = state
+                .stored
+                .nodes
+                .iter()
+                .find(|node| node.endpoint.as_deref() == Some(endpoint))
+                .map(|node| node.node_id.clone())
+                .filter(|node_id| *node_id != local);
+            let previous = match node_id {
+                Some(_) => state.link_reachable.insert(endpoint.to_string(), reachable),
+                None => None,
+            };
+            (node_id, previous)
+        };
+        // An endpoint that has never completed a handshake cannot be attributed to
+        // a node; skip the sample rather than file it under the wrong one.
+        let Some(node_id) = node_id else {
+            return;
+        };
+        let now = epoch_now() as f64;
+        let rtt_ms = reachable.then(|| started.elapsed().as_millis() as i64);
+        let Ok(connection) = self.conn.lock() else {
+            return;
+        };
+        // Losing an observation must never disturb synchronization itself.
+        let _ = link::record_sample(&connection, &node_id, now, rtt_ms);
+        // The first observation is not a transition; without this guard every
+        // restart would write one online event per node.
+        if previous.is_some_and(|value| value != reachable) {
+            let _ = link::record_event(
+                &connection,
+                &LinkEvent {
+                    occurred_at: now,
+                    node_id,
+                    kind: if reachable {
+                        LinkEventKind::Online
+                    } else {
+                        LinkEventKind::Offline
+                    },
+                    detail: Some(endpoint.to_string()),
+                },
+            );
+        }
+    }
+
     fn sync_all(&self, agent: &ureq::Agent) {
         let endpoints = self.all_endpoints();
         let mut first_error = None;
@@ -1567,9 +1738,17 @@ impl ClusterService {
             epoch_now(),
             &random_uuid()?,
         )?;
+        let probe_started = Instant::now();
         let response = with_headers(agent.get(&format!("{endpoint}{path}")), &headers)
             .call()
-            .map_err(|error| network_error(endpoint, error))?;
+            .map_err(|error| {
+                // An HTTP status reply means the link carried the request; only a
+                // transport failure is a lost sample.
+                let reachable = matches!(error, ureq::Error::Status(..));
+                self.record_probe(endpoint, probe_started, reachable);
+                network_error(endpoint, error)
+            })?;
+        self.record_probe(endpoint, probe_started, true);
         let data = read_response(response)?;
         let (_, manifest): (String, ClusterManifest) = open(&data, &key)?;
         if manifest.protocol_version != PROTOCOL_VERSION || manifest.cluster_id != cluster_id {

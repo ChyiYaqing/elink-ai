@@ -8,6 +8,7 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
     private let usage: UsageFetcher
     private let cluster: ClusterManager
     private let updater = UpdateChecker()
+    private let link: LinkMonitor
     private let port: UInt16
     private var pollTimer: Timer?
     private var clickMonitor: Any?
@@ -17,10 +18,12 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
     private let sessionMonitor = AgentSessionMonitor()
     private var loadingSessions = false
 
-    init(status: StatusService, usage: UsageFetcher, cluster: ClusterManager, port: UInt16) {
+    init(status: StatusService, usage: UsageFetcher, cluster: ClusterManager,
+         link: LinkMonitor, port: UInt16) {
         self.status = status
         self.usage = usage
         self.cluster = cluster
+        self.link = link
         self.port = port
         super.init()
         model.deviceConnectionEnabled = DeviceClient.isEnabled
@@ -206,6 +209,8 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
     private func reload() {
         reloadSnapshot()
         reloadAgentSessions()
+        model.natObservation = link.observation
+        model.natUnavailable = link.unavailable
         guard model.deviceConnectionEnabled else { return }
         reloadInfo()
         reloadPreview()

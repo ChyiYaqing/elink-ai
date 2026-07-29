@@ -5,9 +5,11 @@ use ratatui::widgets::{Bar, BarChart, BarGroup, Block, Clear, Paragraph, Sparkli
 use ratatui::Frame;
 
 use crate::app::{App, View};
+use crate::cluster::LinkSummary;
 use crate::device::Preview;
 use crate::model::{ProviderStatus, Snapshot};
 use crate::source::local::history::{range_stats, RangeStats, StatsRange};
+use crate::source::local::stun::StunObservation;
 use crate::util::{epoch_now, format_age, format_minutes, format_tokens};
 
 const STACK_BELOW_WIDTH: u16 = 70;
@@ -442,6 +444,10 @@ fn draw_cluster(frame: &mut Frame, area: Rect, app: &App) {
             " Timezone  {}",
             view.timezone.as_deref().unwrap_or("—")
         )),
+        Line::raw(format!(" Egress    {}", {
+            let (observation, unavailable) = app.cluster.nat_observation();
+            format_nat(observation, unavailable)
+        })),
         Line::raw(""),
     ];
     if let Some(code) = &view.pairing_code {
@@ -474,9 +480,16 @@ fn draw_cluster(frame: &mut Frame, area: Rect, app: &App) {
         lines.push(Line::raw(""));
     }
     lines.push(Line::styled(" Nodes", Style::new().bold()));
+    // Labelled as a sync round trip on purpose: the figure includes peer
+    // processing time and must not be read as link latency.
+    lines.push(Line::styled(
+        "  sync round-trip min/avg/max over the last hour",
+        Style::new().dim(),
+    ));
     if view.nodes.is_empty() {
         lines.push(Line::styled("  no known nodes", Style::new().dim()));
     } else {
+        let summaries = app.cluster.link_summaries(3_600);
         for node in view
             .nodes
             .iter()
@@ -486,9 +499,13 @@ fn draw_cluster(frame: &mut Frame, area: Rect, app: &App) {
                 .last_seen_at
                 .map(|seen| format!("{} ago", format_age(epoch_now() - seen as i64)))
                 .unwrap_or_else(|| "never seen".to_string());
+            let link = summaries
+                .get(&node.node_id)
+                .map(format_link_summary)
+                .unwrap_or_else(|| "—".to_string());
             lines.push(two_column(
                 &format!("  {}", node.name),
-                &seen,
+                &format!("{link}  {seen}"),
                 inner.width as usize,
                 Style::new(),
             ));
@@ -501,6 +518,43 @@ fn draw_cluster(frame: &mut Frame, area: Rect, app: &App) {
         ));
     }
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// States the fact rather than a verdict: port preservation is the precondition
+/// for port contention, while a rewritten port keeps the host out of it. Neither
+/// deserves a warning marker — only losing the test itself does.
+fn format_nat(observation: Option<StunObservation>, unavailable: bool) -> String {
+    match observation {
+        Some(value) if value.port_preserved() => {
+            format!(
+                "{} · port-preserving, in contention",
+                value.external_endpoint()
+            )
+        }
+        Some(value) => format!(
+            "{} · port rewritten, not in contention",
+            value.external_endpoint()
+        ),
+        None if unavailable => "STUN unreachable, port test unavailable".to_string(),
+        None => "—".to_string(),
+    }
+}
+
+/// Renders as `min/avg/max ms`, with a lost-sample count appended only when
+/// samples were actually lost, so a healthy row stays quiet.
+fn format_link_summary(summary: &LinkSummary) -> String {
+    let lost = summary.lost_samples();
+    let latency = match (summary.rtt_min_ms, summary.rtt_avg_ms(), summary.rtt_max_ms) {
+        (Some(min), Some(avg), Some(max)) => format!("{min}/{avg}/{max}ms"),
+        // Every sample in the window failed: no latency exists to report.
+        _ if summary.samples > 0 => "no reply".to_string(),
+        _ => "—".to_string(),
+    };
+    if lost > 0 {
+        format!("{latency} ⚠{lost}/{} lost", summary.samples)
+    } else {
+        latency
+    }
 }
 
 fn draw_stats_card(
@@ -874,6 +928,73 @@ fn draw_help(frame: &mut Frame, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both NAT outcomes are statements of fact; neither may read as "healthy",
+    /// and losing the test itself must be said out loud rather than left blank.
+    #[test]
+    fn nat_line_states_facts_and_announces_its_own_failure() {
+        let preserving = StunObservation {
+            local_port: 58682,
+            external_address: std::net::Ipv4Addr::new(223, 95, 78, 14),
+            external_port: 58682,
+        };
+        assert_eq!(
+            format_nat(Some(preserving), false),
+            "223.95.78.14:58682 · port-preserving, in contention"
+        );
+
+        let rewriting = StunObservation {
+            local_port: 65080,
+            external_address: std::net::Ipv4Addr::new(223, 95, 78, 14),
+            external_port: 65264,
+        };
+        assert_eq!(
+            format_nat(Some(rewriting), false),
+            "223.95.78.14:65264 · port rewritten, not in contention"
+        );
+
+        assert_eq!(
+            format_nat(None, true),
+            "STUN unreachable, port test unavailable"
+        );
+        assert_eq!(format_nat(None, false), "—");
+    }
+
+    #[test]
+    fn link_summary_stays_quiet_when_nothing_was_lost() {
+        let summary = LinkSummary {
+            samples: 240,
+            ok_samples: 240,
+            rtt_min_ms: Some(203),
+            rtt_max_ms: Some(228),
+            rtt_sum_ms: 240 * 215,
+        };
+        assert_eq!(format_link_summary(&summary), "203/215/228ms");
+    }
+
+    #[test]
+    fn link_summary_reports_lost_samples_and_total_outage() {
+        let partial = LinkSummary {
+            samples: 240,
+            ok_samples: 236,
+            rtt_min_ms: Some(203),
+            rtt_max_ms: Some(228),
+            rtt_sum_ms: 236 * 215,
+        };
+        assert_eq!(format_link_summary(&partial), "203/215/228ms ⚠4/240 lost");
+
+        // Every sample failed: there is no latency to report, only the outage.
+        let dead = LinkSummary {
+            samples: 240,
+            ok_samples: 0,
+            rtt_min_ms: None,
+            rtt_max_ms: None,
+            rtt_sum_ms: 0,
+        };
+        assert_eq!(format_link_summary(&dead), "no reply ⚠240/240 lost");
+
+        assert_eq!(format_link_summary(&LinkSummary::default()), "—");
+    }
 
     #[test]
     fn compact_line_formats_states_and_unknowns() {

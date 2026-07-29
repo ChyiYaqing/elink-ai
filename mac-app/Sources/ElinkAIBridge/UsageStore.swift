@@ -24,6 +24,58 @@ struct DailyCategoryUsage: Equatable {
     var tokens: Int
 }
 
+/// 一个 5 分钟窗口内对某节点的同步往返观测。
+/// rtt 含对端处理时间，是同步往返而非链路延迟，UI 不得标注为网络延迟。
+struct LinkProbeBucket: Equatable {
+    var nodeID: String
+    var bucketAt: Date   // 桶起始时间，按 300 秒对齐
+    var samples: Int
+    var okSamples: Int
+    var rttMinMs: Int?   // 本桶全部失败时为 nil
+    var rttMaxMs: Int?
+    var rttSumMs: Int?
+
+    var rttAvgMs: Int? {
+        guard okSamples > 0, let sum = rttSumMs else { return nil }
+        return sum / okSamples
+    }
+}
+
+/// 某节点在一个窗口内所有桶的合并结果。
+struct LinkAggregate: Equatable {
+    var samples = 0
+    var okSamples = 0
+    var rttMinMs: Int?
+    var rttMaxMs: Int?
+    var rttSumMs = 0
+
+    var rttAvgMs: Int? { okSamples > 0 ? rttSumMs / okSamples : nil }
+    var lostSamples: Int { max(0, samples - okSamples) }
+    var lostPercent: Double {
+        samples > 0 ? (Double(lostSamples) / Double(samples) * 1000).rounded() / 10 : 0
+    }
+}
+
+enum LinkEventKind: String {
+    case online
+    case offline
+    /// 外部 IP 变化：NAT 映射已清空，随后通常伴随一轮端口重新抢占
+    case wanRebind = "wan_rebind"
+    /// 出口保留了源端口，本机因此位于端口争抢池里——这不是“正常”，是风险条件
+    case portPreserved = "port_preserved"
+    /// 出口或本机 TUN 代理重写了源端口，本机不参与争抢
+    case portRewritten = "port_rewritten"
+    /// 所有 STUN 服务器都不可达，端口判据暂时失效
+    case stunUnavailable = "stun_unavailable"
+}
+
+struct LinkEvent: Equatable {
+    var occurredAt: Date
+    var nodeID: String
+    var kind: LinkEventKind
+    var detail: String?  // 含内网地址，只在本机 UI 呈现，不进 /v1/status
+}
+
 typealias DailyUsageTotals = [String: [String: Int]]
 
 struct UsageHistoryTotals: Equatable {
@@ -61,6 +113,7 @@ final class UsageStore {
     private static let bucketTimeZoneMetadataKey = "usage_bucket_timezone"
     private static let bucketLegacyUnknownMetadataKey = "usage_bucket_legacy_unknown"
     private static let parserVersionMetadataKey = "usage_parser_version"
+    private static let lastExternalEndpointKey = "link_last_external_endpoint"
     var onClusterUsageChange: (([ClusterSnapshotDescriptor]) -> Void)?
 
     static var defaultPath: String {
@@ -138,6 +191,7 @@ final class UsageStore {
                 Log.error("provider usage cache table create failed", category: "storage")
             }
             Self.createClusterTables(in: db)
+            Self.createLinkTables(in: db)
             Self.protectDatabaseFiles(at: path)
         }
     }
@@ -1450,6 +1504,192 @@ final class UsageStore {
         return sqlite3_step(statement) == SQLITE_DONE
     }
 
+    // MARK: - Link health
+
+    static let linkBucketWidth: TimeInterval = 300
+
+    /// 桶宽与 15 秒探测间隔绑定（每桶约 20 个样本）。放大探测间隔时必须同比放大桶宽，
+    /// 否则每桶样本过少会让 min/max 剧烈跳动，失去判读价值。
+    static func linkBucketStart(_ time: Date) -> Date {
+        Date(timeIntervalSince1970:
+                (time.timeIntervalSince1970 / linkBucketWidth).rounded(.down) * linkBucketWidth)
+    }
+
+    /// 记录一次对某节点的同步往返观测；`rttMs` 为 nil 表示未收到 HTTP 响应。
+    /// 每个样本直接 UPSERT 进所属桶：行数由桶宽而非样本数决定，写入量对 SQLite
+    /// 可忽略，且不需要内存累进，进程崩溃不会丢掉当前窗口。
+    func recordLinkSample(nodeID: String, at time: Date = Date(), rttMs: Int?) {
+        guard !nodeID.isEmpty else { return }
+        let bucketAt = Self.linkBucketStart(time).timeIntervalSince1970
+        queue.sync {
+            guard db != nil else { return }
+            let sql = """
+            INSERT INTO link_probe_bucket
+              (node_id, bucket_at, samples, ok_samples, rtt_min_ms, rtt_max_ms, rtt_sum_ms)
+            VALUES (?, ?, 1, ?, ?, ?, ?)
+            ON CONFLICT(node_id, bucket_at) DO UPDATE SET
+              samples = samples + 1,
+              ok_samples = ok_samples + excluded.ok_samples,
+              rtt_min_ms = MIN(COALESCE(rtt_min_ms, excluded.rtt_min_ms),
+                               COALESCE(excluded.rtt_min_ms, rtt_min_ms)),
+              rtt_max_ms = MAX(COALESCE(rtt_max_ms, excluded.rtt_max_ms),
+                               COALESCE(excluded.rtt_max_ms, rtt_max_ms)),
+              rtt_sum_ms = CASE WHEN excluded.rtt_sum_ms IS NULL THEN rtt_sum_ms
+                                ELSE COALESCE(rtt_sum_ms, 0) + excluded.rtt_sum_ms END
+            """
+            var statement: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+                sqlite3_finalize(statement)
+                Log.error("link sample prepare failed", category: "storage")
+                return
+            }
+            sqlite3_bind_text(statement, 1, nodeID, -1, Self.transient)
+            sqlite3_bind_double(statement, 2, bucketAt)
+            sqlite3_bind_int(statement, 3, rttMs == nil ? 0 : 1)
+            if let rttMs {
+                let value = Int32(clamping: rttMs)
+                sqlite3_bind_int(statement, 4, value)
+                sqlite3_bind_int(statement, 5, value)
+                sqlite3_bind_int(statement, 6, value)
+            } else {
+                sqlite3_bind_null(statement, 4)
+                sqlite3_bind_null(statement, 5)
+                sqlite3_bind_null(statement, 6)
+            }
+            if sqlite3_step(statement) != SQLITE_DONE {
+                Log.error("link sample write failed", category: "storage")
+            }
+            sqlite3_finalize(statement)
+        }
+    }
+
+    func linkBuckets(since: Date, nodeID: String? = nil) -> [LinkProbeBucket] {
+        queue.sync {
+            guard db != nil else { return [] }
+            var sql = """
+            SELECT node_id, bucket_at, samples, ok_samples, rtt_min_ms, rtt_max_ms, rtt_sum_ms
+            FROM link_probe_bucket WHERE bucket_at >= ?
+            """
+            if nodeID != nil { sql += " AND node_id = ?" }
+            sql += " ORDER BY bucket_at"
+            var statement: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+                sqlite3_finalize(statement)
+                return []
+            }
+            defer { sqlite3_finalize(statement) }
+            sqlite3_bind_double(statement, 1, since.timeIntervalSince1970)
+            if let nodeID { sqlite3_bind_text(statement, 2, nodeID, -1, Self.transient) }
+            var rows: [LinkProbeBucket] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                let optional: (Int32) -> Int? = { index in
+                    sqlite3_column_type(statement, index) == SQLITE_NULL
+                        ? nil : Int(sqlite3_column_int(statement, index))
+                }
+                rows.append(LinkProbeBucket(
+                    nodeID: String(cString: sqlite3_column_text(statement, 0)),
+                    bucketAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 1)),
+                    samples: Int(sqlite3_column_int(statement, 2)),
+                    okSamples: Int(sqlite3_column_int(statement, 3)),
+                    rttMinMs: optional(4),
+                    rttMaxMs: optional(5),
+                    rttSumMs: optional(6)
+                ))
+            }
+            return rows
+        }
+    }
+
+    /// 把窗口内的桶按节点合并；没有任何样本的节点不会出现在结果里。
+    func linkAggregates(since: Date) -> [String: LinkAggregate] {
+        var result: [String: LinkAggregate] = [:]
+        for bucket in linkBuckets(since: since) {
+            var value = result[bucket.nodeID] ?? LinkAggregate()
+            value.samples += bucket.samples
+            value.okSamples += bucket.okSamples
+            value.rttSumMs += bucket.rttSumMs ?? 0
+            value.rttMinMs = [value.rttMinMs, bucket.rttMinMs].compactMap { $0 }.min()
+            value.rttMaxMs = [value.rttMaxMs, bucket.rttMaxMs].compactMap { $0 }.max()
+            result[bucket.nodeID] = value
+        }
+        return result
+    }
+
+    /// 上一次 STUN 观测到的外部端点，跨进程保留：家庭出口一天可能重拨数次，
+    /// 只靠内存状态会让重启前后的那次重拨漏记，因果链就断在那里。
+    func lastExternalEndpoint() -> String? {
+        queue.sync {
+            let result = metadataValueLocked(Self.lastExternalEndpointKey)
+            return result.succeeded ? result.value : nil
+        }
+    }
+
+    @discardableResult
+    func setLastExternalEndpoint(_ value: String) -> Bool {
+        queue.sync { setMetadataValueLocked(Self.lastExternalEndpointKey, value: value) }
+    }
+
+    func recordLinkEvent(_ event: LinkEvent) {
+        guard !event.nodeID.isEmpty else { return }
+        queue.sync {
+            guard db != nil else { return }
+            let sql = """
+            INSERT OR REPLACE INTO link_event (occurred_at, node_id, kind, detail)
+            VALUES (?, ?, ?, ?)
+            """
+            var statement: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+                sqlite3_finalize(statement)
+                Log.error("link event prepare failed", category: "storage")
+                return
+            }
+            sqlite3_bind_double(statement, 1, event.occurredAt.timeIntervalSince1970)
+            sqlite3_bind_text(statement, 2, event.nodeID, -1, Self.transient)
+            sqlite3_bind_text(statement, 3, event.kind.rawValue, -1, Self.transient)
+            if let detail = event.detail {
+                sqlite3_bind_text(statement, 4, detail, -1, Self.transient)
+            } else {
+                sqlite3_bind_null(statement, 4)
+            }
+            if sqlite3_step(statement) != SQLITE_DONE {
+                Log.error("link event write failed", category: "storage")
+            }
+            sqlite3_finalize(statement)
+        }
+    }
+
+    func linkEvents(since: Date, limit: Int = 200) -> [LinkEvent] {
+        queue.sync {
+            guard db != nil else { return [] }
+            let sql = """
+            SELECT occurred_at, node_id, kind, detail FROM link_event
+            WHERE occurred_at >= ? ORDER BY occurred_at DESC LIMIT ?
+            """
+            var statement: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+                sqlite3_finalize(statement)
+                return []
+            }
+            defer { sqlite3_finalize(statement) }
+            sqlite3_bind_double(statement, 1, since.timeIntervalSince1970)
+            sqlite3_bind_int(statement, 2, Int32(clamping: limit))
+            var rows: [LinkEvent] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                guard let kind = LinkEventKind(
+                    rawValue: String(cString: sqlite3_column_text(statement, 2))
+                ) else { continue }
+                rows.append(LinkEvent(
+                    occurredAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 0)),
+                    nodeID: String(cString: sqlite3_column_text(statement, 1)),
+                    kind: kind,
+                    detail: sqlite3_column_type(statement, 3) == SQLITE_NULL
+                        ? nil : String(cString: sqlite3_column_text(statement, 3))
+                ))
+            }
+            return rows
+        }
+    }
+
     private static func createClusterTables(in db: OpaquePointer?) {
         let sql = """
         CREATE TABLE IF NOT EXISTS cluster_nodes (
@@ -1490,6 +1730,34 @@ final class UsageStore {
         """
         if sqlite3_exec(db, sql, nil, nil, nil) != SQLITE_OK {
             Log.error("cluster usage tables create failed", category: "storage")
+        }
+    }
+
+    /// 链路观测是本库唯一的无界时序数据，因此只落 5 分钟聚合桶和稀疏事件，
+    /// 两者行数均天然有界，与其余聚合表一样不需要清理逻辑。
+    private static func createLinkTables(in db: OpaquePointer?) {
+        let sql = """
+        CREATE TABLE IF NOT EXISTS link_probe_bucket (
+          node_id TEXT NOT NULL,
+          bucket_at REAL NOT NULL,
+          samples INTEGER NOT NULL,
+          ok_samples INTEGER NOT NULL,
+          rtt_min_ms INTEGER,
+          rtt_max_ms INTEGER,
+          rtt_sum_ms INTEGER,
+          PRIMARY KEY (node_id, bucket_at)
+        );
+        CREATE TABLE IF NOT EXISTS link_event (
+          occurred_at REAL NOT NULL,
+          node_id TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          detail TEXT,
+          PRIMARY KEY (occurred_at, node_id, kind)
+        );
+        CREATE INDEX IF NOT EXISTS idx_link_event_time ON link_event(occurred_at);
+        """
+        if sqlite3_exec(db, sql, nil, nil, nil) != SQLITE_OK {
+            Log.error("link tables create failed", category: "storage")
         }
     }
 

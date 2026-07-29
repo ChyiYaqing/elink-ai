@@ -11,6 +11,8 @@ let usageStore = UsageStore.shared
 let usage = UsageFetcher(cacheStore: usageStore)
 let cluster = ClusterManager(store: usageStore)
 let status = StatusService(usage: usage, store: usageStore, cluster: cluster)
+// 出口 NAT 是本机属性，与集群同步无关，因此独立于 ClusterManager 驱动
+let linkMonitor = LinkMonitor(store: usageStore, nodeID: { cluster.nodeID })
 cluster.localStatusProvider = { status.localSnapshotForSync() }
 // backfill 和时区重分桶共用一条串行队列：并发解析会读到可变的全局时区，产生混合桶。
 // runUsageMaintenance 自查“已应用分桶时区”与当前时区，过期任务自然变成 no-op，
@@ -70,7 +72,9 @@ do {
 
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
-let menu = MenuBarController(usage: usage, status: status, cluster: cluster, port: port)
+let menu = MenuBarController(usage: usage, status: status, cluster: cluster,
+                             link: linkMonitor, port: port)
 _ = menu
+linkMonitor.start()
 usage.start()
 app.run()
