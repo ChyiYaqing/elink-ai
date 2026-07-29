@@ -6,6 +6,18 @@ and `Removed`.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## 0.1.17-rc3
+
+### Added
+
+- Multi-Host Sync nodes in the macOS settings can now be expanded to show
+  their connection address, node ID, and recent connection timestamps
+
+### Changed
+
+- Multi-Host Sync and related documentation now consistently use host
+  terminology for both macOS and Linux machines
+
 ## 0.1.17-rc2
 
 ### Fixed
