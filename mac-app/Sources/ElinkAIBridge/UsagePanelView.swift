@@ -985,13 +985,14 @@ struct UsagePanelView: View {
             let chart = MeshLatencyChart(points: meshHistory, theme: theme) { point in
                 meshHovered = point
             }
-            chart.frame(height: chart.hasPlottableData ? 34 : 8)
-            if chart.hasPlottableData {
-                Text(tr("折线为 5 分钟均值，淡带为同段最低–最高；红点为整段不通。",
-                        "Line: 5-minute average · band: its min–max · red dot: nothing got through."))
-                    .font(.system(size: 7, weight: .medium))
-                    .foregroundStyle(theme.textTertiary)
-            }
+            chart.frame(height: chart.hasPlottableData ? 34 : 6)
+            Text(chart.hasPlottableData
+                 ? tr("折线为 5 分钟均值，淡带为同段最低–最高；红点为整段不通。",
+                      "Line: 5-minute average · band: its min–max · red dot: nothing got through.")
+                 : tr("时间轴上每个红点是一个不通的 5 分钟。",
+                      "Each red dot on the timeline is one 5-minute window with nothing through."))
+                .font(.system(size: 7, weight: .medium))
+                .foregroundStyle(theme.textTertiary)
         }
         .padding(.leading, 13)
         .padding(.trailing, 2)

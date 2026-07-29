@@ -62,6 +62,15 @@ struct MeshLatencyChart: View {
         GeometryReader { geometry in
             let size = geometry.size
             ZStack(alignment: .topLeading) {
+                // 全断时没有线也没有带，红点会悬在空处像是装饰。一条基线把它们
+
+                // 锚成一条时间轴，「什么时候断的、断了多久」才读得出来。
+                if !hasPlottableData {
+                    Rectangle()
+                        .fill(theme.textTertiary.opacity(0.35))
+                        .frame(height: 1)
+                        .position(x: size.width / 2, y: size.height - 1.5)
+                }
                 band(in: size)
                     .fill(seriesColor.opacity(theme.dark ? 0.22 : 0.16))
                 ForEach(Array(segments().enumerated()), id: \.offset) { segment in
