@@ -197,6 +197,8 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
         }
         startPolling()
         reload()
+        // 常规节拍是 30 秒；打开时补一轮，第一眼的数字才不至于旧到一个节拍
+        mesh.refreshIfStale()
     }
 
     func popoverDidClose(_ notification: Notification) {

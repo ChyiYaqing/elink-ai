@@ -376,4 +376,27 @@ final class MeshTests: XCTestCase {
         XCTAssertTrue(MeshLatencyChart(points: alive, theme: PanelTheme(.light)).hasPlottableData)
         XCTAssertFalse(MeshLatencyChart(points: [], theme: PanelTheme(.light)).hasPlottableData)
     }
+
+    // MARK: - 打开面板时的补探
+
+    /// 守卫的意义：反复开关面板不能把 sweep 排成队列。探测队列是串行的，一轮全网
+    /// 约四秒，堆几轮就变成持续发包。
+    func testRefreshSkipsWhenTheDataIsStillFresh() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        XCTAssertFalse(MeshMonitor.isStale(now.addingTimeInterval(-3), maxAge: 10, now: now))
+        XCTAssertFalse(MeshMonitor.isStale(now.addingTimeInterval(-9.9), maxAge: 10, now: now))
+    }
+
+    /// 满了阈值就该补，否则第一眼要等满 30 秒的常规节拍
+    func testRefreshFiresOnceTheDataIsStale() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        XCTAssertTrue(MeshMonitor.isStale(now.addingTimeInterval(-10), maxAge: 10, now: now))
+        XCTAssertTrue(MeshMonitor.isStale(now.addingTimeInterval(-25), maxAge: 10, now: now))
+    }
+
+    /// 从未探测过也算旧——那正是最需要补一轮的时候
+    func testNeverProbedCountsAsStale() {
+        XCTAssertTrue(MeshMonitor.isStale(nil, maxAge: 10))
+        XCTAssertTrue(MeshMonitor.isStale(nil, maxAge: 3600))
+    }
 }

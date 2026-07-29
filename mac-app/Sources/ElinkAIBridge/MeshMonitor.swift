@@ -127,6 +127,24 @@ final class MeshMonitor: ObservableObject {
         timer = nil
     }
 
+    /// 面板打开时补一轮，但只在数据确实旧了才补。
+    ///
+    /// 这张卡是「我怀疑出问题了」才会点开的，等满 30 秒常规节拍才看到答案，等于让它
+    /// 诚实而不可用——年龄那行避免了误导，可要的答案还是得等。
+    ///
+    /// 守卫不能省：探测队列是串行的，一轮全网约四秒（不通的节点各占一次超时），反复
+    /// 开关面板会把 sweep 排成队列，变成持续发包。
+    func refreshIfStale(maxAge: TimeInterval = 10, now: Date = Date()) {
+        guard lighthouseURL != nil, Self.isStale(updatedAt, maxAge: maxAge, now: now) else { return }
+        queue.async { [weak self] in self?.runOnce() }
+    }
+
+    /// 从未探测过也算旧：那正是最需要补一轮的时候。
+    static func isStale(_ updatedAt: Date?, maxAge: TimeInterval, now: Date = Date()) -> Bool {
+        guard let updatedAt else { return true }
+        return now.timeIntervalSince(updatedAt) >= maxAge
+    }
+
     func runOnce(now: Date = Date()) {
         let fetched = fetchRoster()
         if let fetched { roster = fetched }

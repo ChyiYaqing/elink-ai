@@ -53,13 +53,22 @@ pub struct LighthouseRow {
 
 /// Extracts `certName` and the observed source address from one nebula log line.
 ///
-/// Both `from=` and `udpAddr=` are accepted: the field name differs between
-/// nebula's handshake and lighthouse messages, and which one carries the address
-/// has not been confirmed against a live lighthouse yet. Values may or may not be
-/// quoted, so quotes are stripped rather than required.
+/// `from=` only, confirmed against a live lighthouse: over three days it carried
+/// 21825 lines while `udpAddr=` appeared on 29, every one of them a `Host roamed
+/// to new udp ip/port.` line where it holds the address the node just *left* —
+/// `newAddr=` holds the new one. Accepting it recorded each roaming node under
+/// the port it had already given up.
+///
+/// `newAddr=` is not used in its place either. It is nebula's intent, whereas
+/// `from=` is what this lighthouse actually received the packet from, and the
+/// question here is which source port the NAT really handed out. The roamed-to
+/// address shows up in the next `from=` line within seconds anyway, because a
+/// node that just roamed is by definition talking.
+///
+/// Values may or may not be quoted, so quotes are stripped rather than required.
 pub fn parse_line(line: &str) -> Option<LighthouseSample> {
     let cert_name = field(line, "certName=")?;
-    let address = field(line, "from=").or_else(|| field(line, "udpAddr="))?;
+    let address = field(line, "from=")?;
     let (wan_ip, port) = address.rsplit_once(':')?;
     let source_port = port.parse().ok()?;
     if wan_ip.is_empty() || cert_name.is_empty() {
@@ -668,10 +677,27 @@ mod tests {
             Some(sample("DS925", "123.158.49.251", 4242))
         );
 
-        let unquoted = "level=info certName=MBA-M2 udpAddr=223.95.78.14:61571";
+        let unquoted = "level=info certName=MBA-M2 from=223.95.78.14:61571";
         assert_eq!(
             parse_line(unquoted),
             Some(sample("MBA-M2", "223.95.78.14", 61571))
+        );
+    }
+
+    /// Verbatim roam line from the Bandwagon2 lighthouse. `udpAddr` here is the
+    /// address WSL just left and `newAddr` the one it moved to, so reading either
+    /// would file this node under a port it no longer holds — or under one this
+    /// lighthouse has not yet received a packet from. The roamed-to address
+    /// arrives on the next `from=` line regardless.
+    #[test]
+    fn a_roam_line_yields_no_contention_sample() {
+        let roam = r#"time="2026-07-29T10:32:00+08:00" level=info msg="Host roamed to new udp ip/port." certName=WSL localIndex=944200205 newAddr="223.95.78.14:2442" remoteIndex=536779223 udpAddr="223.95.78.14:2019" vpnAddrs="[192.168.100.26]""#;
+        assert_eq!(parse_line(roam), None);
+        // The same line still names the node and its overlay address, so the
+        // roster keeps counting it as seen.
+        assert_eq!(
+            parse_roster_line(roam).map(|entry| entry.overlay),
+            Some("192.168.100.26".to_string())
         );
     }
 
