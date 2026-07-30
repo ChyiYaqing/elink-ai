@@ -569,6 +569,24 @@ final class MeshTests: XCTestCase {
                      "一切正常时不该有横幅")
     }
 
+    /// 页面停在那里不动，图也得跟着走。表头的年龄在动而色带冻住，比整页都不动更误导。
+    @MainActor
+    func testTheOpenPageReloadsHistoryOnItsOwn() {
+        let path = NSTemporaryDirectory() + "elink-mesh-\(UUID().uuidString).db"
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let mesh = MeshMonitor(store: UsageStore(path: path), lighthouseURL: nil)
+        let model = MeshDetailModel()
+        let first = model.anchor
+
+        model.startAutoReload(mesh: mesh, interval: 0.05)
+        defer { model.stopAutoReload() }
+        let deadline = Date().addingTimeInterval(3)
+        while model.anchor == first, Date() < deadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+        }
+        XCTAssertNotEqual(model.anchor, first, "页面开着就该自己重载，不该只等用户点刷新")
+    }
+
     /// 地址存在与否要能被视图观察到，横幅才切得回去。
     @MainActor
     func testConfiguredFlagFollowsTheLighthouseAddress() {

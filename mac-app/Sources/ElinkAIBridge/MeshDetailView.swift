@@ -35,8 +35,28 @@ final class MeshDetailModel: ObservableObject {
     /// 时间轴的右端。取自加载那一刻并固定下来，否则每次重绘轴都在悄悄右移，
     /// 上下两张图对不齐，读出来的时刻是错的。
     @Published var anchor = Date()
+    private var timer: Timer?
 
     var window: ClosedRange<Date> { anchor.addingTimeInterval(-span.seconds)...anchor }
+
+    deinit { timer?.invalidate() }
+
+    /// 页面开着就自己重载。表头的年龄和状态点跟着 MeshMonitor 走，色带和折线却只在
+    /// 打开那一刻取过一次——一张在动的表头配一张冻住的图，比整页都不动更容易看错。
+    ///
+    /// 节拍对齐探测的 30 秒：更密只是把同一份数据再读一遍，而每次重载都要读一遍库
+    /// 并向 lighthouse 要一次历史。
+    func startAutoReload(mesh: MeshMonitor, interval: TimeInterval = 30) {
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+            self?.load(mesh: mesh)
+        }
+    }
+
+    func stopAutoReload() {
+        timer?.invalidate()
+        timer = nil
+    }
 
     func load(mesh: MeshMonitor) {
         guard !loading else { return }
@@ -108,7 +128,9 @@ struct MeshDetailView: View {
             // 名册决定这里有哪几台，先补一轮，否则刚开机点进来是空的
             mesh.refreshIfStale()
             model.load(mesh: mesh)
+            model.startAutoReload(mesh: mesh)
         }
+        .onDisappear { model.stopAutoReload() }
         .onChange(of: model.span) { _ in model.load(mesh: mesh) }
     }
 
