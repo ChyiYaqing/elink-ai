@@ -157,7 +157,7 @@ open .build/elink-ai-v0.1.17-rc5.dmg
 
 Pushing a `v*` tag runs the release workflow, creates the matching GitHub
 Release when needed, and uploads the versioned macOS DMG plus Linux
-`elink-tui` archive for `arm64`.
+`elink-tui` archives for `arm64` and `amd64`.
 
 Before tagging a release, add a matching `## X.Y.Z` section to
 [CHANGELOG.md](CHANGELOG.md). Keep its non-empty subsections in `Packaging`,

@@ -56,6 +56,16 @@ jobs:
       contents: read
     runs-on: [self-hosted, macOS, ARM64, elink-ci]
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            platform: linux/arm64
+            file_pattern: "aarch64|arm64"
+          - arch: amd64
+            platform: linux/amd64
+            file_pattern: "x86-64|x86_64|amd64"
     env:
       RUST_IMAGE: rust:1.97.0-bookworm@sha256:8fa55b2f3ddf97471ab6a767bfa3f37e6bad0986ba823e75fea57e2a2a5c3073
     steps:
@@ -70,12 +80,12 @@ jobs:
             exit 1
           fi
 
-      - name: Build Linux arm64 TUI
+      - name: Build Linux ${{ matrix.arch }} TUI
         run: |
-          OUTPUT="$RUNNER_TEMP/elink-tui-linux-arm64"
+          OUTPUT="$RUNNER_TEMP/elink-tui-linux-${{ matrix.arch }}"
           mkdir -p "$OUTPUT"
           docker run --rm \
-            --platform linux/arm64 \
+            --platform "${{ matrix.platform }}" \
             --user "$(id -u):$(id -g)" \
             --env CARGO_HOME=/tmp/cargo-home \
             --env CARGO_TARGET_DIR=/tmp/target \
@@ -91,15 +101,15 @@ jobs:
           chmod 0755 "$OUTPUT/elink-tui"
           FILE_OUTPUT=$(file "$OUTPUT/elink-tui")
           echo "$FILE_OUTPUT"
-          echo "$FILE_OUTPUT" | grep -Eqi 'aarch64|arm64'
+          echo "$FILE_OUTPUT" | grep -Eqi '${{ matrix.file_pattern }}'
           tar -C "$OUTPUT" -czf \
-            "$RUNNER_TEMP/elink-tui-${GITHUB_REF_NAME}-linux-arm64.tar.gz" \
+            "$RUNNER_TEMP/elink-tui-${GITHUB_REF_NAME}-linux-${{ matrix.arch }}.tar.gz" \
             elink-tui
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: elink-tui-linux-arm64
-          path: ${{ runner.temp }}/elink-tui-${{ github.ref_name }}-linux-arm64.tar.gz
+          name: elink-tui-linux-${{ matrix.arch }}
+          path: ${{ runner.temp }}/elink-tui-${{ github.ref_name }}-linux-${{ matrix.arch }}.tar.gz
           if-no-files-found: error
           retention-days: 1
 
