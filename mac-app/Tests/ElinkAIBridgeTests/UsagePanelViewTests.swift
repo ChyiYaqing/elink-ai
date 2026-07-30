@@ -115,7 +115,7 @@ final class UsagePanelViewTests: XCTestCase {
         model.panelMaxHeight = 320
         let view = UsagePanelView(
             model: model,
-            updater: UpdateChecker(currentVersion: "0.1.17-rc4"),
+            updater: UpdateChecker(currentVersion: "0.1.17-rc5"),
             cluster: cluster,
             mesh: MeshMonitor(store: UsageStore.shared, lighthouseURL: nil)
         )
@@ -189,7 +189,7 @@ final class UsagePanelViewTests: XCTestCase {
         model.deviceConnectionEnabled = enabled
         let view = UsagePanelView(
             model: model,
-            updater: UpdateChecker(currentVersion: "0.1.17-rc4"),
+            updater: UpdateChecker(currentVersion: "0.1.17-rc5"),
             cluster: cluster,
             mesh: MeshMonitor(store: UsageStore.shared, lighthouseURL: nil),
             initialDeviceSettingsExpanded: expanded
@@ -218,7 +218,7 @@ final class UsagePanelViewTests: XCTestCase {
         model.showSettings = true
         let view = UsagePanelView(
             model: model,
-            updater: UpdateChecker(currentVersion: "0.1.17-rc4"),
+            updater: UpdateChecker(currentVersion: "0.1.17-rc5"),
             cluster: cluster,
             mesh: MeshMonitor(store: UsageStore.shared, lighthouseURL: nil),
             initialClusterExpanded: true
@@ -297,7 +297,7 @@ final class UsagePanelViewTests: XCTestCase {
             model.panelMaxHeight = 3000
             let view = UsagePanelView(
                 model: model,
-                updater: UpdateChecker(currentVersion: "0.1.17-rc4"),
+                updater: UpdateChecker(currentVersion: "0.1.17-rc5"),
                 cluster: cluster,
                 mesh: MeshMonitor(store: UsageStore.shared, lighthouseURL: nil),
                 initialClusterExpanded: true,

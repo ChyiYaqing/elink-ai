@@ -6,6 +6,15 @@ and `Removed`.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## 0.1.17-rc5
+
+### Added
+
+- macOS now opens a dedicated Nebula history window with 6-hour, 24-hour, and
+  7-day views of latency, packet loss, and missing probe intervals
+- `elink-tui --headless` now retains five-minute lighthouse probe history so
+  macOS can compare local and lighthouse views of past tunnel outages
+
 ## 0.1.17-rc4
 
 ### Added
