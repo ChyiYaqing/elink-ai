@@ -19,6 +19,7 @@ final class PanelModel: ObservableObject {
     @Published var natUnavailable = false
     @Published var lighthouseURL = ""
     var onSaveLighthouse: ((String) -> Void)?
+    var onOpenMeshWindow: (() -> Void)?
     @Published var launchAtLogin = false
     @Published var deviceHost = ""
     @Published var bridgeAddress = ""
@@ -56,10 +57,6 @@ struct UsagePanelView: View {
     @State private var showClusterAdvanced = false
     @State private var showLeaveClusterConfirmation = false
     @State private var expandedNodeID: String?
-    @State private var meshExpanded = false
-    @State private var meshSelected: String?
-    @State private var meshHovered: MeshBucketPoint?
-    @State private var meshHistory: [MeshBucketPoint] = []
 
     init(model: PanelModel, updater: UpdateChecker, cluster: ClusterManager,
          mesh: MeshMonitor,
@@ -808,11 +805,14 @@ struct UsagePanelView: View {
 
     /// nebula overlay：每一台有证书的设备，以及本机能到达哪些。
     /// 与多机同步刻意分开——那是另一批机器，回答的是另一个问题。
+    ///
+    /// 卡片只回答「现在几台通」，点开进独立窗口看历史。弹窗宽 440pt，减掉边距后一天的
+    /// 时间轴上一个五分钟桶不到半个像素——在这里画历史，等于把它藏起来。
     private func meshCard(_ theme: PanelTheme) -> some View {
         VStack(alignment: .leading, spacing: 0) {
             Button {
-                Log.user(meshExpanded ? "collapse nebula overlay" : "expand nebula overlay")
-                withAnimation(.easeOut(duration: 0.2)) { meshExpanded.toggle() }
+                Log.user("open nebula overlay window")
+                model.onOpenMeshWindow?()
             } label: {
                 // 紧凑头部：与主列表里的 Agent 会话、电子纸屏幕保持同一套样式。
                 // settingsHeader 那种 26pt 彩色圆加副标题是设置页的样式，混进来会让
@@ -830,97 +830,41 @@ struct UsagePanelView: View {
                         color: mesh.hosts.isEmpty || mesh.hosts.contains { $0.state != .online }
                             ? theme.statusWarning : theme.statusHealthy
                     )
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: 9, weight: .semibold))
+                    Image(systemName: "arrow.up.forward.app")
+                        .font(.system(size: 10, weight: .semibold))
                         .foregroundStyle(theme.textTertiary)
-                        .rotationEffect(.degrees(meshExpanded ? 90 : 0))
                 }
-                .padding(12)
+                .padding(.horizontal, 12)
+                .padding(.top, 12)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .accessibilityLabel(tr("Nebula 网络", "Nebula Overlay"))
-            .accessibilityValue(meshExpanded ? tr("已展开", "Expanded") : tr("已折叠", "Collapsed"))
+            .accessibilityHint(tr("打开完整的网格窗口", "Opens the full overlay window"))
 
-            if meshExpanded {
-                VStack(alignment: .leading, spacing: 7) {
-                    Text(Self.meshSubtitle(
-                        total: mesh.hosts.count,
-                        reachable: mesh.hosts.filter { $0.state == .online }.count,
-                        updatedAt: mesh.updatedAt
-                    ))
-                    .font(.system(size: 9, weight: .medium))
-                    .foregroundStyle(theme.textTertiary)
-                    if !mesh.icmpAvailable {
-                        meshNotice(tr("无法打开 ICMP socket，本机可达性暂时测不了",
-                                      "No ICMP socket: reachability unavailable on this host"),
-                                   theme: theme)
-                    }
-                    if !mesh.lighthouseReachable {
-                        meshNotice(tr("lighthouse 不可达，显示的是上一次的名册",
-                                      "Lighthouse unreachable: showing the last known roster"),
-                                   theme: theme)
-                    }
-                    if let nat = Self.clusterNatDetail(model.natObservation,
-                                                       unavailable: model.natUnavailable) {
-                        HStack(alignment: .top, spacing: 6) {
-                            Text(tr("出口 NAT", "Egress NAT"))
-                                .font(.system(size: 8, weight: .medium))
-                                .foregroundStyle(theme.textTertiary)
-                                .frame(width: 54, alignment: .leading)
-                            Text(nat)
-                                .font(.system(size: 8, design: .monospaced))
-                                .foregroundStyle(theme.textSecondary)
-                        }
-                    }
-                    if mesh.hosts.isEmpty {
-                        Text(tr("等待第一份名册…", "Waiting for the first roster…"))
-                            .font(.system(size: 9))
-                            .foregroundStyle(theme.textTertiary)
-                    }
-                    HStack(spacing: 6) {
-                        TextField(tr("lighthouse 地址，例如 192.168.100.200:8767",
-                                     "Lighthouse address, e.g. 192.168.100.200:8767"),
-                                  text: $model.lighthouseURL)
-                            .textFieldStyle(.roundedBorder)
-                            .font(.system(size: 9, design: .monospaced))
-                        PillButton(title: tr("保存", "Save"), icon: "checkmark", theme: theme) {
-                            model.onSaveLighthouse?(model.lighthouseURL)
-                        }
-                    }
-                    Text(tr("设备清单由跑着 elink-tui --headless 的 lighthouse 提供；留空则关闭本视图。",
-                            "The roster comes from a lighthouse running elink-tui --headless; empty disables this view."))
-                        .font(.system(size: 8, weight: .medium))
-                        .foregroundStyle(theme.textTertiary)
-                    ForEach(mesh.hosts, id: \.name) { host in
-                        VStack(alignment: .leading, spacing: 6) {
-                            Button {
-                                let opening = meshSelected != host.name
-                                Log.user(opening ? "open nebula host history" : "close nebula host history")
-                                withAnimation(.easeOut(duration: 0.16)) {
-                                    meshSelected = opening ? host.name : nil
-                                }
-                                meshHovered = nil
-                                meshHistory = opening ? mesh.history(for: host.name) : []
-                            } label: {
-                                meshHostRow(host, theme: theme)
-                                    .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-                            .accessibilityValue(meshSelected == host.name
-                                ? tr("已展开", "Expanded") : tr("已折叠", "Collapsed"))
-
-                            if meshSelected == host.name {
-                                meshHistoryDetail(host, theme: theme)
-                            }
-                        }
-                    }
+            VStack(alignment: .leading, spacing: 5) {
+                Text(Self.meshSubtitle(
+                    total: mesh.hosts.count,
+                    reachable: mesh.hosts.filter { $0.state == .online }.count,
+                    updatedAt: mesh.updatedAt
+                ))
+                .font(.system(size: 9, weight: .medium))
+                .foregroundStyle(theme.textTertiary)
+                if !mesh.icmpAvailable {
+                    meshNotice(tr("无法打开 ICMP socket，本机可达性暂时测不了",
+                                  "No ICMP socket: reachability unavailable on this host"),
+                               theme: theme)
                 }
-                .padding(.horizontal, 12)
-                .padding(.bottom, 12)
-                .transition(.opacity)
+                if !mesh.lighthouseReachable {
+                    meshNotice(tr("lighthouse 不可达，显示的是上一次的名册",
+                                  "Lighthouse unreachable: showing the last known roster"),
+                               theme: theme)
+                }
             }
+            .padding(.horizontal, 12)
+            .padding(.top, 5)
+            .padding(.bottom, 12)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .glassCard(theme)
@@ -977,57 +921,10 @@ struct UsagePanelView: View {
         return head + tr(" · 丢 \(lost)", " · \(lost) lost")
     }
 
-    private func meshHistoryDetail(_ host: MeshHostView, theme: PanelTheme) -> some View {
-        VStack(alignment: .leading, spacing: 5) {
-            Text(Self.meshHistorySummary(points: meshHistory, hovered: meshHovered))
-                .font(.system(size: 8, design: .monospaced))
-                .foregroundStyle(theme.textSecondary)
-            let chart = MeshLatencyChart(points: meshHistory, theme: theme) { point in
-                meshHovered = point
-            }
-            chart.frame(height: chart.hasPlottableData ? 34 : 6)
-            Text(chart.hasPlottableData
-                 ? tr("折线为 5 分钟均值，淡带为同段最低–最高；红点为整段不通。",
-                      "Line: 5-minute average · band: its min–max · red dot: nothing got through.")
-                 : tr("时间轴上每个红点是一个不通的 5 分钟。",
-                      "Each red dot on the timeline is one 5-minute window with nothing through."))
-                .font(.system(size: 7, weight: .medium))
-                .foregroundStyle(theme.textTertiary)
-        }
-        .padding(.leading, 13)
-        .padding(.trailing, 2)
-        .transition(.opacity)
-    }
-
     private func meshNotice(_ text: String, theme: PanelTheme) -> some View {
         Text(text)
             .font(.system(size: 8, weight: .medium))
             .foregroundStyle(theme.statusWarning)
-    }
-
-    private func meshHostRow(_ host: MeshHostView, theme: PanelTheme) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Circle()
-                .fill(Self.meshStateColor(host.state, theme: theme))
-                .frame(width: 5, height: 5)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(host.name)
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(theme.textPrimary)
-                Text(host.overlay)
-                    .font(.system(size: 8, design: .monospaced))
-                    .foregroundStyle(theme.textTertiary)
-            }
-            Spacer(minLength: 6)
-            VStack(alignment: .trailing, spacing: 1) {
-                Text(host.latestRttUs.map { Self.meshLatency(Int($0)) } ?? "—")
-                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                    .foregroundStyle(theme.textPrimary)
-                Text(Self.meshStateText(host))
-                    .font(.system(size: 8, weight: .medium))
-                    .foregroundStyle(Self.meshStateColor(host.state, theme: theme))
-            }
-        }
     }
 
     struct ClusterNodeDetailRow: Equatable {

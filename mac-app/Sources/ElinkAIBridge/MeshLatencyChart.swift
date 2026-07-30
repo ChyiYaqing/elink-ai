@@ -6,13 +6,24 @@ import SwiftUI
 /// 尖峰抹平——探测 30 秒一次，一个桶里有十个样本，实测见过 763µs–5339µs 的桶，七倍
 /// 抖动在平均值上完全看不出来，而抖动正是「波动情况」本身。
 ///
+/// 横轴是时间，不是样本下标。这一条是被一次真实事故换来的：早期版本按 `index /
+/// (count - 1)` 定位，而查询只返回**库里存在**的桶，于是本机休眠的那几个小时直接从
+/// 轴上消失，凌晨两点和早上八点被画成相邻两点、连成一条连续的线。夜里断没断，在那种
+/// 轴上永远看不出来。按时间定位后，没有数据的时段就是横轴上一段空白。
+///
 /// 一次都没通的桶**断线**，不连过去。跨着一段断网把两端连起来，等于画出一条那段时间
 /// 根本不存在的延迟曲线——这是这类图最有害的错误，比画成 0ms 更隐蔽。断口另用警示色
 /// 在基线上标点，让「没有数据」和「数据很好」在视觉上无法混淆。
+///
+/// 「探了但全丢」和「根本没探」是两件不同的事，前者是故障、后者只是没在看，因此前者
+/// 有红点、后者只有空白。两者的区分交给下方同轴的 `MeshAvailabilityStrip` 明说。
 struct MeshLatencyChart: View {
     let points: [MeshBucketPoint]
+    /// 横轴的时间范围。由调用方给定而不是从数据推导：两张图（本机视角与 lighthouse
+    /// 视角）必须共用同一根时间轴，否则上下对照读出来的是错的。
+    let window: ClosedRange<Date>
     let theme: PanelTheme
-    /// 悬停到某个桶时回调，交给外层把数字显示在标题栏——比在 34pt 高的图里挤 tooltip 可读。
+    /// 悬停到某个桶时回调，交给外层把数字显示在标题栏——比在图里挤 tooltip 可读。
     var onHover: ((MeshBucketPoint?) -> Void)?
 
     @State private var hoveredIndex: Int?
@@ -63,7 +74,6 @@ struct MeshLatencyChart: View {
             let size = geometry.size
             ZStack(alignment: .topLeading) {
                 // 全断时没有线也没有带，红点会悬在空处像是装饰。一条基线把它们
-
                 // 锚成一条时间轴，「什么时候断的、断了多久」才读得出来。
                 if !hasPlottableData {
                     Rectangle()
@@ -100,9 +110,16 @@ struct MeshLatencyChart: View {
 
     // MARK: - 几何
 
+    /// 时间 → 横坐标。窗口零宽时退化到中点，避免除零。
+    static func position(_ time: Date, in window: ClosedRange<Date>, width: CGFloat) -> CGFloat {
+        let span = window.upperBound.timeIntervalSince(window.lowerBound)
+        guard span > 0 else { return width / 2 }
+        let ratio = time.timeIntervalSince(window.lowerBound) / span
+        return width * CGFloat(max(0, min(1, ratio)))
+    }
+
     private func x(_ index: Int, width: CGFloat) -> CGFloat {
-        guard points.count > 1 else { return width / 2 }
-        return width * CGFloat(index) / CGFloat(points.count - 1)
+        Self.position(points[index].bucketAt, in: window, width: width)
     }
 
     private func y(_ micros: Int, height: CGFloat) -> CGFloat {
@@ -111,24 +128,44 @@ struct MeshLatencyChart: View {
         return height - CGFloat((Double(micros) - lower) / span) * height
     }
 
+    /// 悬停取横轴上最近的桶，但不跨过空白时段：鼠标停在一段没有数据的区间里时，把
+    /// 几小时外的某个桶报成「当前」，读出来的就是一个假的时间点。
     private func nearestIndex(to positionX: CGFloat, width: CGFloat) -> Int? {
         guard !points.isEmpty else { return nil }
-        guard points.count > 1 else { return 0 }
-        let ratio = max(0, min(1, positionX / width))
-        return Int((ratio * CGFloat(points.count - 1)).rounded())
+        var best: (index: Int, distance: CGFloat)?
+        for index in points.indices {
+            let distance = abs(x(index, width: width) - positionX)
+            if best == nil || distance < best!.distance { best = (index, distance) }
+        }
+        guard let best else { return nil }
+        let span = window.upperBound.timeIntervalSince(window.lowerBound)
+        guard span > 0 else { return best.index }
+        // 一个桶宽的容差：够宽到相邻桶密集时不出现死区，也够窄到不跨越空白。
+        let tolerance = width * CGFloat(UsageStore.meshBucketWidth / span)
+        return best.distance <= max(tolerance, 3) ? best.index : nil
     }
 
     /// 连续可用桶的下标分段。断口把折线切开，而不是让它跨过去。
+    ///
+    /// 两种断口都要切：桶存在但一次没通（`rttAvgUs == nil`），以及桶根本不存在——后者
+    /// 表现为相邻两点的时间差超过一个桶宽。只切前者会让休眠时段被一条直线连过去。
     static func segments(_ points: [MeshBucketPoint]) -> [[Int]] {
         var result: [[Int]] = []
         var current: [Int] = []
         for (index, point) in points.enumerated() {
-            if point.rttAvgUs != nil {
+            let contiguous = current.last.map { previous in
+                point.bucketAt.timeIntervalSince(points[previous].bucketAt)
+                    <= UsageStore.meshBucketWidth * 1.5
+            } ?? true
+            if point.rttAvgUs != nil, contiguous {
                 current.append(index)
-            } else if !current.isEmpty {
+                continue
+            }
+            if !current.isEmpty {
                 result.append(current)
                 current = []
             }
+            if point.rttAvgUs != nil { current.append(index) }
         }
         if !current.isEmpty { result.append(current) }
         return result

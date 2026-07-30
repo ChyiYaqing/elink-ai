@@ -314,6 +314,11 @@ final class MeshTests: XCTestCase {
 
     // MARK: - 折线的断口
 
+    /// 覆盖住测试数据的横轴范围。
+    private func axis(_ seconds: TimeInterval = 3_600) -> ClosedRange<Date> {
+        base.addingTimeInterval(-300)...base.addingTimeInterval(seconds)
+    }
+
     /// 跨着一段断网把两端连起来，会画出一条那段时间根本不存在的延迟曲线。
     /// 这比画成 0ms 更隐蔽，所以断口必须把折线切开。
     func testLineBreaksAcrossADeadWindow() {
@@ -351,7 +356,7 @@ final class MeshTests: XCTestCase {
     func testAxisTracksTheDataRangeNotZero() {
         let series = [point(0, min: 199_000, max: 210_000),
                       point(300, min: 205_000, max: 221_000)]
-        let chart = MeshLatencyChart(points: series, theme: PanelTheme(.light))
+        let chart = MeshLatencyChart(points: series, window: axis(), theme: PanelTheme(.light))
         let (lower, upper) = chart.axisBounds
         XCTAssertGreaterThan(lower, 150_000, "下界不能退到零")
         XCTAssertLessThan(lower, 199_000, "下界要留出余量")
@@ -361,7 +366,8 @@ final class MeshTests: XCTestCase {
     /// 一条水平线也要能画出来，不能因为 span 为零而除零或贴边
     func testAFlatSeriesStillGetsHeadroom() {
         let series = [point(0, min: 1_000, max: 1_000), point(300, min: 1_000, max: 1_000)]
-        let (lower, upper) = MeshLatencyChart(points: series, theme: PanelTheme(.light)).axisBounds
+        let (lower, upper) = MeshLatencyChart(points: series, window: axis(),
+                                              theme: PanelTheme(.light)).axisBounds
         XCTAssertLessThan(lower, 1_000)
         XCTAssertGreaterThan(upper, 1_000)
     }
@@ -370,11 +376,156 @@ final class MeshTests: XCTestCase {
     func testAnAllLostWindowHasNothingToPlot() {
         let dead = [point(0, min: nil, max: nil, samples: 10, ok: 0),
                     point(300, min: nil, max: nil, samples: 10, ok: 0)]
-        XCTAssertFalse(MeshLatencyChart(points: dead, theme: PanelTheme(.light)).hasPlottableData)
+        XCTAssertFalse(MeshLatencyChart(points: dead, window: axis(),
+                                       theme: PanelTheme(.light)).hasPlottableData)
 
         let alive = [point(0, min: 1_000, max: 1_200)]
-        XCTAssertTrue(MeshLatencyChart(points: alive, theme: PanelTheme(.light)).hasPlottableData)
-        XCTAssertFalse(MeshLatencyChart(points: [], theme: PanelTheme(.light)).hasPlottableData)
+        XCTAssertTrue(MeshLatencyChart(points: alive, window: axis(),
+                                      theme: PanelTheme(.light)).hasPlottableData)
+        XCTAssertFalse(MeshLatencyChart(points: [], window: axis(),
+                                       theme: PanelTheme(.light)).hasPlottableData)
+    }
+
+    // MARK: - 时间轴
+
+    /// 本机休眠时一个桶都不会写，那几个小时在库里是**不存在**而不是「全丢」。
+    /// 早期版本按下标定位，于是缺口被整个挤掉，凌晨两点和早上八点被画成相邻两点
+    /// 连成一条连续的线——夜里断没断，在那种轴上永远看不出来。
+    func testAbsentBucketsBreakTheLineInsteadOfCollapsing() {
+        let series = [point(0, min: 1_100, max: 1_700),
+                      point(300, min: 1_200, max: 1_900),
+                      // 中间六小时没有任何桶：本机睡着了
+                      point(21_600, min: 900, max: 1_400),
+                      point(21_900, min: 950, max: 1_500)]
+        XCTAssertEqual(MeshLatencyChart.segments(series), [[0, 1], [2, 3]],
+                       "隔着六小时空白的两段不能连成一条线")
+    }
+
+    /// 横坐标必须按时间取，否则空白时段在轴上不占宽度
+    func testPositionsFollowTimeNotOrder() {
+        let window = base...base.addingTimeInterval(3_600)
+        XCTAssertEqual(MeshLatencyChart.position(base, in: window, width: 100), 0)
+        XCTAssertEqual(MeshLatencyChart.position(base.addingTimeInterval(1_800),
+                                                 in: window, width: 100), 50)
+        XCTAssertEqual(MeshLatencyChart.position(base.addingTimeInterval(3_600),
+                                                 in: window, width: 100), 100)
+        // 窗口外的点被夹住而不是画到框外
+        XCTAssertEqual(MeshLatencyChart.position(base.addingTimeInterval(-9_999),
+                                                 in: window, width: 100), 0)
+    }
+
+    // MARK: - 可达性色带
+
+    /// 「探了但全丢」是故障，「根本没探」只是没在看。两者同色，就等于把本机休眠
+    /// 报成一次中断，或者把一次中断报成休眠。
+    func testStatusSeparatesAnOutageFromNotWatching() {
+        XCTAssertEqual(MeshBucketStatus.of(point(0, min: 1_000, max: 1_200)), .ok)
+        XCTAssertEqual(
+            MeshBucketStatus.of(point(0, min: 1_000, max: 1_200, samples: 10, ok: 7)), .partial)
+        XCTAssertEqual(
+            MeshBucketStatus.of(point(0, min: nil, max: nil, samples: 10, ok: 0)), .lost)
+        XCTAssertEqual(
+            MeshBucketStatus.of(point(0, min: nil, max: nil, samples: 0, ok: 0)), .noData)
+    }
+
+    /// 七天窗口下一个桶不到一个像素。若按数据顺序绘制，后面的正常桶会把前面那次
+    /// 中断整个覆盖掉——一张在最需要它说实话时说「一切正常」的图。
+    func testWorseStatusIsDrawnLast() {
+        let series = [point(0, min: nil, max: nil, samples: 10, ok: 0),
+                      point(300, min: 1_000, max: 1_200),
+                      point(600, min: 1_000, max: 1_200, samples: 10, ok: 4)]
+        let marks = MeshAvailabilityStrip.marks(points: series, window: axis(), width: 600)
+        XCTAssertEqual(marks.map(\.status), [.ok, .partial, .lost],
+                       "越坏越后画，才不会被好桶盖住")
+    }
+
+    /// 5 分钟占七天的 0.05%，不设下限就是 0.4pt——等于没画
+    func testAShortOutageStaysVisibleInAWideWindow() {
+        let week = base...base.addingTimeInterval(7 * 24 * 3_600)
+        let marks = MeshAvailabilityStrip.marks(
+            points: [point(0, min: nil, max: nil, samples: 10, ok: 0)],
+            window: week, width: 800)
+        XCTAssertEqual(marks.count, 1)
+        XCTAssertGreaterThanOrEqual(marks[0].width, MeshAvailabilityStrip.minimumMarkWidth)
+    }
+
+    /// 撑宽后不能越出右边缘，否则窗口末尾那格会被裁掉一半
+    func testTheLastMarkStaysInsideTheStrip() {
+        let window = base...base.addingTimeInterval(7 * 24 * 3_600)
+        let marks = MeshAvailabilityStrip.marks(
+            points: [point(7 * 24 * 3_600 - 300, min: nil, max: nil, samples: 10, ok: 0)],
+            window: window, width: 800)
+        XCTAssertLessThanOrEqual(marks[0].x + marks[0].width, 800)
+    }
+
+    // MARK: - lighthouse 历史
+
+    /// 本机视角测不到 lighthouse 到 DS925 那条隧道，昨晚断的恰恰是它。
+    /// 这份文档是唯一的证据来源，解析必须完整保留丢失桶的「没有延迟值」。
+    func testLighthouseHistoryKeepsTheOutageBucket() throws {
+        let json = """
+        {"schema_version":1,"generated_at":1700003600,"since":1700000000,
+         "bucket_width_s":300,
+         "fields":["bucket_at","samples","ok_samples","rtt_min_us","rtt_max_us","rtt_sum_us"],
+         "hosts":[{"name":"DS925","buckets":[
+           [1700000000,10,10,199000,221000,2100000],
+           [1700000300,10,0,null,null,null],
+           [1700000600,10,6,205000,240000,1300000]]}]}
+        """
+        let history = try XCTUnwrap(MeshMonitor.parseHistory(Data(json.utf8)))
+        let points = try XCTUnwrap(history["DS925"])
+        XCTAssertEqual(points.count, 3)
+        XCTAssertEqual(points[0].rttAvgUs, 210_000)
+        XCTAssertTrue(points[1].fullyLost)
+        XCTAssertNil(points[1].rttAvgUs, "全丢的桶不能有延迟值，否则画成 0ms")
+        XCTAssertEqual(points[2].lostSamples, 4)
+        XCTAssertEqual(MeshBucketStatus.of(points[1]), .lost)
+        XCTAssertEqual(MeshBucketStatus.of(points[2]), .partial)
+    }
+
+    /// 老版本 lighthouse 对任何路径都回名册，两份文档都有 hosts 键。当成空历史会把
+    /// 「lighthouse 太旧」显示成「这段时间一切正常」。
+    func testARosterDocumentIsNotMistakenForHistory() {
+        let roster = """
+        {"schema_version":2,"generated_at":1700000000,"default_port":4242,
+         "hosts":[{"name":"DS925","overlay":"192.168.100.125","last_activity_at":1,
+                   "probed_at":1,"rtt_us":211000}],"wan":[]}
+        """
+        XCTAssertNil(MeshMonitor.parseHistory(Data(roster.utf8)),
+                     "名册不是历史文档")
+        XCTAssertNil(MeshMonitor.parseHistory(Data("not json".utf8)))
+    }
+
+    func testHistoryURLKeepsTheHostAndAsksForTheWindow() throws {
+        let base = try XCTUnwrap(MeshMonitor.lighthouseURL(from: "192.168.100.200:8767"))
+        let url = try XCTUnwrap(MeshMonitor.historyURL(base: base, window: 24 * 3_600))
+        XCTAssertEqual(url.absoluteString, "http://192.168.100.200:8767/history?window=86400")
+    }
+
+    /// 三种缺席要分开说：没配地址、连不上、版本太旧。空图配一句「暂无数据」
+    /// 会把它们说成同一件事，而处置方式完全不同。
+    func testEachKindOfMissingHistorySaysWhich() {
+        let notice = { MeshWindowView.lighthouseNotice($0, hasSeries: false) }
+        XCTAssertNotEqual(notice(.notConfigured), notice(.unreachable))
+        XCTAssertNotEqual(notice(.unreachable), notice(.unsupported))
+        XCTAssertNotNil(notice(nil), "没有报错但也没有序列，仍要说明")
+        XCTAssertNil(MeshWindowView.lighthouseNotice(nil, hasSeries: true))
+    }
+
+    /// 一天的窗口分五段，首尾刻度的时刻必然相同；七天更是五个都可能撞上。
+    /// 只写时刻会在轴的两端印出同一个标签，所以满一天就要带日期。
+    func testWideWindowsGetDatedAxisLabels() {
+        let english = Locale(identifier: "en_US")
+        let hours = MeshWindowView.axisLabels(
+            window: base...base.addingTimeInterval(6 * 3_600), locale: english)
+        let day = MeshWindowView.axisLabels(
+            window: base...base.addingTimeInterval(24 * 3_600), locale: english)
+        let week = MeshWindowView.axisLabels(
+            window: base...base.addingTimeInterval(7 * 24 * 3_600), locale: english)
+        XCTAssertEqual(Set(hours).count, 5, "刻度不能重复")
+        XCTAssertEqual(Set(day).count, 5, "刻度不能重复")
+        XCTAssertEqual(Set(week).count, 5, "刻度不能重复")
+        XCTAssertGreaterThan(day[0].count, hours[0].count, "满一天的窗口要带上日期")
     }
 
     // MARK: - 打开面板时的补探

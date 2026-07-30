@@ -24,6 +24,15 @@ enum MeshState: String {
     case unreachable
 }
 
+/// 取 lighthouse 历史时说不出答案的三种原因。都要能分开告诉用户：空图配一句
+/// 「暂无数据」会把「没配地址」「连不上」「lighthouse 太旧」全说成同一件事。
+enum MeshHistoryError: Error, Equatable {
+    case notConfigured
+    case unreachable
+    /// 老版本 lighthouse 不认 `/history`，对任何路径都返回名册文档。
+    case unsupported
+}
+
 /// 一个节点，聚合好可直接渲染。
 struct MeshHostView: Equatable {
     var name: String
@@ -183,9 +192,88 @@ final class MeshMonitor: ObservableObject {
                 icmpAvailable: available, at: now)
     }
 
-    /// 某节点的逐桶历史。同步读库：只在用户点开某一台时调用，一次十几行。
+    /// 某节点的逐桶历史，本机视角。同步读库：只在用户点开某一台时调用，一次十几行。
     func history(for hostName: String, window: TimeInterval = 6 * 3600) -> [MeshBucketPoint] {
         store.meshHistory(hostName: hostName, since: Date().addingTimeInterval(-window))
+    }
+
+    /// lighthouse 视角的逐桶历史，按节点名分组。
+    ///
+    /// 本机视角只测得到「我到它」的那些隧道，而网格上大多数链路本机根本不在其上。
+    /// 2026-07-29 夜里断的是 lighthouse 到 DS925 那一条：本机对两端都通，两条本地曲线
+    /// 平得像什么都没发生。要回答那种问题只能问 lighthouse 自己。
+    ///
+    /// 而且必须问它要**历史**而不是当前值：事故发生在夜里，本机那时是睡着的，任何
+    /// 「本机在线时顺手记一笔」的方案在这种时段都只会留下空白。
+    func fetchLighthouseHistory(
+        window: TimeInterval,
+        completion: @escaping (Result<[String: [MeshBucketPoint]], MeshHistoryError>) -> Void
+    ) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            let finish = { (result: Result<[String: [MeshBucketPoint]], MeshHistoryError>) in
+                DispatchQueue.main.async { completion(result) }
+            }
+            guard let base = self.lighthouseURL,
+                  let url = Self.historyURL(base: base, window: window) else {
+                finish(.failure(.notConfigured))
+                return
+            }
+            var request = URLRequest(url: url)
+            // 比名册那 5 秒宽：一次七天的查询要读上万行并拼成一份文档。
+            request.timeoutInterval = 15
+            // 不像 fetchRoster 那样用信号量等结果：那条路径的调用者本身是同步的，
+            // 而这里只是取地址要用一下这条串行队列。阻塞在这里等十几秒，会把整轮
+            // ICMP sweep 一起卡住——为了看历史而让实时状态停摆，本末倒置。
+            self.session.dataTask(with: request) { data, _, _ in
+                guard let data else {
+                    finish(.failure(.unreachable))
+                    return
+                }
+                guard let history = Self.parseHistory(data) else {
+                    finish(.failure(.unsupported))
+                    return
+                }
+                finish(.success(history))
+            }.resume()
+        }
+    }
+
+    static func historyURL(base: URL, window: TimeInterval) -> URL? {
+        var components = URLComponents(url: base, resolvingAgainstBaseURL: false)
+        components?.path = "/history"
+        components?.queryItems = [URLQueryItem(name: "window", value: String(Int(window)))]
+        return components?.url
+    }
+
+    /// 解析 lighthouse 的历史文档。
+    ///
+    /// 返回 nil 而不是空字典表示「这不是一份历史文档」——老版本 lighthouse 对任何路径
+    /// 都回名册，两者都有 `hosts` 键，靠 `bucket_width_s` 区分。把它当成空历史会让
+    /// 「lighthouse 太旧」显示成「这段时间一切正常」。
+    static func parseHistory(_ data: Data) -> [String: [MeshBucketPoint]]? {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              object["bucket_width_s"] != nil,
+              let hosts = object["hosts"] as? [[String: Any]] else { return nil }
+        var result: [String: [MeshBucketPoint]] = [:]
+        for host in hosts {
+            guard let name = host["name"] as? String,
+                  let rows = host["buckets"] as? [[Any?]] else { continue }
+            result[name] = rows.compactMap { row in
+                // [bucket_at, samples, ok_samples, rtt_min_us, rtt_max_us, rtt_sum_us]
+                guard row.count >= 6,
+                      let bucketAt = row[0] as? Double ?? (row[0] as? Int).map(Double.init),
+                      let samples = row[1] as? Int, let ok = row[2] as? Int else { return nil }
+                let sum = row[5] as? Int
+                return MeshBucketPoint(
+                    bucketAt: Date(timeIntervalSince1970: bucketAt),
+                    samples: samples, okSamples: ok,
+                    rttMinUs: row[3] as? Int, rttMaxUs: row[4] as? Int,
+                    rttAvgUs: ok > 0 ? sum.map { $0 / ok } : nil
+                )
+            }
+        }
+        return result
     }
 
     /// 本机探通就结束提问：无论 lighthouse 怎么看，本机能到达对方，而这正是用户在问的。

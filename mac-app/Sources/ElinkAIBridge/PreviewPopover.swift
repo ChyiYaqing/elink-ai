@@ -18,6 +18,7 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
     private var actionInFlight = false
     private let sessionMonitor = AgentSessionMonitor()
     private var loadingSessions = false
+    private let meshWindow: MeshWindowController
 
     init(status: StatusService, usage: UsageFetcher, cluster: ClusterManager,
          link: LinkMonitor, mesh: MeshMonitor, port: UInt16) {
@@ -27,6 +28,7 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
         self.link = link
         self.mesh = mesh
         self.port = port
+        self.meshWindow = MeshWindowController(mesh: mesh, panel: model, link: link)
         super.init()
         model.deviceConnectionEnabled = DeviceClient.isEnabled
         if !model.deviceConnectionEnabled {
@@ -141,6 +143,13 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
             } else {
                 self.model.agentSessions = []
             }
+        }
+        model.onOpenMeshWindow = { [weak self] in
+            guard let self else { return }
+            // 弹窗是 transient 的，窗口一激活它就会自己消失；显式关掉是为了不让它在
+            // 窗口前面闪一下
+            self.popover.performClose(nil)
+            self.meshWindow.show()
         }
         model.onOpenDeviceStatus = { [weak self] in
             guard let base = DeviceClient.baseURL else {

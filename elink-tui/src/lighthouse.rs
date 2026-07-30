@@ -190,7 +190,19 @@ pub fn create_schema(connection: &Connection) -> rusqlite::Result<()> {
             last_activity_at INTEGER NOT NULL,
             probed_at INTEGER,
             rtt_us INTEGER
-        );",
+        );
+        CREATE TABLE IF NOT EXISTS lighthouse_probe_bucket (
+            cert_name TEXT NOT NULL,
+            bucket_at INTEGER NOT NULL,
+            samples INTEGER NOT NULL,
+            ok_samples INTEGER NOT NULL,
+            rtt_min_us INTEGER,
+            rtt_max_us INTEGER,
+            rtt_sum_us INTEGER,
+            PRIMARY KEY (cert_name, bucket_at)
+        );
+        CREATE INDEX IF NOT EXISTS idx_lighthouse_probe_bucket
+            ON lighthouse_probe_bucket(bucket_at);",
     )
 }
 
@@ -260,9 +272,30 @@ pub fn hosts(connection: &Connection) -> rusqlite::Result<Vec<RosterHost>> {
     rows.collect()
 }
 
+/// One node's probe outcomes folded into a single five-minute bucket, from the
+/// lighthouse's vantage point.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeBucket {
+    pub cert_name: String,
+    pub bucket_at: i64,
+    pub samples: i64,
+    pub ok_samples: i64,
+    pub rtt_min_us: Option<i64>,
+    pub rtt_max_us: Option<i64>,
+    pub rtt_sum_us: Option<i64>,
+}
+
 /// Stores one probe outcome. A miss is written just as deliberately as a hit:
 /// leaving `rtt_us` alone on failure would keep serving the last good round
 /// trip and make an unreachable node look merely stale.
+///
+/// The outcome lands in two places. `lighthouse_host` keeps only the latest
+/// value, which answers "is it up right now"; the bucket table keeps the whole
+/// series, which answers "was it up last night". Only the second question can
+/// be asked about a link the asker is not on: a client watching the mesh
+/// measures its own tunnels, so an outage between the lighthouse and a node is
+/// visible from nowhere else, and a client that was asleep at the time cannot
+/// reconstruct it afterwards from anything but this table.
 pub fn record_probe(
     connection: &Connection,
     cert_name: &str,
@@ -273,7 +306,48 @@ pub fn record_probe(
         "UPDATE lighthouse_host SET probed_at = ?2, rtt_us = ?3 WHERE cert_name = ?1",
         rusqlite::params![cert_name, at, rtt_us.map(i64::from)],
     )?;
+    let rtt = rtt_us.map(i64::from);
+    connection.execute(
+        "INSERT INTO lighthouse_probe_bucket
+           (cert_name, bucket_at, samples, ok_samples, rtt_min_us, rtt_max_us, rtt_sum_us)
+         VALUES (?1, ?2, 1, ?3, ?4, ?4, ?4)
+         ON CONFLICT(cert_name, bucket_at) DO UPDATE SET
+           samples = samples + 1,
+           ok_samples = ok_samples + excluded.ok_samples,
+           rtt_min_us = MIN(COALESCE(rtt_min_us, excluded.rtt_min_us),
+                            COALESCE(excluded.rtt_min_us, rtt_min_us)),
+           rtt_max_us = MAX(COALESCE(rtt_max_us, excluded.rtt_max_us),
+                            COALESCE(excluded.rtt_max_us, rtt_max_us)),
+           rtt_sum_us = CASE WHEN excluded.rtt_sum_us IS NULL THEN rtt_sum_us
+                             ELSE COALESCE(rtt_sum_us, 0) + excluded.rtt_sum_us END",
+        rusqlite::params![
+            cert_name,
+            bucket_start(at as f64),
+            i64::from(rtt.is_some()),
+            rtt
+        ],
+    )?;
     Ok(())
+}
+
+pub fn probe_history(connection: &Connection, since: i64) -> rusqlite::Result<Vec<ProbeBucket>> {
+    let mut statement = connection.prepare(
+        "SELECT cert_name, bucket_at, samples, ok_samples, rtt_min_us, rtt_max_us, rtt_sum_us
+         FROM lighthouse_probe_bucket WHERE bucket_at >= ?1
+         ORDER BY cert_name, bucket_at",
+    )?;
+    let rows = statement.query_map([since], |row| {
+        Ok(ProbeBucket {
+            cert_name: row.get(0)?,
+            bucket_at: row.get(1)?,
+            samples: row.get(2)?,
+            ok_samples: row.get(3)?,
+            rtt_min_us: row.get(4)?,
+            rtt_max_us: row.get(5)?,
+            rtt_sum_us: row.get(6)?,
+        })
+    })?;
+    rows.collect()
 }
 
 /// Pings every node on the roster and records the outcome.
@@ -518,6 +592,83 @@ pub fn snapshot_json(
     )
 }
 
+/// How far back `/history` reaches when the request does not say.
+const DEFAULT_HISTORY_WINDOW_S: i64 = 24 * 60 * 60;
+
+/// The furthest back it will go when the request does say. A cap rather than
+/// trust: the response is built in memory, and one node-week is already ~2000
+/// buckets.
+const MAX_HISTORY_WINDOW_S: i64 = 30 * 24 * 60 * 60;
+
+/// `Some(window_seconds)` for a history request, `None` for anything else.
+///
+/// History is a separate document rather than a field on the roster because the
+/// roster is polled every thirty seconds by every client, and a day of buckets
+/// per node would make that poll two orders of magnitude heavier for data
+/// nobody reads until something breaks.
+pub fn history_window(target: &str) -> Option<i64> {
+    let (path, query) = match target.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (target, None),
+    };
+    if path != "/history" {
+        return None;
+    }
+    let requested = query
+        .and_then(|query| {
+            query
+                .split('&')
+                .find_map(|pair| pair.strip_prefix("window="))
+        })
+        .and_then(|value| value.parse::<i64>().ok());
+    Some(
+        requested
+            .unwrap_or(DEFAULT_HISTORY_WINDOW_S)
+            .clamp(BUCKET_WIDTH_S as i64, MAX_HISTORY_WINDOW_S),
+    )
+}
+
+/// Serialises the per-node probe series.
+///
+/// Buckets are arrays rather than objects: a week of one node is ~2016 of them,
+/// and repeating six key names on every row triples the document for nothing a
+/// reader gains. `fields` names the order so the shape stays self-describing.
+pub fn probe_history_json(buckets: &[ProbeBucket], since: i64, now: i64) -> String {
+    let optional = |value: Option<i64>| match value {
+        Some(value) => value.to_string(),
+        None => "null".to_string(),
+    };
+    let mut hosts: Vec<String> = Vec::new();
+    let mut index = 0;
+    while index < buckets.len() {
+        let name = buckets[index].cert_name.clone();
+        let mut rows: Vec<String> = Vec::new();
+        while index < buckets.len() && buckets[index].cert_name == name {
+            let bucket = &buckets[index];
+            rows.push(format!(
+                "[{},{},{},{},{},{}]",
+                bucket.bucket_at,
+                bucket.samples,
+                bucket.ok_samples,
+                optional(bucket.rtt_min_us),
+                optional(bucket.rtt_max_us),
+                optional(bucket.rtt_sum_us)
+            ));
+            index += 1;
+        }
+        hosts.push(format!(
+            r#"{{"name":{},"buckets":[{}]}}"#,
+            serde_json::Value::String(name),
+            rows.join(",")
+        ));
+    }
+    format!(
+        r#"{{"schema_version":1,"generated_at":{now},"since":{since},"bucket_width_s":{},"fields":["bucket_at","samples","ok_samples","rtt_min_us","rtt_max_us","rtt_sum_us"],"hosts":[{}]}}"#,
+        BUCKET_WIDTH_S as i64,
+        hosts.join(",")
+    )
+}
+
 /// Runs the collector and serves the aggregate read-only.
 ///
 /// Deliberately outside the usage cluster: this process never pairs, never holds
@@ -569,15 +720,21 @@ pub fn run_headless(database: &Path, config: LighthouseConfig) -> anyhow::Result
             last_collect = Instant::now();
         }
         match listener.accept() {
-            Ok((stream, _)) => {
-                let stored = rows(&connection, 0).unwrap_or_default();
-                let roster = hosts(&connection).unwrap_or_default();
-                let body = snapshot_json(
-                    &stored,
-                    &roster,
-                    config.default_port,
-                    crate::util::epoch_now(),
-                );
+            Ok((mut stream, _)) => {
+                let now = crate::util::epoch_now();
+                let target = request_target(&mut stream).unwrap_or_default();
+                let body = match history_window(&target) {
+                    Some(window) => {
+                        let since = bucket_start((now - window) as f64);
+                        let buckets = probe_history(&connection, since).unwrap_or_default();
+                        probe_history_json(&buckets, since, now)
+                    }
+                    None => {
+                        let stored = rows(&connection, 0).unwrap_or_default();
+                        let roster = hosts(&connection).unwrap_or_default();
+                        snapshot_json(&stored, &roster, config.default_port, now)
+                    }
+                };
                 let _ = respond(stream, &body);
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -644,12 +801,23 @@ fn spawn_prober(database: &Path, interval: Duration) {
     });
 }
 
+/// Reads the request line and returns its target, e.g. `/history?window=86400`.
+///
+/// `None` for a request that never arrives or does not parse; the caller serves
+/// the roster in that case, which is what this endpoint answered to every
+/// request before history existed.
+fn request_target(stream: &mut TcpStream) -> Option<String> {
+    let mut buffer = [0u8; 1024];
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let read = stream.read(&mut buffer).ok()?;
+    let text = String::from_utf8_lossy(&buffer[..read]);
+    let mut fields = text.lines().next()?.split_whitespace();
+    let _method = fields.next()?;
+    Some(fields.next()?.to_string())
+}
+
 fn respond(mut stream: TcpStream, body: &str) -> std::io::Result<()> {
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-    // The request line is irrelevant: this endpoint serves exactly one document.
-    let mut discard = [0u8; 1024];
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-    let _ = stream.read(&mut discard);
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
@@ -1036,6 +1204,133 @@ mod tests {
         assert_eq!(host.reachable(), Some(false));
         // The log-derived timestamp is a separate axis and must not move.
         assert_eq!(host.last_activity_at, 1_785_000_000);
+    }
+
+    /// The outage this whole table exists for: the lighthouse could not reach
+    /// DS925 for a stretch of the night. The current-state row keeps only the
+    /// last probe, so without the bucket series that stretch leaves no trace
+    /// anywhere — least of all on a client that was asleep while it happened.
+    #[test]
+    fn probe_history_keeps_an_outage_the_current_row_forgets() {
+        let connection = Connection::open_in_memory().unwrap();
+        create_schema(&connection).unwrap();
+        record_roster(
+            &connection,
+            &[RosterEntry {
+                cert_name: "DS925".into(),
+                overlay: "192.168.100.125".into(),
+                seen_at: Some(1_785_000_000),
+            }],
+            0,
+        )
+        .unwrap();
+
+        // 02:00–02:05 healthy, 02:05–02:10 nothing through, then healthy again.
+        record_probe(&connection, "DS925", 1_785_000_000, Some(199_000)).unwrap();
+        record_probe(&connection, "DS925", 1_785_000_030, Some(221_000)).unwrap();
+        record_probe(&connection, "DS925", 1_785_000_300, None).unwrap();
+        record_probe(&connection, "DS925", 1_785_000_330, None).unwrap();
+        record_probe(&connection, "DS925", 1_785_000_600, Some(205_000)).unwrap();
+
+        let history = probe_history(&connection, 0).unwrap();
+        assert_eq!(history.len(), 3, "three five-minute buckets");
+        assert_eq!(history[0].bucket_at, 1_785_000_000);
+        assert_eq!(history[0].samples, 2);
+        assert_eq!(history[0].ok_samples, 2);
+        assert_eq!(history[0].rtt_min_us, Some(199_000));
+        assert_eq!(history[0].rtt_max_us, Some(221_000));
+        assert_eq!(history[0].rtt_sum_us, Some(420_000));
+
+        let outage = &history[1];
+        assert_eq!(outage.bucket_at, 1_785_000_300);
+        assert_eq!(outage.samples, 2, "the probes ran");
+        assert_eq!(outage.ok_samples, 0, "and none of them came back");
+        assert_eq!(
+            outage.rtt_min_us, None,
+            "a lost bucket must carry no latency at all, or it plots as 0ms"
+        );
+
+        // The row a client polls has already moved on; only the series remembers.
+        assert_eq!(hosts(&connection).unwrap()[0].rtt_us, Some(205_000));
+    }
+
+    /// A window boundary must not swallow the buckets on the far side of it.
+    #[test]
+    fn probe_history_honours_the_requested_window() {
+        let connection = Connection::open_in_memory().unwrap();
+        create_schema(&connection).unwrap();
+        record_roster(
+            &connection,
+            &[RosterEntry {
+                cert_name: "DS925".into(),
+                overlay: "192.168.100.125".into(),
+                seen_at: Some(1),
+            }],
+            0,
+        )
+        .unwrap();
+        record_probe(&connection, "DS925", 1_785_000_000, Some(1)).unwrap();
+        record_probe(&connection, "DS925", 1_785_000_600, Some(2)).unwrap();
+
+        assert_eq!(probe_history(&connection, 1_785_000_300).unwrap().len(), 1);
+        assert_eq!(probe_history(&connection, 1_785_000_000).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn history_requests_are_told_apart_from_roster_requests() {
+        assert_eq!(history_window("/"), None);
+        assert_eq!(history_window(""), None);
+        assert_eq!(history_window("/v1/status"), None);
+        assert_eq!(history_window("/history"), Some(DEFAULT_HISTORY_WINDOW_S));
+        assert_eq!(history_window("/history?window=21600"), Some(21_600));
+        assert_eq!(
+            history_window("/history?foo=1&window=21600"),
+            Some(21_600),
+            "the window may not be the first parameter"
+        );
+        // Garbage and out-of-range values are clamped rather than refused: a
+        // client asking for too much still deserves an answer.
+        assert_eq!(
+            history_window("/history?window=abc"),
+            Some(DEFAULT_HISTORY_WINDOW_S)
+        );
+        assert_eq!(history_window("/history?window=0"), Some(300));
+        assert_eq!(
+            history_window("/history?window=99999999"),
+            Some(MAX_HISTORY_WINDOW_S)
+        );
+    }
+
+    #[test]
+    fn history_json_groups_buckets_under_each_node() {
+        let bucket = |name: &str, at: i64, ok: i64, rtt: Option<i64>| ProbeBucket {
+            cert_name: name.into(),
+            bucket_at: at,
+            samples: 1,
+            ok_samples: ok,
+            rtt_min_us: rtt,
+            rtt_max_us: rtt,
+            rtt_sum_us: rtt,
+        };
+        let body = probe_history_json(
+            &[
+                bucket("Bandwagon2", 1_785_000_000, 1, Some(90)),
+                bucket("DS925", 1_785_000_000, 1, Some(199_000)),
+                bucket("DS925", 1_785_000_300, 0, None),
+            ],
+            1_785_000_000,
+            1_785_000_900,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["bucket_width_s"], 300);
+        assert_eq!(parsed["since"], 1_785_000_000_i64);
+        assert_eq!(parsed["hosts"].as_array().unwrap().len(), 2);
+        assert_eq!(parsed["hosts"][1]["name"], "DS925");
+        let buckets = parsed["hosts"][1]["buckets"].as_array().unwrap();
+        assert_eq!(buckets.len(), 2);
+        assert_eq!(buckets[1][0], 1_785_000_300_i64);
+        assert_eq!(buckets[1][2], 0, "ok_samples");
+        assert!(buckets[1][3].is_null(), "a lost bucket carries no latency");
     }
 
     /// Nobody on the default port is a valid state: every node was rewritten.
