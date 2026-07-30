@@ -72,6 +72,10 @@ struct MeshLatencyChart: View {
     var body: some View {
         GeometryReader { geometry in
             let size = geometry.size
+            // 纵轴范围一次算好往下传。它要扫一遍所有桶，而每个点的 y 都要用它：以前在
+            // y() 里现算，一张 288 个桶的图就成了 O(n²)，面板里 8 台 × 2 条 = 16 张图
+            // 一起重画时，单次布局要占掉半秒主线程。
+            let scale = bounds
             ZStack(alignment: .topLeading) {
                 // 全断时没有线也没有带，红点会悬在空处像是装饰。一条基线把它们
                 // 锚成一条时间轴，「什么时候断的、断了多久」才读得出来。
@@ -81,15 +85,15 @@ struct MeshLatencyChart: View {
                         .frame(height: 1)
                         .position(x: size.width / 2, y: size.height - 1.5)
                 }
-                band(in: size)
+                band(in: size, scale: scale)
                     .fill(seriesColor.opacity(theme.dark ? 0.22 : 0.16))
                 ForEach(Array(segments().enumerated()), id: \.offset) { segment in
-                    line(segment.element, in: size)
+                    line(segment.element, in: size, scale: scale)
                         .stroke(seriesColor,
                                 style: StrokeStyle(lineWidth: 2, lineCap: .round, lineJoin: .round))
                 }
                 lossMarkers(in: size)
-                crosshair(in: size)
+                crosshair(in: size, scale: scale)
             }
             .contentShape(Rectangle())
             .onContinuousHover { phase in
@@ -122,8 +126,9 @@ struct MeshLatencyChart: View {
         Self.position(points[index].bucketAt, in: window, width: width)
     }
 
-    private func y(_ micros: Int, height: CGFloat) -> CGFloat {
-        let (lower, upper) = bounds
+    private func y(_ micros: Int, height: CGFloat,
+                   scale: (lower: Double, upper: Double)) -> CGFloat {
+        let (lower, upper) = scale
         let span = max(upper - lower, 1)
         return height - CGFloat((Double(micros) - lower) / span) * height
     }
@@ -173,12 +178,13 @@ struct MeshLatencyChart: View {
 
     private func segments() -> [[Int]] { Self.segments(points) }
 
-    private func line(_ indices: [Int], in size: CGSize) -> Path {
+    private func line(_ indices: [Int], in size: CGSize,
+                      scale: (lower: Double, upper: Double)) -> Path {
         Path { path in
             // 孤立的一个点画不出线段，补一个短横杠，否则它会整个消失
             if indices.count == 1, let value = points[indices[0]].rttAvgUs {
                 let center = CGPoint(x: x(indices[0], width: size.width),
-                                     y: y(value, height: size.height))
+                                     y: y(value, height: size.height, scale: scale))
                 path.move(to: CGPoint(x: center.x - 1, y: center.y))
                 path.addLine(to: CGPoint(x: center.x + 1, y: center.y))
                 return
@@ -186,14 +192,14 @@ struct MeshLatencyChart: View {
             for (offset, index) in indices.enumerated() {
                 guard let value = points[index].rttAvgUs else { continue }
                 let position = CGPoint(x: x(index, width: size.width),
-                                       y: y(value, height: size.height))
+                                       y: y(value, height: size.height, scale: scale))
                 if offset == 0 { path.move(to: position) } else { path.addLine(to: position) }
             }
         }
     }
 
     /// min–max 区间带，同样按可用段切开。
-    private func band(in size: CGSize) -> Path {
+    private func band(in size: CGSize, scale: (lower: Double, upper: Double)) -> Path {
         Path { path in
             for indices in segments() {
                 guard indices.count > 1 else { continue }
@@ -202,9 +208,10 @@ struct MeshLatencyChart: View {
                     guard let high = points[index].rttMaxUs,
                           let low = points[index].rttMinUs else { continue }
                     let positionX = x(index, width: size.width)
-                    let top = CGPoint(x: positionX, y: y(high, height: size.height))
+                    let top = CGPoint(x: positionX, y: y(high, height: size.height, scale: scale))
                     if offset == 0 { path.move(to: top) } else { path.addLine(to: top) }
-                    closing.append(CGPoint(x: positionX, y: y(low, height: size.height)))
+                    closing.append(CGPoint(x: positionX,
+                                           y: y(low, height: size.height, scale: scale)))
                 }
                 for position in closing.reversed() { path.addLine(to: position) }
                 path.closeSubpath()
@@ -222,7 +229,8 @@ struct MeshLatencyChart: View {
     }
 
     @ViewBuilder
-    private func crosshair(in size: CGSize) -> some View {
+    private func crosshair(in size: CGSize,
+                           scale: (lower: Double, upper: Double)) -> some View {
         if let hoveredIndex, points.indices.contains(hoveredIndex) {
             let positionX = x(hoveredIndex, width: size.width)
             Rectangle()
@@ -235,7 +243,7 @@ struct MeshLatencyChart: View {
                     // 2pt 的表面色描边把点从线和带里分出来
                     .overlay(Circle().stroke(theme.glassBackground, lineWidth: 2))
                     .frame(width: 6, height: 6)
-                    .position(x: positionX, y: y(value, height: size.height))
+                    .position(x: positionX, y: y(value, height: size.height, scale: scale))
             }
         }
     }
