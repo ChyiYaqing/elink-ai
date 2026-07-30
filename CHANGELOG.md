@@ -6,6 +6,19 @@ and `Removed`.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## 0.1.17-rc7
+
+### Changed
+
+- Nebula overlay history now includes a one-hour range and opens with that
+  range selected by default
+
+### Fixed
+
+- Nebula overlay history now refreshes while its page remains open
+- The two Agent Sessions summary cards now keep matching heights when
+  collapsed
+
 ## 0.1.17-rc6
 
 ### Packaging
