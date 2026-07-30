@@ -18,28 +18,34 @@ struct AgentSessionsCard: View {
 
     var body: some View {
         let running = sessions.filter { $0.anyBusy }.count
-        VStack(spacing: 10) {
+        VStack(alignment: .leading, spacing: 10) {
             Button {
                 Log.user("\(isExpanded ? "collapse" : "expand") agent sessions")
                 withAnimation(.easeOut(duration: 0.2)) {
                     isExpanded.toggle()
                 }
             } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: "terminal.fill")
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundStyle(theme.textSecondary)
-                    Text(tr("Agent 会话", "Agent Sessions"))
-                        .font(.system(size: 12, weight: .semibold, design: .rounded))
-                        .foregroundStyle(theme.textPrimary)
-                    Spacer()
-                    StateBadge(text: running > 0 ? tr("\(running) 运行中", "\(running) working")
-                                                 : tr("空闲", "Idle"),
-                               color: running > 0 ? theme.statusHealthy : theme.textTertiary)
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: 9, weight: .semibold))
+                // 摘要行的间距（12 / 5 / 12）与 Nebula 卡片一致，两张卡折叠时同高
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "terminal.fill")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(theme.textSecondary)
+                        Text(tr("Agent 会话", "Agent Sessions"))
+                            .font(.system(size: 12, weight: .semibold, design: .rounded))
+                            .foregroundStyle(theme.textPrimary)
+                        Spacer()
+                        StateBadge(text: running > 0 ? tr("\(running) 运行中", "\(running) working")
+                                                     : tr("空闲", "Idle"),
+                                   color: running > 0 ? theme.statusHealthy : theme.textTertiary)
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundStyle(theme.textTertiary)
+                            .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                    }
+                    Text(Self.subtitle(sessions: sessions))
+                        .font(.system(size: 9, weight: .medium))
                         .foregroundStyle(theme.textTertiary)
-                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
                 }
                 .contentShape(Rectangle())
             }
@@ -139,6 +145,18 @@ struct AgentSessionsCard: View {
         if busy { return Self.busyColor }
         if live { return theme.textTertiary }
         return theme.statusHealthy
+    }
+
+    /// 折叠时也要说清「有几个、多久没动静」。只有一个「空闲」徽章的话，卡片里是一个
+    /// 会话还是四个、上次动静是一分钟前还是三天前，都看不出来。
+    static func subtitle(sessions: [AgentSession], now: Date = Date()) -> String {
+        let count = tr("\(sessions.count) 个会话",
+                       sessions.count == 1 ? "1 session" : "\(sessions.count) sessions")
+        guard let latest = sessions.map({ $0.lastActivity ?? $0.lastModified }).max() else {
+            return count
+        }
+        let ago = relativeTime(latest, now: now)
+        return count + tr(" · 最近 \(ago)", " · last active \(ago)")
     }
 
     static func relativeTime(_ date: Date, now: Date = Date()) -> String {

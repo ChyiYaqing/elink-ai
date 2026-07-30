@@ -244,6 +244,25 @@ final class AgentSessionMonitorTests: XCTestCase {
 
     // MARK: - 相对时间
 
+    /// 折叠的卡片上，徽章只说忙不忙。有几个会话、上次动静多久以前，要靠副标题。
+    func testCollapsedSubtitleCountsSessionsAndTheLatestActivity() {
+        UserDefaults.standard.set(AppLanguage.english.rawValue, forKey: AppLanguage.defaultsKey)
+        defer { UserDefaults.standard.removeObject(forKey: AppLanguage.defaultsKey) }
+        let now = Date()
+        let old = AgentSession(id: "/a", kind: .claude, title: "a", snippet: "",
+                               model: "", lastModified: now.addingTimeInterval(-7200))
+        var recent = AgentSession(id: "/b", kind: .codex, title: "b", snippet: "",
+                                  model: "", lastModified: now.addingTimeInterval(-3600))
+        recent.lastActivity = now.addingTimeInterval(-300)
+
+        XCTAssertEqual(AgentSessionsCard.subtitle(sessions: [old], now: now),
+                       "1 session · last active 2h")
+        // 取最近的那一个，而不是列表里的第一个
+        XCTAssertEqual(AgentSessionsCard.subtitle(sessions: [old, recent], now: now),
+                       "2 sessions · last active 5m")
+        XCTAssertEqual(AgentSessionsCard.subtitle(sessions: [], now: now), "0 sessions")
+    }
+
     func testRelativeTimeFormatting() {
         let now = Date()
         XCTAssertEqual(AgentSessionsCard.relativeTime(now.addingTimeInterval(-5), now: now), "now")
