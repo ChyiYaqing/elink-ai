@@ -2,15 +2,16 @@ import SwiftUI
 
 /// 历史窗口长度。
 ///
-/// 默认一天而不是几小时：这个窗口是「昨晚是不是断了」才会被打开的，而六小时的窗口在
-/// 第二天早上看已经把昨晚整段滑出去了。
+/// 默认一小时：五分钟一个桶，一小时是十二格，刚断的那一下在这个尺度上占满一格，一眼
+/// 就能看见。更长的窗口回答的是另一个问题——「昨晚是不是断了」——需要时手动切过去。
 enum MeshHistorySpan: String, CaseIterable, Identifiable {
-    case sixHours, day
+    case hour, sixHours, day
 
     var id: String { rawValue }
 
     var seconds: TimeInterval {
         switch self {
+        case .hour: return 3600
         case .sixHours: return 6 * 3600
         case .day: return 24 * 3600
         }
@@ -18,6 +19,7 @@ enum MeshHistorySpan: String, CaseIterable, Identifiable {
 
     var label: String {
         switch self {
+        case .hour: return "1h"
         case .sixHours: return "6h"
         case .day: return "24h"
         }
@@ -25,7 +27,7 @@ enum MeshHistorySpan: String, CaseIterable, Identifiable {
 }
 
 final class MeshDetailModel: ObservableObject {
-    @Published var span: MeshHistorySpan = .day
+    @Published var span: MeshHistorySpan = .hour
     @Published var localHistory: [String: [MeshBucketPoint]] = [:]
     @Published var lighthouseHistory: [String: [MeshBucketPoint]] = [:]
     @Published var lighthouseError: MeshHistoryError?
