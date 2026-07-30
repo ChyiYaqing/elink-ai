@@ -202,6 +202,46 @@ final class UsagePanelViewTests: XCTestCase {
             .compactMap { ($0 as? NSTextField)?.placeholderString }
     }
 
+    /// Nebula 那一页现在开在面板里，和用量统计一样是一层覆盖。它原先是 720pt 宽的
+    /// 独立窗口，搬进 440pt 的面板后，页面上的控件不能越出面板宽度。
+    @MainActor
+    func testMeshPageOpensInsideThePanelAndFitsItsWidth() {
+        let path = NSTemporaryDirectory() + "elink-panel-\(UUID().uuidString).db"
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let store = UsageStore(path: path)
+        let cluster = ClusterManager(store: store, credentials: ClusterCredentials(
+            nodeID: "local-node",
+            nodeName: "Local Mac",
+            clusterID: nil,
+            clusterSecret: nil,
+            timezone: nil
+        ))
+        let model = PanelModel()
+        model.showMesh = true
+        let view = UsagePanelView(
+            model: model,
+            updater: UpdateChecker(currentVersion: "0.1.17-rc5"),
+            cluster: cluster,
+            mesh: MeshMonitor(store: UsageStore.shared, lighthouseURL: nil)
+        )
+        let host = NSHostingView(rootView: view)
+        host.frame = NSRect(x: 0, y: 0, width: 440, height: 900)
+        host.layoutSubtreeIfNeeded()
+
+        let placeholders = host.descendants
+            .compactMap { ($0 as? NSTextField)?.placeholderString }
+        XCTAssertTrue(
+            placeholders.contains { $0.contains("lighthouse 地址") },
+            "面板里应直接显示 Nebula 页面，实际输入框：\(placeholders)"
+        )
+        for view in host.descendants
+            where view is NSTextField || view is NSSegmentedControl {
+            let frame = host.convert(view.bounds, from: view)
+            XCTAssertGreaterThanOrEqual(frame.minX, host.bounds.minX)
+            XCTAssertLessThanOrEqual(frame.maxX, host.bounds.maxX)
+        }
+    }
+
     @MainActor
     func testSingleNodeClusterShowsPairingCodeInput() {
         let path = NSTemporaryDirectory() + "elink-panel-\(UUID().uuidString).db"

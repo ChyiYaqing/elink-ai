@@ -1,4 +1,3 @@
-import AppKit
 import SwiftUI
 
 /// 历史窗口长度。
@@ -6,7 +5,7 @@ import SwiftUI
 /// 默认一天而不是几小时：这个窗口是「昨晚是不是断了」才会被打开的，而六小时的窗口在
 /// 第二天早上看已经把昨晚整段滑出去了。
 enum MeshHistorySpan: String, CaseIterable, Identifiable {
-    case sixHours, day, week
+    case sixHours, day
 
     var id: String { rawValue }
 
@@ -14,7 +13,6 @@ enum MeshHistorySpan: String, CaseIterable, Identifiable {
         switch self {
         case .sixHours: return 6 * 3600
         case .day: return 24 * 3600
-        case .week: return 7 * 24 * 3600
         }
     }
 
@@ -22,12 +20,11 @@ enum MeshHistorySpan: String, CaseIterable, Identifiable {
         switch self {
         case .sixHours: return "6h"
         case .day: return "24h"
-        case .week: return "7d"
         }
     }
 }
 
-final class MeshWindowModel: ObservableObject {
+final class MeshDetailModel: ObservableObject {
     @Published var span: MeshHistorySpan = .day
     @Published var localHistory: [String: [MeshBucketPoint]] = [:]
     @Published var lighthouseHistory: [String: [MeshBucketPoint]] = [:]
@@ -45,7 +42,7 @@ final class MeshWindowModel: ObservableObject {
         let seconds = span.seconds
         let loadedAt = Date()
         let names = mesh.hosts.map(\.name)
-        // 七天 × 六台是上万行，主线程读会把窗口卡住
+        // 一天 × 六台是上千行，读 SQLite 不放在主线程上，否则翻页时面板会顿一下
         DispatchQueue.global(qos: .userInitiated).async {
             var local: [String: [MeshBucketPoint]] = [:]
             for name in names { local[name] = mesh.history(for: name, window: seconds) }
@@ -71,27 +68,25 @@ final class MeshWindowModel: ObservableObject {
 
 /// Nebula overlay 的完整视图。
 ///
-/// 菜单栏弹窗里那张卡只回答「现在几台通」；这里回答「哪条链路、什么时候断的」。后者
-/// 需要的横向像素是前者给不了的——440pt 宽的弹窗里，一天的时间轴上一个五分钟桶不到
-/// 半个像素。
-struct MeshWindowView: View {
+/// 主列表里那张卡只回答「现在几台通」；这里回答「哪条链路、什么时候断的」。和用量统计
+/// 一样是面板里的一层覆盖：点卡片进来，点返回回去，不另开窗口。
+struct MeshDetailView: View {
     @ObservedObject var mesh: MeshMonitor
-    @ObservedObject var model: MeshWindowModel
+    /// lighthouse 地址和出口 NAT 都挂在面板模型上。这一页开着时弹窗仍在轮询，
+    /// 那份拷贝跟着一起更新。
     @ObservedObject var panel: PanelModel
-    /// 直接观察而不是走 PanelModel：那份拷贝只在弹窗打开时被刷新，窗口开着的时候
-    /// 会停在最后一次的值上，而一个不再更新的 NAT 判据比没有更误导。
-    @ObservedObject var link: LinkMonitor
-    @Environment(\.colorScheme) private var scheme
+    let theme: PanelTheme
+    let onBack: () -> Void
+    @StateObject private var model = MeshDetailModel()
     @State private var hovered: [String: MeshBucketPoint] = [:]
 
     var body: some View {
-        let theme = PanelTheme(scheme)
-        VStack(alignment: .leading, spacing: 12) {
-            header(theme)
-            ScrollView(.vertical) {
-                VStack(alignment: .leading, spacing: 14) {
-                    settings(theme)
-                    legend(theme)
+        VStack(alignment: .leading, spacing: 10) {
+            header
+            ScrollView(.vertical, showsIndicators: false) {
+                VStack(alignment: .leading, spacing: 10) {
+                    settings
+                    legend
                     if mesh.hosts.isEmpty {
                         Text(tr("等待第一份名册…", "Waiting for the first roster…"))
                             .font(.system(size: 11))
@@ -99,39 +94,36 @@ struct MeshWindowView: View {
                             .padding(.vertical, 24)
                     }
                     ForEach(mesh.hosts, id: \.name) { host in
-                        hostBlock(host, theme: theme)
+                        hostBlock(host)
                     }
                 }
-                .padding(.horizontal, 18)
-                .padding(.bottom, 18)
             }
+            Spacer(minLength: 0)
         }
-        .frame(minWidth: 720, minHeight: 480)
-        .background(theme.backgroundGradient)
-        .onAppear { model.load(mesh: mesh) }
+        .padding(12)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .onAppear {
+            // 名册决定这里有哪几台，先补一轮，否则刚开机点进来是空的
+            mesh.refreshIfStale()
+            model.load(mesh: mesh)
+        }
         .onChange(of: model.span) { _ in model.load(mesh: mesh) }
     }
 
     // MARK: - 顶部
 
-    private func header(_ theme: PanelTheme) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 10) {
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                PillButton(title: tr("返回", "Back"), icon: "chevron.left", theme: theme,
+                           action: onBack)
                 Image(systemName: "network")
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(theme.textSecondary)
                 Text(tr("Nebula 网络", "Nebula Overlay"))
-                    .font(.system(size: 15, weight: .semibold, design: .rounded))
+                    .font(.system(size: 13, weight: .bold, design: .rounded))
                     .foregroundStyle(theme.textPrimary)
                 Spacer()
-                Picker("", selection: $model.span) {
-                    ForEach(MeshHistorySpan.allCases) { span in
-                        Text(span.label).tag(span)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .frame(width: 150)
                 PillButton(title: model.loading ? tr("加载中…", "Loading…") : tr("刷新", "Refresh"),
                            icon: "arrow.clockwise", theme: theme) {
                     Log.user("refresh nebula overlay history")
@@ -140,30 +132,36 @@ struct MeshWindowView: View {
                 }
                 .disabled(model.loading)
             }
+            Picker("", selection: $model.span) {
+                ForEach(MeshHistorySpan.allCases) { span in
+                    Text(span.label).tag(span)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(maxWidth: .infinity)
             Text(UsagePanelView.meshSubtitle(
                 total: mesh.hosts.count,
                 reachable: mesh.hosts.filter { $0.state == .online }.count,
                 updatedAt: mesh.updatedAt
             ))
-            .font(.system(size: 10, weight: .medium))
+            .font(.system(size: 9, weight: .medium))
             .foregroundStyle(theme.textTertiary)
             if !mesh.icmpAvailable {
                 notice(tr("无法打开 ICMP socket，本机可达性暂时测不了",
-                          "No ICMP socket: reachability unavailable on this host"), theme)
+                          "No ICMP socket: reachability unavailable on this host"))
             }
-            if !mesh.lighthouseReachable {
-                notice(tr("lighthouse 不可达，显示的是上一次的名册",
-                          "Lighthouse unreachable: showing the last known roster"), theme)
+            if let text = UsagePanelView.meshRosterNotice(
+                configured: mesh.configured, reachable: mesh.lighthouseReachable) {
+                notice(text)
             }
         }
-        .padding(.horizontal, 18)
-        .padding(.top, 16)
     }
 
-    private func settings(_ theme: PanelTheme) -> some View {
+    private var settings: some View {
         VStack(alignment: .leading, spacing: 7) {
-            if let nat = UsagePanelView.clusterNatDetail(link.observation,
-                                                        unavailable: link.unavailable) {
+            if let nat = UsagePanelView.clusterNatDetail(panel.natObservation,
+                                                         unavailable: panel.natUnavailable) {
                 HStack(alignment: .top, spacing: 8) {
                     Text(tr("出口 NAT", "Egress NAT"))
                         .font(.system(size: 9, weight: .medium))
@@ -180,25 +178,24 @@ struct MeshWindowView: View {
                           text: $panel.lighthouseURL)
                     .textFieldStyle(.roundedBorder)
                     .font(.system(size: 10, design: .monospaced))
-                    .frame(maxWidth: 320)
                 PillButton(title: tr("保存", "Save"), icon: "checkmark", theme: theme) {
                     panel.onSaveLighthouse?(panel.lighthouseURL)
                     model.load(mesh: mesh)
                 }
-                Text(tr("设备清单由跑着 elink-tui --headless 的 lighthouse 提供；留空则关闭本视图。",
-                        "The roster comes from a lighthouse running elink-tui --headless; empty disables this view."))
-                    .font(.system(size: 8, weight: .medium))
-                    .foregroundStyle(theme.textTertiary)
             }
+            Text(tr("设备清单由跑着 elink-tui --headless 的 lighthouse 提供；留空则关闭本视图。",
+                    "The roster comes from a lighthouse running elink-tui --headless; empty disables this view."))
+                .font(.system(size: 8, weight: .medium))
+                .foregroundStyle(theme.textTertiary)
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
         .glassCard(theme)
     }
 
-    private func legend(_ theme: PanelTheme) -> some View {
+    private var legend: some View {
         let strip = MeshAvailabilityStrip(points: [], window: model.window, theme: theme)
-        return HStack(spacing: 12) {
+        return HStack(spacing: 10) {
             ForEach([(MeshBucketStatus.ok, tr("全部探通", "all through")),
                      (.partial, tr("有丢包", "some lost")),
                      (.lost, tr("全部不通", "nothing through")),
@@ -206,9 +203,9 @@ struct MeshWindowView: View {
                 HStack(spacing: 4) {
                     RoundedRectangle(cornerRadius: 1)
                         .fill(strip.color(status))
-                        .frame(width: 14, height: 8)
+                        .frame(width: 12, height: 8)
                     Text(text)
-                        .font(.system(size: 9, weight: .medium))
+                        .font(.system(size: 8, weight: .medium))
                         .foregroundStyle(theme.textTertiary)
                 }
             }
@@ -216,7 +213,7 @@ struct MeshWindowView: View {
         }
     }
 
-    private func notice(_ text: String, _ theme: PanelTheme) -> some View {
+    private func notice(_ text: String) -> some View {
         Text(text)
             .font(.system(size: 9, weight: .medium))
             .foregroundStyle(theme.statusWarning)
@@ -224,41 +221,44 @@ struct MeshWindowView: View {
 
     // MARK: - 每台节点
 
-    private func hostBlock(_ host: MeshHostView, theme: PanelTheme) -> some View {
+    private func hostBlock(_ host: MeshHostView) -> some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Circle()
-                    .fill(UsagePanelView.meshStateColor(host.state, theme: theme))
-                    .frame(width: 6, height: 6)
-                Text(host.name)
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(theme.textPrimary)
-                Text(host.overlay)
-                    .font(.system(size: 9, design: .monospaced))
-                    .foregroundStyle(theme.textTertiary)
-                Spacer()
-                Text(host.latestRttUs.map { UsagePanelView.meshLatency(Int($0)) } ?? "—")
-                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                    .foregroundStyle(theme.textPrimary)
+            // 440pt 宽放不下「名字 + overlay 地址 + 延迟 + 状态」一行，状态另起一行：
+            // 它是四者里最长的，挤在一行会先把 overlay 地址截断
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Circle()
+                        .fill(UsagePanelView.meshStateColor(host.state, theme: theme))
+                        .frame(width: 6, height: 6)
+                    Text(host.name)
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(theme.textPrimary)
+                    Text(host.overlay)
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(theme.textTertiary)
+                    Spacer()
+                    Text(host.latestRttUs.map { UsagePanelView.meshLatency(Int($0)) } ?? "—")
+                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(theme.textPrimary)
+                }
                 Text(UsagePanelView.meshStateText(host))
                     .font(.system(size: 9, weight: .medium))
                     .foregroundStyle(UsagePanelView.meshStateColor(host.state, theme: theme))
+                    .padding(.leading, 12)
             }
 
             series(key: "local:\(host.name)",
                    title: tr("本机 → \(host.name)", "this host → \(host.name)"),
                    points: model.localHistory[host.name] ?? [],
-                   missing: nil,
-                   theme: theme)
+                   missing: nil)
 
             series(key: "lighthouse:\(host.name)",
                    title: tr("lighthouse → \(host.name)", "lighthouse → \(host.name)"),
                    points: model.lighthouseHistory[host.name] ?? [],
                    missing: Self.lighthouseNotice(model.lighthouseError,
-                                                  hasSeries: model.lighthouseHistory[host.name] != nil),
-                   theme: theme)
+                                                  hasSeries: model.lighthouseHistory[host.name] != nil))
 
-            axis(theme)
+            axis
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -271,17 +271,16 @@ struct MeshWindowView: View {
     /// 本身，后者只是旁证。
     @ViewBuilder
     private func series(key: String, title: String, points: [MeshBucketPoint],
-                        missing: String?, theme: PanelTheme) -> some View {
+                        missing: String?) -> some View {
         VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 8) {
-                Text(title)
-                    .font(.system(size: 9, weight: .semibold))
-                    .foregroundStyle(theme.textSecondary)
-                Text(UsagePanelView.meshHistorySummary(points: points, hovered: hovered[key]))
-                    .font(.system(size: 9, design: .monospaced))
-                    .foregroundStyle(theme.textTertiary)
-                Spacer()
-            }
+            // 标题和摘要各占一行：两者并排要 300pt 以上，440pt 的面板里摘要会被吃掉，
+            // 而「三分之一探测没回来」正是这一段要说的话
+            Text(title)
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(theme.textSecondary)
+            Text(UsagePanelView.meshHistorySummary(points: points, hovered: hovered[key]))
+                .font(.system(size: 9, design: .monospaced))
+                .foregroundStyle(theme.textTertiary)
             if let missing {
                 Text(missing)
                     .font(.system(size: 9, weight: .medium))
@@ -317,7 +316,7 @@ struct MeshWindowView: View {
         }
     }
 
-    private func axis(_ theme: PanelTheme) -> some View {
+    private var axis: some View {
         HStack(spacing: 0) {
             ForEach(Array(Self.axisLabels(window: model.window).enumerated()), id: \.offset) { item in
                 Text(item.element)
@@ -333,7 +332,7 @@ struct MeshWindowView: View {
     /// 五个等距刻度。满一天的窗口带上日期。
     ///
     /// 门槛正好压在 24 小时上：一天的窗口分五段，首尾两个刻度的时刻必然相同，只写
-    /// 「22:13」会在轴的两端印出同一个标签；七天的窗口更是五个刻度都可能撞上。
+    /// 「22:13」会在轴的两端印出同一个标签。
     static func axisLabels(window: ClosedRange<Date>, count: Int = 5,
                            locale: Locale = .current) -> [String] {
         let span = window.upperBound.timeIntervalSince(window.lowerBound)
@@ -344,53 +343,5 @@ struct MeshWindowView: View {
             let ratio = Double(step) / Double(max(count - 1, 1))
             return formatter.string(from: window.lowerBound.addingTimeInterval(span * ratio))
         }
-    }
-}
-
-/// 承载 `MeshWindowView` 的普通窗口。
-///
-/// 应用是 `.accessory`，平时没有窗口；这里显式激活一次，否则窗口会开在别的应用后面，
-/// 用户点了「打开」却看不到任何反应。
-final class MeshWindowController: NSObject, NSWindowDelegate {
-    private let mesh: MeshMonitor
-    private let panel: PanelModel
-    private let link: LinkMonitor
-    private let model = MeshWindowModel()
-    private var window: NSWindow?
-
-    init(mesh: MeshMonitor, panel: PanelModel, link: LinkMonitor) {
-        self.mesh = mesh
-        self.panel = panel
-        self.link = link
-        super.init()
-    }
-
-    func show() {
-        // 名册决定窗口里有哪几台，先补一轮，否则刚开机点开是空的
-        mesh.refreshIfStale()
-        if let window {
-            model.load(mesh: mesh)
-            NSApp.activate(ignoringOtherApps: true)
-            window.makeKeyAndOrderFront(nil)
-            return
-        }
-        let hosting = NSHostingController(
-            rootView: MeshWindowView(mesh: mesh, model: model, panel: panel, link: link)
-        )
-        let window = NSWindow(contentViewController: hosting)
-        window.title = tr("Nebula 网络", "Nebula Overlay")
-        window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
-        window.setContentSize(NSSize(width: 860, height: 620))
-        window.center()
-        // 关闭只是收起来：重开时保留窗口位置和已经选好的时间窗口
-        window.isReleasedWhenClosed = false
-        window.delegate = self
-        self.window = window
-        NSApp.activate(ignoringOtherApps: true)
-        window.makeKeyAndOrderFront(nil)
-    }
-
-    func windowWillClose(_ notification: Notification) {
-        Log.user("close nebula overlay window")
     }
 }

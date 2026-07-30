@@ -505,22 +505,22 @@ final class MeshTests: XCTestCase {
     /// 三种缺席要分开说：没配地址、连不上、版本太旧。空图配一句「暂无数据」
     /// 会把它们说成同一件事，而处置方式完全不同。
     func testEachKindOfMissingHistorySaysWhich() {
-        let notice = { MeshWindowView.lighthouseNotice($0, hasSeries: false) }
+        let notice = { MeshDetailView.lighthouseNotice($0, hasSeries: false) }
         XCTAssertNotEqual(notice(.notConfigured), notice(.unreachable))
         XCTAssertNotEqual(notice(.unreachable), notice(.unsupported))
         XCTAssertNotNil(notice(nil), "没有报错但也没有序列，仍要说明")
-        XCTAssertNil(MeshWindowView.lighthouseNotice(nil, hasSeries: true))
+        XCTAssertNil(MeshDetailView.lighthouseNotice(nil, hasSeries: true))
     }
 
     /// 一天的窗口分五段，首尾刻度的时刻必然相同；七天更是五个都可能撞上。
     /// 只写时刻会在轴的两端印出同一个标签，所以满一天就要带日期。
     func testWideWindowsGetDatedAxisLabels() {
         let english = Locale(identifier: "en_US")
-        let hours = MeshWindowView.axisLabels(
+        let hours = MeshDetailView.axisLabels(
             window: base...base.addingTimeInterval(6 * 3_600), locale: english)
-        let day = MeshWindowView.axisLabels(
+        let day = MeshDetailView.axisLabels(
             window: base...base.addingTimeInterval(24 * 3_600), locale: english)
-        let week = MeshWindowView.axisLabels(
+        let week = MeshDetailView.axisLabels(
             window: base...base.addingTimeInterval(7 * 24 * 3_600), locale: english)
         XCTAssertEqual(Set(hours).count, 5, "刻度不能重复")
         XCTAssertEqual(Set(day).count, 5, "刻度不能重复")
@@ -549,5 +549,41 @@ final class MeshTests: XCTestCase {
     func testNeverProbedCountsAsStale() {
         XCTAssertTrue(MeshMonitor.isStale(nil, maxAge: 10))
         XCTAssertTrue(MeshMonitor.isStale(nil, maxAge: 3600))
+    }
+
+    /// 没配地址时不能显示成「lighthouse 不可达」：那句话会让人去查网络，而实际上
+    /// 一次名册请求都还没发出去过。
+    func testMissingLighthouseAddressIsNotReportedAsUnreachable() {
+        let unconfigured = UsagePanelView.meshRosterNotice(configured: false, reachable: false)
+        XCTAssertNotNil(unconfigured)
+        XCTAssertFalse(unconfigured?.contains("不可达") ?? true,
+                       "从没发出过请求，不能说连不上：\(unconfigured ?? "")")
+        XCTAssertEqual(
+            UsagePanelView.meshRosterNotice(configured: false, reachable: true),
+            unconfigured,
+            "没有地址时 reachable 那一位没有意义，说法不该跟着变"
+        )
+        XCTAssertNotEqual(UsagePanelView.meshRosterNotice(configured: true, reachable: false),
+                          unconfigured)
+        XCTAssertNil(UsagePanelView.meshRosterNotice(configured: true, reachable: true),
+                     "一切正常时不该有横幅")
+    }
+
+    /// 地址存在与否要能被视图观察到，横幅才切得回去。
+    @MainActor
+    func testConfiguredFlagFollowsTheLighthouseAddress() {
+        let path = NSTemporaryDirectory() + "elink-mesh-\(UUID().uuidString).db"
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let mesh = MeshMonitor(store: UsageStore(path: path), lighthouseURL: nil)
+        XCTAssertFalse(mesh.configured)
+
+        // 用 discard 端口：reconfigure 会立刻拉一次名册，这个地址秒拒，测试不碰网络
+        mesh.reconfigure(lighthouseURL: MeshMonitor.lighthouseURL(from: "127.0.0.1:9"))
+        XCTAssertTrue(mesh.configured)
+        mesh.stop()
+
+        // 地址被清空后回到「未配置」，横幅不能停在上一次的说法
+        mesh.reconfigure(lighthouseURL: MeshMonitor.lighthouseURL(from: ""))
+        XCTAssertFalse(mesh.configured)
     }
 }

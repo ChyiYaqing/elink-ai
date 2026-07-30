@@ -79,6 +79,9 @@ final class MeshMonitor: ObservableObject {
     }
 
     @Published private(set) var hosts: [MeshHostView] = []
+    /// 有没有一个可用的 lighthouse 地址。没配地址和连不上必须分开：前者要用户去填一个，
+    /// 后者只能等，而「lighthouse 不可达」这一句会把没填地址的人引向排查网络。
+    @Published private(set) var configured: Bool
     /// 一次名册拉取失败后置 false；视图继续用上一次的名册，lighthouse 重启不该让
     /// 整个网格视图变空。
     @Published private(set) var lighthouseReachable = false
@@ -99,6 +102,7 @@ final class MeshMonitor: ObservableObject {
          session: URLSession = .shared) {
         self.store = store
         self.lighthouseURL = lighthouseURL
+        self.configured = lighthouseURL != nil
         self.windowSeconds = windowSeconds
         self.session = session
     }
@@ -113,6 +117,7 @@ final class MeshMonitor: ObservableObject {
             self.lighthouseURL = lighthouseURL
             self.roster = []
         }
+        publishConfigured(lighthouseURL != nil)
         guard lighthouseURL != nil else {
             stop()
             publish(hosts: [], lighthouseReachable: false,
@@ -336,6 +341,13 @@ final class MeshMonitor: ObservableObject {
             self.lighthouseReachable = lighthouseReachable
             self.icmpAvailable = icmpAvailable
             self.updatedAt = now
+        }
+        if Thread.isMainThread { apply() } else { DispatchQueue.main.async(execute: apply) }
+    }
+
+    private func publishConfigured(_ configured: Bool) {
+        let apply: () -> Void = { [weak self] in
+            self?.configured = configured
         }
         if Thread.isMainThread { apply() } else { DispatchQueue.main.async(execute: apply) }
     }

@@ -19,7 +19,7 @@ final class PanelModel: ObservableObject {
     @Published var natUnavailable = false
     @Published var lighthouseURL = ""
     var onSaveLighthouse: ((String) -> Void)?
-    var onOpenMeshWindow: (() -> Void)?
+    @Published var showMesh = false
     @Published var launchAtLogin = false
     @Published var deviceHost = ""
     @Published var bridgeAddress = ""
@@ -100,19 +100,22 @@ struct UsagePanelView: View {
                             AgentSessionsCard(sessions: model.agentSessions, theme: theme)
                         }
                         meshCard(theme)
-                        if model.deviceConnectionEnabled || model.showSettings || model.statsProvider != nil {
+                        if model.deviceConnectionEnabled || overlayVisible {
                             deviceCard(theme)
                         }
                     }
                     .frame(maxWidth: .infinity)
                 }
-                .opacity(model.showSettings || model.statsProvider != nil ? 0 : 1)
-                .allowsHitTesting(!model.showSettings && model.statsProvider == nil)
+                .opacity(overlayVisible ? 0 : 1)
+                .allowsHitTesting(!overlayVisible)
                 if model.showSettings {
                     settingsCard(theme)
                         .transition(.opacity)
                 } else if let provider = model.statsProvider {
                     statsCard(provider, theme)
+                        .transition(.opacity)
+                } else if model.showMesh {
+                    meshDetail(theme)
                         .transition(.opacity)
                 }
             }
@@ -122,6 +125,11 @@ struct UsagePanelView: View {
         .frame(width: 440)
         .frame(maxHeight: model.panelMaxHeight)
         .background(theme.backgroundGradient)
+    }
+
+    /// 设置、用量统计、Nebula 三页互斥，都盖在主列表上。
+    private var overlayVisible: Bool {
+        model.showSettings || model.statsProvider != nil || model.showMesh
     }
 
     private func header(_ theme: PanelTheme) -> some View {
@@ -239,6 +247,13 @@ struct UsagePanelView: View {
             }
         )
         .glassCard(theme)
+    }
+
+    private func meshDetail(_ theme: PanelTheme) -> some View {
+        MeshDetailView(mesh: mesh, panel: model, theme: theme) {
+            Log.user("close nebula overlay")
+            withAnimation(.easeOut(duration: 0.2)) { model.showMesh = false }
+        }
     }
 
     private func settingsCard(_ theme: PanelTheme) -> some View {
@@ -806,13 +821,13 @@ struct UsagePanelView: View {
     /// nebula overlay：每一台有证书的设备，以及本机能到达哪些。
     /// 与多机同步刻意分开——那是另一批机器，回答的是另一个问题。
     ///
-    /// 卡片只回答「现在几台通」，点开进独立窗口看历史。弹窗宽 440pt，减掉边距后一天的
-    /// 时间轴上一个五分钟桶不到半个像素——在这里画历史，等于把它藏起来。
+    /// 卡片只回答「现在几台通」，点开在面板内翻到历史那一页，和点 Claude 卡片进用量
+    /// 统计是同一个动作。
     private func meshCard(_ theme: PanelTheme) -> some View {
         VStack(alignment: .leading, spacing: 0) {
             Button {
-                Log.user("open nebula overlay window")
-                model.onOpenMeshWindow?()
+                Log.user("open nebula overlay")
+                withAnimation(.easeOut(duration: 0.2)) { model.showMesh = true }
             } label: {
                 // 紧凑头部：与主列表里的 Agent 会话、电子纸屏幕保持同一套样式。
                 // settingsHeader 那种 26pt 彩色圆加副标题是设置页的样式，混进来会让
@@ -830,8 +845,8 @@ struct UsagePanelView: View {
                         color: mesh.hosts.isEmpty || mesh.hosts.contains { $0.state != .online }
                             ? theme.statusWarning : theme.statusHealthy
                     )
-                    Image(systemName: "arrow.up.forward.app")
-                        .font(.system(size: 10, weight: .semibold))
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
                         .foregroundStyle(theme.textTertiary)
                 }
                 .padding(.horizontal, 12)
@@ -841,7 +856,7 @@ struct UsagePanelView: View {
             }
             .buttonStyle(.plain)
             .accessibilityLabel(tr("Nebula 网络", "Nebula Overlay"))
-            .accessibilityHint(tr("打开完整的网格窗口", "Opens the full overlay window"))
+            .accessibilityHint(tr("展开完整的网格视图", "Opens the full overlay view"))
 
             VStack(alignment: .leading, spacing: 5) {
                 Text(Self.meshSubtitle(
@@ -856,10 +871,9 @@ struct UsagePanelView: View {
                                   "No ICMP socket: reachability unavailable on this host"),
                                theme: theme)
                 }
-                if !mesh.lighthouseReachable {
-                    meshNotice(tr("lighthouse 不可达，显示的是上一次的名册",
-                                  "Lighthouse unreachable: showing the last known roster"),
-                               theme: theme)
+                if let notice = Self.meshRosterNotice(configured: mesh.configured,
+                                                      reachable: mesh.lighthouseReachable) {
+                    meshNotice(notice, theme: theme)
                 }
             }
             .padding(.horizontal, 12)
@@ -870,6 +884,17 @@ struct UsagePanelView: View {
         .glassCard(theme)
     }
 
+
+    /// 名册缺席的两种原因要分开说：没配地址是「去填一个」，连不上是「只能等，先看旧的」。
+    /// 合成一句「lighthouse 不可达」会把从没发出过请求的情形说成网络故障。
+    static func meshRosterNotice(configured: Bool, reachable: Bool) -> String? {
+        guard configured else {
+            return tr("未配置 lighthouse 地址，取不到设备清单",
+                      "No lighthouse address: no roster to show")
+        }
+        return reachable ? nil : tr("lighthouse 不可达，显示的是上一次的名册",
+                                    "Lighthouse unreachable: showing the last known roster")
+    }
 
     /// 陈旧必须可见。一个 30 秒前的 221ms 和刚测出来的 221ms 长得一模一样，而这块
     /// 面板是用来判断「现在通不通」的——不写出数据年龄，旧数据就会冒充实时数据。
