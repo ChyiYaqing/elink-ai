@@ -6,6 +6,18 @@ and `Removed`.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## 0.1.17-rc6
+
+### Packaging
+
+- Linux releases now include an `amd64` `elink-tui` archive alongside the
+  existing `arm64` archive
+
+### Changed
+
+- Nebula overlay history now opens inside the menu-bar panel instead of a
+  separate window
+
 ## 0.1.17-rc5
 
 ### Added
