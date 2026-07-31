@@ -12,6 +12,7 @@ from threading import Lock
 from PIL import Image
 
 from .base import Display
+from .frame_diff import Rect
 
 
 class Waveshare583V2Display(Display):
@@ -35,21 +36,31 @@ class Waveshare583V2Display(Display):
         self._lock = Lock()
         self._opened = False
 
-    def show(self, image: Image.Image, *, kind: str = "full") -> None:
+    def show(self, image: Image.Image, *, kind: str = "full",
+             regions: tuple[Rect, ...] = ()) -> None:
         if image.size != (self.width, self.height):
             raise ValueError(f"expected {self.width}x{self.height}, got {image.size}")
-        packed = image.convert("1", dither=Image.Dither.NONE).tobytes()
-        if len(packed) != self.width * self.height // 8:
-            raise ValueError("unexpected packed image size")
+        if kind == "region" and not regions:
+            raise ValueError("region refresh requires at least one region")
+        packed = None
+        if kind != "region":
+            packed = image.convert("1", dither=Image.Dither.NONE).tobytes()
+            if len(packed) != self.width * self.height // 8:
+                raise ValueError("unexpected packed image size")
         with self._lock:
             try:
                 self._open()
-                if kind == "partial":
+                if kind == "region":
+                    self._init_partial()
+                    self._display_regions(image, regions)
+                elif kind in {"partial", "fast-full"}:
                     self._init_partial()
                     self._display_partial(packed)
-                else:
+                elif kind == "full":
                     self._init_full()
                     self._display_full(packed)
+                else:
+                    raise ValueError(f"unsupported refresh kind: {kind}")
                 self._sleep()
             finally:
                 self._close_bus()
@@ -115,6 +126,41 @@ class Waveshare583V2Display(Display):
             self._data(value)
         self._command(0x13); self._data_block(packed)
         self._turn_on(); self._command(0x92)
+
+    def _display_regions(self, image: Image.Image, regions: tuple[Rect, ...]) -> None:
+        self._command(0x50); self._data(0xA9); self._data(0x07)
+        self._command(0x91)
+        for region in regions:
+            packed = self._pack_region(image, region)
+            self._command(0x90)
+            x_end = region.right - 1
+            y_end = region.bottom - 1
+            for value in (
+                region.left >> 8, region.left & 0xFF,
+                x_end >> 8, x_end & 0xFF,
+                region.top >> 8, region.top & 0xFF,
+                y_end >> 8, y_end & 0xFF,
+                0x01,
+            ):
+                self._data(value)
+            self._command(0x13)
+            self._data_block(packed)
+        self._turn_on(); self._command(0x92)
+
+    def _pack_region(self, image: Image.Image, region: Rect) -> bytes:
+        if (region.left < 0 or region.top < 0 or region.right > self.width
+                or region.bottom > self.height or region.left >= region.right
+                or region.top >= region.bottom):
+            raise ValueError("region is outside the display or empty")
+        if region.left % 8 or region.right % 8:
+            raise ValueError("region x coordinates must be byte-aligned")
+        packed = image.convert("1", dither=Image.Dither.NONE).crop((
+            region.left, region.top, region.right, region.bottom,
+        )).tobytes()
+        expected = region.width * region.height // 8
+        if len(packed) != expected:
+            raise ValueError("unexpected region payload size")
+        return packed
 
     def _sleep(self) -> None:
         self._command(0x50); self._data(0xF7)

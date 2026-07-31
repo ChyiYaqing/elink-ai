@@ -18,6 +18,11 @@ def test_first_refresh_is_full_then_unchanged_is_skipped():
     assert not policy.decide(value, stale=False, now=200).refresh
 
 
+def test_manual_smart_refresh_is_deferred_to_frame_differ():
+    decision = RefreshPolicy().decide(snapshot(), stale=False, now=100, force="smart")
+    assert decision.refresh and decision.kind == "smart" and decision.reason == "manual"
+
+
 def test_small_percentage_change_is_throttled_but_status_is_priority():
     policy = RefreshPolicy(min_interval_s=30)
     first = snapshot(pct=10)

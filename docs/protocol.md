@@ -46,6 +46,14 @@ lifecycle event arrives.
 - `POST /v1/display/refresh` with `{"kind":"smart|partial|full"}`
 - `PUT /v1/config/bridge` with `{"bridge_url":"http://host:8765"}`
 
+`GET /v1/device` reports the operation that actually reached the panel in
+`last_refresh_kind` (`full`, `fast-full`, or `region`), rather than echoing the
+requested kind. `last_refresh_region_count`, `last_refresh_area`, and
+`last_refresh_reason` describe the selected frame-diff plan. `partial_count`
+counts successful non-full operations. A `smart` request may perform no panel
+operation when the rendered frame is unchanged; `partial` may safely fall back
+to a full operation when there is no trusted displayed-frame baseline.
+
 No endpoint accepts or returns OAuth tokens or raw session logs.
 
 ## Host peer sync protocol v2

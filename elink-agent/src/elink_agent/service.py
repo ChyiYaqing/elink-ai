@@ -15,6 +15,7 @@ from . import __version__
 from .bridge_client import BridgeClient
 from .config import AgentConfig
 from .display.base import Display
+from .display.frame_diff import FrameDiffer, RefreshPlan
 from .models import StatusSnapshot
 from .refresh_policy import RefreshPolicy
 from .renderer import DashboardRenderer
@@ -58,6 +59,9 @@ class RuntimeState:
     last_error: str | None = None
     refresh_error: str | None = None
     stale: bool = True
+    last_refresh_region_count: int = 0
+    last_refresh_area: int = 0
+    last_refresh_reason: str = "none"
 
 
 class AgentService:
@@ -71,6 +75,8 @@ class AgentService:
             full_every=config.full_refresh_every,
             full_interval_s=config.full_refresh_interval_s,
         )
+        self.frame_differ = FrameDiffer(width=display.width, height=display.height)
+        self._displayed_frame = None
         self.snapshot = StatusSnapshot.offline()
         self.runtime = RuntimeState()
         self._lock = threading.RLock()
@@ -102,9 +108,7 @@ class AgentService:
         if kind not in {"smart", "partial", "full"}:
             raise ValueError("refresh must be smart, partial, or full")
         with self._lock:
-            self._force = None if kind == "smart" else kind
-            if kind == "smart":
-                self.policy.last_signature = ""
+            self._force = kind
             self._pending_since = 0.0
             self._request_gen += 1
         self._wake.set()
@@ -149,6 +153,9 @@ class AgentService:
                 "last_fetch_age_s": None if not self.runtime.last_fetch_at else int(now - self.runtime.last_fetch_at),
                 "last_refresh_age_s": None if not self.runtime.last_refresh_at else int(now - self.runtime.last_refresh_at),
                 "last_refresh_kind": self.runtime.last_refresh_kind,
+                "last_refresh_region_count": self.runtime.last_refresh_region_count,
+                "last_refresh_area": self.runtime.last_refresh_area,
+                "last_refresh_reason": self.runtime.last_refresh_reason,
                 "partial_count": self.policy.partial_count,
                 "error": self.runtime.refresh_error or self.runtime.last_error,
             }
@@ -231,13 +238,21 @@ class AgentService:
         )
         if self.config.orientation == 180:
             image = image.rotate(180)
+        plan = self._refresh_plan(kind, image)
+        if plan.kind == "none":
+            with self._lock:
+                self._finish_refresh(marker)
+            logger.info("skipped refresh because the rendered frame is unchanged")
+            return
         try:
-            self.display.show(image, kind=kind)
+            self.display.show(image, kind=plan.kind, regions=plan.regions)
         except Exception as error:
             # 失败时保留 _force/_pending_since，重试窗口到期后同一请求会再次执行
             with self._lock:
                 self.runtime.refresh_error = f"display: {error}"
+                self.runtime.last_refresh_reason = "display-failed-baseline-unknown"
                 self._display_retry_at = time.time() + 60
+                self._displayed_frame = None
             logger.exception("display refresh failed")
             return
         # 屏幕已经刷新成功；预览/状态文件写失败只记错误，照常 record，
@@ -250,9 +265,14 @@ class AgentService:
             logger.exception("preview save failed")
         now_wall = time.time()
         with self._lock:
-            self.policy.record(snapshot, stale=stale, kind=kind)
+            policy_kind = "full" if plan.kind == "full" else "partial"
+            self.policy.record(snapshot, stale=stale, kind=policy_kind)
+            self._displayed_frame = image.copy()
             self.runtime.last_refresh_at = now_wall
-            self.runtime.last_refresh_kind = kind
+            self.runtime.last_refresh_kind = plan.kind
+            self.runtime.last_refresh_region_count = len(plan.regions)
+            self.runtime.last_refresh_area = plan.planned_area
+            self.runtime.last_refresh_reason = plan.reason
             self._display_retry_at = 0.0
             self._finish_refresh(marker)
             try:
@@ -263,7 +283,15 @@ class AgentService:
             self.runtime.refresh_error = save_error
         if save_error:
             logger.warning("refresh succeeded but %s", save_error)
-        logger.info("displayed %s refresh", kind)
+        logger.info("displayed %s refresh", plan.kind)
+
+    def _refresh_plan(self, requested_kind: str, image) -> RefreshPlan:
+        screen_area = self.display.width * self.display.height
+        if requested_kind == "full":
+            return RefreshPlan("full", planned_area=screen_area, reason="requested-full")
+        if requested_kind not in {"partial", "smart"}:
+            raise ValueError(f"unsupported refresh kind: {requested_kind}")
+        return self.frame_differ.plan(self._displayed_frame, image)
 
     def _finish_refresh(self, marker: int) -> None:
         # 刷新期间到达的 set_mode/request_refresh 不能被清掉，保留其失效标记

@@ -4,7 +4,10 @@ import threading
 import time
 from pathlib import Path
 
+from PIL import Image
+
 from elink_agent.config import AgentConfig
+from elink_agent.display.frame_diff import Rect
 from elink_agent.display.mock import MockDisplay
 from elink_agent.models import ProviderStatus, StatusSnapshot
 from elink_agent.service import AgentService
@@ -16,10 +19,10 @@ class BlockingDisplay(MockDisplay):
         self.entered = threading.Event()
         self.release = threading.Event()
 
-    def show(self, image, *, kind: str = "full") -> None:
+    def show(self, image, *, kind: str = "full", regions=()) -> None:
         self.entered.set()
         assert self.release.wait(timeout=10)
-        super().show(image, kind=kind)
+        super().show(image, kind=kind, regions=regions)
 
 
 def test_refresh_writes_preview_and_records_policy():
@@ -67,10 +70,30 @@ def test_api_state_stays_reachable_while_display_refresh_blocks():
 
 
 class FailingBlockingDisplay(BlockingDisplay):
-    def show(self, image, *, kind: str = "full") -> None:
+    def show(self, image, *, kind: str = "full", regions=()) -> None:
         self.entered.set()
         assert self.release.wait(timeout=10)
         raise RuntimeError("panel hung")
+
+
+class FrameRenderer:
+    def __init__(self, image):
+        self.image = image
+
+    def render(self, *_args, **_kwargs):
+        return self.image.copy()
+
+
+class FailOnceDisplay(MockDisplay):
+    def __init__(self, output_path):
+        super().__init__(output_path)
+        self.fail_next = False
+
+    def show(self, image, *, kind: str = "full", regions=()) -> None:
+        if self.fail_next:
+            self.fail_next = False
+            raise RuntimeError("partial transfer failed")
+        super().show(image, kind=kind, regions=regions)
 
 
 def test_identical_refresh_request_during_failed_refresh_is_preserved():
@@ -103,6 +126,62 @@ def test_forced_refresh_survives_display_failure():
         service._refresh("full", False)
         assert service._force == "full"
         assert service._display_retry_at > 0
+
+
+def test_successful_full_then_small_change_uses_region_refresh():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        config = AgentConfig(output_path=root / "frame.png", state_path=root / "state.json")
+        display = MockDisplay(config.output_path)
+        service = AgentService(config, display)
+        first = Image.new("1", (648, 480), 255)
+        service.renderer = FrameRenderer(first)
+        service._refresh("full", False)
+        second = first.copy()
+        second.putpixel((9, 10), 0)
+        service.renderer.image = second
+        service._refresh("partial", False)
+        assert display.calls == ["full", "region"]
+        assert display.region_calls[-1] == (Rect(8, 10, 16, 11),)
+        info = service.device_info()
+        assert info["last_refresh_kind"] == "region"
+        assert info["last_refresh_region_count"] == 1
+        assert info["last_refresh_area"] == 8
+
+
+def test_display_failure_invalidates_baseline_and_next_retry_is_full():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        config = AgentConfig(output_path=root / "frame.png", state_path=root / "state.json")
+        display = FailOnceDisplay(config.output_path)
+        service = AgentService(config, display)
+        first = Image.new("1", (648, 480), 255)
+        service.renderer = FrameRenderer(first)
+        service._refresh("full", False)
+        changed = first.copy()
+        changed.putpixel((9, 10), 0)
+        service.renderer.image = changed
+        display.fail_next = True
+        service._refresh("partial", False)
+        assert service._displayed_frame is None
+        assert service.runtime.last_refresh_reason == "display-failed-baseline-unknown"
+        service._refresh("partial", False)
+        assert display.calls == ["full", "full"]
+        assert service.runtime.last_refresh_reason == "missing-baseline"
+
+
+def test_smart_refresh_skips_an_identical_render_and_finishes_request():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        config = AgentConfig(output_path=root / "frame.png", state_path=root / "state.json")
+        display = MockDisplay(config.output_path)
+        service = AgentService(config, display)
+        service.renderer = FrameRenderer(Image.new("1", (648, 480), 255))
+        service._refresh("full", False)
+        service.request_refresh("smart")
+        service._refresh("smart", False)
+        assert display.calls == ["full"]
+        assert service._force is None
 
 
 class StubClient:

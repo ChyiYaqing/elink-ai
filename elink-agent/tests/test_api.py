@@ -22,6 +22,10 @@ def test_device_api_and_mode_change():
             with urlopen(f"http://127.0.0.1:{port}/v1/device") as response:
                 obj = json.load(response)
             assert obj["device_type"] == "elink-agent"
+            assert obj["last_refresh_kind"] == "none"
+            assert obj["last_refresh_region_count"] == 0
+            assert obj["last_refresh_area"] == 0
+            assert obj["last_refresh_reason"] == "none"
             request = Request(
                 f"http://127.0.0.1:{port}/v1/display/mode",
                 method="POST",
