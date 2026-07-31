@@ -207,6 +207,29 @@ final class LinkProbeTests: XCTestCase {
         XCTAssertFalse(subject.unavailable)
     }
 
+    /// probe 是网络探测不是纯函数，每台服务器一轮只能打一次。
+    /// v0.1.18 用 lazy.compactMap{}.first 求值了两次，第二次赶上丢包就 SIGILL。
+    func testEachServerIsProbedOncePerRound() {
+        let (store, path) = store()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let sample = StunObservation(localPort: 4252, externalAddress: "223.95.78.14",
+                                     externalPort: 4252)
+        var calls: [String] = []
+        var answered = false
+        let subject = monitor(store, servers: ["dead", "flaky"]) { host in
+            calls.append(host)
+            guard host == "flaky" else { return nil }
+            defer { answered = true }
+            return answered ? nil : sample   // 只有第一次成功
+        }
+
+        subject.runOnce(now: epoch)
+
+        XCTAssertEqual(calls, ["dead", "flaky"])
+        XCTAssertEqual(subject.observation, sample)
+        XCTAssertFalse(subject.unavailable)
+    }
+
     /// 全部失败必须显式降级并记一次，但持续故障不能反复刷事件
     func testTotalFailureDegradesOnceAndRecovers() {
         let (store, path) = store()

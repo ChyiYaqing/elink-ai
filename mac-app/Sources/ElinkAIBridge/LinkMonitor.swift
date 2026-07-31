@@ -54,8 +54,15 @@ final class LinkMonitor: ObservableObject {
     /// 依次尝试每台服务器，第一个成功的即采用。
     /// 单台 STUN 服务器不可用不能让整条判据失效，这是它配多台的唯一原因。
     func runOnce(now: Date = Date()) {
-        let current = servers.lazy.compactMap { self.probe($0) }.first
-        guard let current else {
+        // 必须是显式循环：lazy 集合的 first 会先算 startIndex 再取下标，对同一台
+        // 服务器求值两次。probe 是网络探测不是纯函数，两次之间抖动一下就会让
+        // compactMap 的强制解包碰上 nil 并直接 SIGILL。
+        var probed: StunObservation?
+        for server in servers {
+            probed = probe(server)
+            if probed != nil { break }
+        }
+        guard let current = probed else {
             recordUnavailable(at: now)
             return
         }
