@@ -770,4 +770,38 @@ final class ClusterTests: XCTestCase {
             190
         )
     }
+
+    /// 升级重启后如果这台机器当天不再产生用量，`recordHourly` 的「无变化就回滚」守卫
+    /// 会一直挡着，它今天已有的小时分布就永远镜像不出去——别人看得到它的天级用量，
+    /// 却看不到今日分布。组集群的那一刻要把本地小时行补进去。
+    func testConfiguringTheClusterSeedsExistingLocalHours() {
+        let (store, path) = store()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        // 采集发生在组集群之前，且此后不再变化
+        store.record(day: "2026-07-31", provider: "claude", models: ["opus": 140],
+                     expectedBucketTimeZone: nil)
+        store.recordHourly(day: "2026-07-31", provider: "claude",
+                           hours: [9: ["opus": 100], 10: ["opus": 40]],
+                           expectedBucketTimeZone: nil)
+        store.recordHourly(day: "2026-07-31", provider: "codex", hours: [9: ["gpt-5": 7]],
+                           expectedBucketTimeZone: nil)
+
+        store.configureClusterStorage(nodeID: "node-a", nodeName: "Mac A", aggregationEnabled: true)
+
+        let key = ClusterSnapshotKey(originNodeID: "node-a", day: "2026-07-31", provider: "claude")
+        let snapshot = store.clusterSnapshots(keys: [key]).first
+        XCTAssertEqual(snapshot?.hours?["9"], ["opus": 100], "对端拉到的快照要带上小时分布")
+        XCTAssertEqual(snapshot?.hours?["10"], ["opus": 40])
+        // 直接查集群表：hourlyUsage 有「本机缺席就用本地表补」的回退，会掩盖没补种的情况
+        XCTAssertEqual(
+            store.clusterHourlyUsage(provider: "codex", day: "2026-07-31")
+                .reduce(0) { $0 + $1.tokens },
+            7, "另一个 provider 的小时行同样要补种"
+        )
+        XCTAssertEqual(
+            Set(store.clusterHourlyUsage(provider: "claude", day: "2026-07-31")
+                .compactMap(\.nodeID)),
+            ["node-a"]
+        )
+    }
 }

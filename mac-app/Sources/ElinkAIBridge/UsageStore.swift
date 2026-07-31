@@ -1137,6 +1137,7 @@ final class UsageStore {
                 lastSeenAt: Date(),
                 lastSyncAt: nil
             ))
+            seedClusterHourlyLocked(nodeID: nodeID)
             guard snapshotCountLocked(originNodeID: nodeID) == 0 else { return }
             let sql = """
             SELECT day, provider, model, tokens
@@ -1164,6 +1165,47 @@ final class UsageStore {
                 ), requireNewer: true)
             }
         }
+    }
+
+    /// 把本地小时行补写进集群表。须在 queue 内调用。
+    ///
+    /// 集群表里的这一份是本地表的派生缓存，平时由 `recordHourly` 顺带维护。但那条路
+    /// 上有一道「数据没变化就回滚」的守卫——它挡的是 5 分钟一次的采集把统计页刷得
+    /// 乱跳——于是刚升级完、当天又不再产生用量的机器，它今天已有的小时分布永远不会
+    /// 被镜像出去：别人看得到它的天级用量，却看不到它今日的分布。
+    ///
+    /// 组集群的这一刻正好覆盖两种时机：升级重启，以及第一次配对。整张本地表也就
+    /// 几十行，重算一遍比判断「哪几天需要补」更省事，也更难写错。
+    private func seedClusterHourlyLocked(nodeID: String) {
+        let sql = """
+        SELECT day, hour, provider, model, tokens FROM hourly_model_usage
+        ORDER BY day, provider, hour, model
+        """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return }
+        var grouped: [String: [String: [String: Int]]] = [:]
+        while sqlite3_step(statement) == SQLITE_ROW,
+              let day = sqlite3_column_text(statement, 0),
+              let provider = sqlite3_column_text(statement, 2),
+              let model = sqlite3_column_text(statement, 3) {
+            let key = "\(String(cString: day))\u{1f}\(String(cString: provider))"
+            let hour = String(sqlite3_column_int64(statement, 1))
+            grouped[key, default: [:]][hour, default: [:]][String(cString: model)]
+                = Int(sqlite3_column_int64(statement, 4))
+        }
+        sqlite3_finalize(statement)
+        guard !grouped.isEmpty,
+              sqlite3_exec(db, "BEGIN IMMEDIATE", nil, nil, nil) == SQLITE_OK else { return }
+        var succeeded = true
+        for (compound, hours) in grouped {
+            let parts = compound.split(separator: "\u{1f}", maxSplits: 1).map(String.init)
+            guard parts.count == 2 else { continue }
+            succeeded = replaceClusterHourlyLocked(
+                nodeID: nodeID, day: parts[0], provider: parts[1], hours: hours
+            )
+            if !succeeded { break }
+        }
+        _ = finishTransactionLocked(succeeded)
     }
 
     func setClusterAggregationEnabled(_ enabled: Bool) {
