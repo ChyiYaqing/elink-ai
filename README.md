@@ -43,12 +43,13 @@ The editable source is [docs/architecture.drawio](docs/architecture.drawio)
 </p>
 
 Each provider card opens stacked bar charts with day/week/month/year ranges.
-The day range shows today's hour-by-hour token distribution (24 bars, local to
-this host); hovering a bar reveals the per-model breakdown for that hour, day,
-or month. A token-categories section splits the selected range into input,
-output, cache read, cache write, and reasoning tokens with a proportion bar
-and per-category percentages (collected locally from the day the feature is
-enabled).
+The day range shows today's hour-by-hour token distribution (24 bars);
+hovering a bar reveals the per-model breakdown for that hour, day, or month.
+Every range can be filtered to one host and ends with a per-device share, each
+host keeping its own colour across ranges and across machines. A
+token-categories section splits the selected range into input, output, cache
+read, cache write, and reasoning tokens with a proportion bar and per-category
+percentages (collected locally from the day the feature is enabled).
 
 ## Current scope
 
@@ -130,7 +131,10 @@ If both hosts accidentally created separate one-node clusters, use “Join Anoth
 Cluster” on either host; entering all six digits submits pairing automatically
 and keeps that host's local usage history.
 
-Each host keeps the latest per-node daily/model snapshots. The dashboard and
+Each host keeps the latest per-node daily/model snapshots, each carrying that
+day's hour-by-hour distribution so the day range can also be split by host.
+Hosts running an older version keep syncing; they simply contribute no hourly
+detail, which is reported as unknown rather than as zero. The dashboard and
 `/v1/status` return the cluster-wide sum, while quota windows use the freshest
 observation because quota percentages are account-level values and must not be
 added together. Pairing and sync never transfer OAuth credentials or raw logs.
