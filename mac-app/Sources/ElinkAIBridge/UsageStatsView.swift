@@ -201,6 +201,19 @@ enum UsageStats {
         Color(red: 0.83, green: 0.35, blue: 0.53), // 玫红
     ]
 
+    /// 设备占比区块的显示条件。
+    ///
+    /// 只要在集群里、又没有筛到单台，就给出占比，哪怕只有一台有用量。以前还要求
+    /// 「至少两台有数据」，于是 Codex 这种只有一台在用的 provider 整块消失，而
+    /// 「数据源」筛选器仍然显示——页面一边说这是多机环境，一边不给分布，读者只能
+    /// 猜是坏了还是真没有。一张 100% 的卡片是个明确回答：其余机器没用过。
+    ///
+    /// 筛到单台时不显示：那时候占比只会是 100%，是同义反复。
+    static func showsDeviceShare(clusterNodes: Int, filteredToOneHost: Bool,
+                                 devicesWithUsage: Int) -> Bool {
+        clusterNodes > 1 && !filteredToOneHost && devicesWithUsage > 0
+    }
+
     /// 集群成员各自的身份色，按 nodeID 排序后依次取色。
     ///
     /// 先试过按 nodeID 哈希取色，实测四台机器里有三台撞成同一个颜色——6 个色位下
@@ -282,8 +295,11 @@ struct UsageStatsView: View {
                         detail(buckets: buckets, order: order, colors: colors)
                         categorySection(
                             UsageStats.categoryTotals(rows: categoryRows, range: range))
-                        if clusterNodes.count > 1, effectiveNodeID == nil,
-                           rangeDevices.count > 1 {
+                        if UsageStats.showsDeviceShare(
+                            clusterNodes: clusterNodes.count,
+                            filteredToOneHost: effectiveNodeID != nil,
+                            devicesWithUsage: rangeDevices.count
+                        ) {
                             deviceSection(devices: devices, order: order, colors: colors,
                                           heading: deviceHeading(buckets))
                         }

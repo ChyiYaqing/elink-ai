@@ -386,6 +386,30 @@ final class UsagePanelViewTests: XCTestCase {
                        UsageStats.fallbackDeviceColor("stranger"))
         XCTAssertEqual(UsageStats.fallbackDeviceColor(nil), UsageStats.devicePalette[0])
     }
+
+    /// Codex 常常只有一台机器在用。以前要求「至少两台有数据」，于是这一块整个消失，
+    /// 而「数据源」筛选器还在——页面一边说这是多机环境一边不给分布。一张 100% 的
+    /// 卡片是明确回答：其余机器没用过。
+    func testDeviceShareAppearsEvenWhenOnlyOneHostHasUsage() {
+        XCTAssertTrue(UsageStats.showsDeviceShare(
+            clusterNodes: 2, filteredToOneHost: false, devicesWithUsage: 1
+        ), "只有一台有用量也要显示，这正是 Codex 的常态")
+        XCTAssertTrue(UsageStats.showsDeviceShare(
+            clusterNodes: 2, filteredToOneHost: false, devicesWithUsage: 2
+        ))
+        // 没组集群时没有「别的机器」可言
+        XCTAssertFalse(UsageStats.showsDeviceShare(
+            clusterNodes: 1, filteredToOneHost: false, devicesWithUsage: 1
+        ))
+        // 已经筛到单台，占比只会是 100%，是同义反复
+        XCTAssertFalse(UsageStats.showsDeviceShare(
+            clusterNodes: 2, filteredToOneHost: true, devicesWithUsage: 1
+        ))
+        // 该时段谁都没用过，空区块没有意义
+        XCTAssertFalse(UsageStats.showsDeviceShare(
+            clusterNodes: 2, filteredToOneHost: false, devicesWithUsage: 0
+        ))
+    }
 }
 
 private extension NSView {
