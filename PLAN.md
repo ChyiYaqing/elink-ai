@@ -316,7 +316,7 @@ A 的已知代价是「VPS 以零 token 节点混进用量聚合」。实现时�
 journal_unit = "nebula"        # 走 journalctl -u nebula
 # log_file = "/var/log/nebula.log"   # 或直接读文件，优先级更高
 default_port = 4242
-listen = "0.0.0.0:8767"
+listen = "192.168.100.200:8767"   # 绑 overlay 地址；这份文档不能对公网开放
 interval_s = 60
 ```
 

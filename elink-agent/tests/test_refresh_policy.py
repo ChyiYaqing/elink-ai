@@ -72,3 +72,19 @@ def test_reset_minutes_are_grouped_in_five_minute_buckets():
     assert not policy.decide(second, stale=False, now=200).refresh
     second.claude.primary_reset_min = 24
     assert policy.decide(second, stale=False, now=200).refresh
+
+
+def test_manual_refresh_still_obeys_the_minimum_interval():
+    """刷新端点没有鉴权。绕过最小间隔就意味着局域网上任何人都能不停驱动墨水屏。"""
+    policy = RefreshPolicy(min_interval_s=30, full_every=20)
+    value = snapshot()
+    first = policy.decide(value, stale=False, now=100, force="full")
+    assert first.refresh and first.reason == "manual"
+    policy.record(value, stale=False, kind="full", now=100)
+
+    throttled = policy.decide(value, stale=False, now=110, force="full")
+    assert not throttled.refresh and throttled.reason == "throttled"
+
+    # 请求不会被丢掉：调用方保留 force，窗口一到同一个请求就执行
+    later = policy.decide(value, stale=False, now=131, force="full")
+    assert later.refresh and later.kind == "full"

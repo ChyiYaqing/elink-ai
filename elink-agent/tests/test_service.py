@@ -286,3 +286,92 @@ def test_persisted_bridge_url_applies_without_env_override():
         config = AgentConfig(output_path=root / "frame.png", state_path=state_path)
         service = AgentService(config, MockDisplay(config.output_path))
         assert service.config.bridge_url == "http://persisted:8765"
+
+
+def test_remote_bridge_url_must_be_private():
+    """无鉴权的端点改的是一个 root 进程反复请求的地址：不限目标就是持久化盲 SSRF。"""
+    import pytest
+
+    from elink_agent.service import require_private_bridge
+
+    for allowed in [
+        "http://192.168.1.50:8765",
+        "http://10.1.9.16:8765",
+        "http://127.0.0.1:8765",
+        "http://elink.local:8765",
+    ]:
+        require_private_bridge(allowed)
+
+    for rejected in [
+        "http://93.184.216.34:8765",          # 公网地址
+        "http://169.254.169.254/latest/meta", # 云元数据服务
+        "http://attacker.example.com:8765",   # 任意主机名
+        "file:///etc/passwd",                 # 非 HTTP scheme
+        "http:///v1/status",                  # 没有主机
+    ]:
+        with pytest.raises(ValueError):
+            require_private_bridge(rejected)
+
+
+def test_bridge_client_refuses_redirects_and_huge_bodies():
+    """跟随重定向会让「必须是私有地址」这条检查作废：私有地址回一个 302 就走了。"""
+    import http.server
+    import json as _json
+    import threading
+
+    from elink_agent.bridge_client import MAX_STATUS_BYTES, BridgeClient
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path.startswith("/v1/status"):
+                self.send_response(302)
+                self.send_header("Location", "http://169.254.169.254/latest/meta-data/")
+                self.end_headers()
+                return
+            self.send_response(404)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        client = BridgeClient(f"http://127.0.0.1:{server.server_address[1]}")
+        try:
+            client.fetch_status()
+        except OSError as error:
+            assert "302" in str(error)
+        else:
+            raise AssertionError("重定向必须被拒绝")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    class Fat(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = _json.dumps({"claude": {}, "pad": "x" * (MAX_STATUS_BYTES + 10)}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    fat = http.server.HTTPServer(("127.0.0.1", 0), Fat)
+    fat_thread = threading.Thread(target=fat.serve_forever, daemon=True)
+    fat_thread.start()
+    try:
+        client = BridgeClient(f"http://127.0.0.1:{fat.server_address[1]}")
+        try:
+            client.fetch_status()
+        except OSError as error:
+            assert "too large" in str(error)
+        else:
+            raise AssertionError("超长响应必须被拒绝")
+    finally:
+        fat.shutdown()
+        fat.server_close()

@@ -7,7 +7,9 @@
   <array><string>/Applications/ElinkAIBridge.app/Contents/MacOS/ElinkAIBridge</string></array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>/tmp/elink-ai-bridge.log</string>
-  <key>StandardErrorPath</key><string>/tmp/elink-ai-bridge.log</string>
+  <!-- 换成你自己的用户名。不要写 /tmp：那是所有本地账户共享的目录，另一个账户
+       可以先在这个固定名字上放一个符号链接，把日志引到别处去。 -->
+  <key>StandardOutPath</key><string>/Users/YOUR-USERNAME/Library/Logs/Elink AI/elink-ai-console.log</string>
+  <key>StandardErrorPath</key><string>/Users/YOUR-USERNAME/Library/Logs/Elink AI/elink-ai-console.log</string>
 </dict>
 </plist>

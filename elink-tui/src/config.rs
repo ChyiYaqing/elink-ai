@@ -287,16 +287,17 @@ impl Config {
                                 unit: unit.to_string(),
                             })
                     });
+                let self_overlay = lighthouse.self_overlay.filter(|value| !value.is_empty());
                 source.map(|source| LighthouseConfig {
                     source,
                     default_port: lighthouse.default_port.unwrap_or(4242),
                     listen: lighthouse
                         .listen
                         .filter(|value| !value.is_empty())
-                        .unwrap_or_else(|| "0.0.0.0:8767".to_string()),
+                        .unwrap_or_else(|| default_listen(self_overlay.as_deref())),
                     interval: Duration::from_secs(lighthouse.interval_s.unwrap_or(60).max(5)),
                     self_name: lighthouse.self_name.filter(|value| !value.is_empty()),
-                    self_overlay: lighthouse.self_overlay.filter(|value| !value.is_empty()),
+                    self_overlay,
                 })
             },
             mesh: file
@@ -314,11 +315,49 @@ impl Config {
     }
 }
 
+/// Where the lighthouse listens when the config does not say.
+///
+/// The roster names every node, its overlay address, and its WAN mapping, and it
+/// is served as plaintext HTTP with no authentication. The only thing keeping
+/// that document private is the address it is bound to, so the default must not
+/// be `0.0.0.0` — a lighthouse runs on a public VPS as often as not, and a
+/// default that publishes the network topology to the internet is a default that
+/// is wrong in exactly the deployment it is most likely to meet.
+///
+/// `self_overlay` is the overlay address of this very host, so binding to it
+/// serves every node on the VPN and nobody else. Without it there is nothing
+/// safe to guess: loopback keeps the document private and makes the missing
+/// configuration obvious the first time another node asks for it.
+fn default_listen(self_overlay: Option<&str>) -> String {
+    match self_overlay {
+        Some(overlay) => format!("{overlay}:8767"),
+        None => "127.0.0.1:8767".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+
+    /// The roster is unauthenticated plaintext listing every node and its WAN
+    /// address; a wildcard default publishes it to whatever the host is exposed
+    /// to, which for a VPS is the internet.
+    #[test]
+    fn lighthouse_never_defaults_to_a_wildcard_address() {
+        assert_eq!(
+            default_listen(Some("192.168.100.200")),
+            "192.168.100.200:8767"
+        );
+        assert_eq!(default_listen(None), "127.0.0.1:8767");
+        for listen in [default_listen(Some("192.168.100.200")), default_listen(None)] {
+            assert!(
+                !listen.starts_with("0.0.0.0") && !listen.starts_with("[::]"),
+                "default must not be a wildcard: {listen}"
+            );
+        }
+    }
 
     #[test]
     fn rejects_invalid_status_poll_intervals() {

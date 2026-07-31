@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import threading
@@ -8,6 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from . import __version__
 from .bridge_client import BridgeClient
@@ -18,6 +20,32 @@ from .refresh_policy import RefreshPolicy
 from .renderer import DashboardRenderer
 
 logger = logging.getLogger(__name__)
+
+
+def require_private_bridge(bridge_url: str) -> None:
+    """远程设置的桥接地址只能指向私有网络。
+
+    公网地址、云厂商元数据地址（169.254.169.254）和任意主机名都拒绝：这个端点
+    无鉴权，接受什么就等于把 root 进程的 HTTP 客户端交给谁。配置文件里的地址不走
+    这条路——那是本机信任的输入。
+    """
+    parts = urlsplit(bridge_url)
+    if parts.scheme not in {"http", "https"}:
+        raise ValueError("bridge_url must be http or https")
+    host = parts.hostname
+    if not host:
+        raise ValueError("bridge_url must name a host")
+    if host == "localhost" or host.endswith(".local"):
+        return
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError as error:
+        raise ValueError("bridge_url must be a private address") from error
+    if not (address.is_private or address.is_loopback):
+        raise ValueError("bridge_url must be a private address")
+    if address.is_link_local:
+        # 169.254.169.254 是云元数据服务；link-local 段整体没有理由成为桥接方
+        raise ValueError("bridge_url must not be link-local")
 
 
 @dataclass(slots=True)
@@ -96,6 +124,10 @@ class AgentService:
     def set_bridge(self, bridge_url: str) -> None:
         if not bridge_url.startswith(("http://", "https://")):
             bridge_url = "http://" + bridge_url
+        # 这个端点没有鉴权，改的又是一个 root 进程反复请求的地址。不限制目标，
+        # 局域网上任何人都能把它指向任意主机——那是一个持久化的盲 SSRF 原语。
+        # 桥接方只可能在本机或同一个局域网/overlay 上，所以只接受私有地址。
+        require_private_bridge(bridge_url)
         with self._lock:
             self.config.bridge_url = bridge_url.rstrip("/")
             self.client = BridgeClient(self.config.bridge_url, self.config.request_timeout_s)

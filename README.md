@@ -165,7 +165,9 @@ Before tagging a release, add a matching `## X.Y.Z` section to
 as the GitHub Release body.
 
 After copying it to `/Applications`, the example LaunchAgent in `install/` can
-start it at login.
+start it at login. Replace `YOUR-USERNAME` in its two log paths first: they must
+stay under your own `~/Library/Logs`, because a fixed name in the shared `/tmp`
+can be symlinked by any other local account before the agent opens it.
 
 Claude hooks can be merged without replacing existing settings:
 

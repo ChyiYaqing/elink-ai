@@ -30,7 +30,12 @@ class RefreshPolicy:
     def decide(self, snapshot: StatusSnapshot, *, stale: bool, now: float | None = None,
                force: str | None = None) -> RefreshDecision:
         now = time.monotonic() if now is None else now
-        if force in {"full", "partial"}:
+        if force in {"full", "partial", "smart"}:
+            # 手动刷新同样要过最小间隔。这个端点没有鉴权，局域网上任何人都能调，
+            # 而绕过间隔就意味着可以不停地驱动墨水屏硬件。请求不会被丢掉：调用方
+            # 保留着 force，窗口一到同一个请求就会执行，最坏情况是慢一个间隔。
+            if self.last_refresh_at and now - self.last_refresh_at < self.min_interval_s:
+                return RefreshDecision(False, reason="throttled")
             return RefreshDecision(True, force, "manual")
         signature = self._signature(snapshot, stale)
         priority = self._priority_signature(snapshot, stale)
