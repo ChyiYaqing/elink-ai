@@ -198,6 +198,9 @@ struct UsageStatsView: View {
     let accent: Color
     let theme: PanelTheme
     let clusterNodes: [ClusterNodeRecord]
+    /// 默认是全局那一份。可注入是为了测试：渲染这个视图会读库，用共享实例就等于让
+    /// 测试去开用户的真实数据库——读是小事，建表和写入不是。
+    var store: UsageStore = .shared
     let onBack: () -> Void
 
     @State private var range: StatsRange = .week
@@ -631,9 +634,9 @@ struct UsageStatsView: View {
         let today = StatusService.dayKey(Date())
         // 集群启用时 usage() 返回全节点带 nodeID 的行，节点筛选在内存中完成
         DispatchQueue.global(qos: .userInitiated).async {
-            let result = UsageStore.shared.usage(provider: provider, since: since)
-            let hourly = UsageStore.shared.hourlyUsage(provider: provider, day: today)
-            let categories = UsageStore.shared.categoryUsage(provider: provider, since: since)
+            let result = store.usage(provider: provider, since: since)
+            let hourly = store.hourlyUsage(provider: provider, day: today)
+            let categories = store.categoryUsage(provider: provider, since: since)
             DispatchQueue.main.async {
                 rows = result
                 hourlyRows = hourly

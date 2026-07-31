@@ -117,7 +117,7 @@ final class UsagePanelViewTests: XCTestCase {
             model: model,
             updater: UpdateChecker(currentVersion: "0.1.17-rc7"),
             cluster: cluster,
-            mesh: MeshMonitor(store: UsageStore.shared, lighthouseURL: nil)
+            mesh: MeshMonitor(store: store, lighthouseURL: nil)
         )
         let host = NSHostingView(rootView: view)
         let size = host.fittingSize
@@ -131,6 +131,9 @@ final class UsagePanelViewTests: XCTestCase {
     @MainActor
     func testEnglishStatsRangePickerFitsNarrowCard() throws {
         UserDefaults.standard.set(AppLanguage.english.rawValue, forKey: AppLanguage.defaultsKey)
+        // 渲染会读库：注入临时库，测试不碰用户的真实数据库
+        let path = NSTemporaryDirectory() + "elink-stats-\(UUID().uuidString).db"
+        defer { try? FileManager.default.removeItem(atPath: path) }
         let view = UsageStatsView(
             provider: "codex",
             title: "Codex",
@@ -138,6 +141,7 @@ final class UsagePanelViewTests: XCTestCase {
             accent: PanelTheme.codexColor(dark: false),
             theme: PanelTheme(.light),
             clusterNodes: [],
+            store: UsageStore(path: path),
             onBack: {}
         )
         let host = NSHostingView(rootView: view)
@@ -191,7 +195,7 @@ final class UsagePanelViewTests: XCTestCase {
             model: model,
             updater: UpdateChecker(currentVersion: "0.1.17-rc7"),
             cluster: cluster,
-            mesh: MeshMonitor(store: UsageStore.shared, lighthouseURL: nil),
+            mesh: MeshMonitor(store: store, lighthouseURL: nil),
             initialDeviceSettingsExpanded: expanded
         )
         let host = NSHostingView(rootView: view)
@@ -222,7 +226,7 @@ final class UsagePanelViewTests: XCTestCase {
             model: model,
             updater: UpdateChecker(currentVersion: "0.1.17-rc7"),
             cluster: cluster,
-            mesh: MeshMonitor(store: UsageStore.shared, lighthouseURL: nil)
+            mesh: MeshMonitor(store: store, lighthouseURL: nil)
         )
         let host = NSHostingView(rootView: view)
         host.frame = NSRect(x: 0, y: 0, width: 440, height: 900)
@@ -260,7 +264,7 @@ final class UsagePanelViewTests: XCTestCase {
             model: model,
             updater: UpdateChecker(currentVersion: "0.1.17-rc7"),
             cluster: cluster,
-            mesh: MeshMonitor(store: UsageStore.shared, lighthouseURL: nil),
+            mesh: MeshMonitor(store: store, lighthouseURL: nil),
             initialClusterExpanded: true
         )
         let host = NSHostingView(rootView: view)
@@ -339,7 +343,7 @@ final class UsagePanelViewTests: XCTestCase {
                 model: model,
                 updater: UpdateChecker(currentVersion: "0.1.17-rc7"),
                 cluster: cluster,
-                mesh: MeshMonitor(store: UsageStore.shared, lighthouseURL: nil),
+                mesh: MeshMonitor(store: store, lighthouseURL: nil),
                 initialClusterExpanded: true,
                 initialExpandedNodeID: expandedNodeID
             )
