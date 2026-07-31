@@ -189,6 +189,46 @@ enum UsageStats {
             ($0.element, palette[$0.offset % palette.count])
         })
     }
+
+    /// 设备身份色。与模型配色分开：条形和图例点按模型着色，这一套只用在设备的图标
+    /// 和占比徽章上，两者落在不同的视觉位置，不会互相冒充。
+    static let devicePalette: [Color] = [
+        Color(red: 0.35, green: 0.47, blue: 0.93), // 靛蓝
+        Color(red: 0.16, green: 0.68, blue: 0.60), // 松绿
+        Color(red: 0.86, green: 0.45, blue: 0.16), // 赭橙
+        Color(red: 0.72, green: 0.33, blue: 0.82), // 紫罗兰
+        Color(red: 0.22, green: 0.60, blue: 0.86), // 天蓝
+        Color(red: 0.83, green: 0.35, blue: 0.53), // 玫红
+    ]
+
+    /// 集群成员各自的身份色，按 nodeID 排序后依次取色。
+    ///
+    /// 先试过按 nodeID 哈希取色，实测四台机器里有三台撞成同一个颜色——6 个色位下
+    /// 四台不撞的概率只有 28%，而「区分设备」正是这套颜色存在的理由。按排序位置分配
+    /// 则在 6 台以内保证互不相同，且每台主机排出来的顺序一样，跨屏对照仍然成立。
+    ///
+    /// 代价是新增一台设备可能让排在它后面的颜色整体后移。成员变化是低频事件，
+    /// 换来的是同一屏上永远不撞色。
+    ///
+    /// 取的是集群花名册而不是当前有用量的那几台：否则切一次时间范围，某台没用量的
+    /// 设备一消失，剩下的颜色就会重排。
+    static func deviceColors(for nodeIDs: [String]) -> [String: Color] {
+        let ordered = Set(nodeIDs.filter { !$0.isEmpty }).sorted()
+        return Dictionary(uniqueKeysWithValues: ordered.enumerated().map {
+            ($0.element, devicePalette[$0.offset % devicePalette.count])
+        })
+    }
+
+    /// 花名册之外的来源（尚未同步到的节点、无来源标记的本地行）落到哈希上：不保证
+    /// 与别人不撞，但至少同一台设备每次都是同一个颜色。
+    static func fallbackDeviceColor(_ nodeID: String?) -> Color {
+        guard let nodeID, !nodeID.isEmpty else { return devicePalette[0] }
+        var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+        for byte in nodeID.utf8 {
+            hash = (hash ^ UInt64(byte)) &* 0x0000_0100_0000_01b3
+        }
+        return devicePalette[Int(hash % UInt64(devicePalette.count))]
+    }
 }
 
 struct UsageStatsView: View {
@@ -533,6 +573,7 @@ struct UsageStatsView: View {
     private func deviceSection(devices: [DeviceUsage], order: [String],
                                colors: [String: Color], heading: String) -> some View {
         let total = devices.reduce(0) { $0 + $1.total }
+        let identities = UsageStats.deviceColors(for: clusterNodes.map(\.nodeID))
         return VStack(alignment: .leading, spacing: 6) {
             Text(heading)
                 .font(.system(size: 9, weight: .semibold))
@@ -543,19 +584,24 @@ struct UsageStatsView: View {
                     .foregroundStyle(theme.textTertiary)
             }
             ForEach(devices) { device in
-                deviceCard(device, order: order, colors: colors, clusterTotal: total)
+                deviceCard(device, order: order, colors: colors, clusterTotal: total,
+                           identity: device.nodeID.flatMap { identities[$0] }
+                               ?? UsageStats.fallbackDeviceColor(device.nodeID))
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
+    /// 每台设备一个身份色。原本图标和徽章都用 provider 的强调色，于是同一屏上的
+    /// 几台机器长得一模一样，只能靠读名字区分。
     private func deviceCard(_ device: DeviceUsage, order: [String],
-                            colors: [String: Color], clusterTotal: Int) -> some View {
+                            colors: [String: Color], clusterTotal: Int,
+                            identity: Color) -> some View {
         VStack(alignment: .leading, spacing: 5) {
             HStack(spacing: 6) {
                 Image(systemName: "laptopcomputer")
                     .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(accent)
+                    .foregroundStyle(identity)
                 Text(deviceName(device.nodeID))
                     .font(.system(size: 10, weight: .bold, design: .rounded))
                     .foregroundStyle(theme.textPrimary)
@@ -567,10 +613,10 @@ struct UsageStatsView: View {
                     .foregroundStyle(theme.textSecondary)
                 Text(Self.percentText(device.total, of: clusterTotal))
                     .font(.system(size: 9, weight: .bold, design: .monospaced))
-                    .foregroundStyle(accent)
+                    .foregroundStyle(identity)
                     .padding(.horizontal, 5)
                     .padding(.vertical, 1)
-                    .background(Capsule().fill(accent.opacity(theme.dark ? 0.22 : 0.12)))
+                    .background(Capsule().fill(identity.opacity(theme.dark ? 0.22 : 0.12)))
             }
             // 迷你比例条：按模型着色，与上方模型图例配色一致
             GeometryReader { geo in

@@ -360,6 +360,32 @@ final class UsagePanelViewTests: XCTestCase {
                        clusterCardHeight(expandedNodeID: nil),
                        "只有被点击的节点会展开")
     }
+
+    /// 这套颜色存在的理由就是「同一屏上分得开」。先试过按 nodeID 哈希取色，实测
+    /// 四台机器里三台撞成同一个颜色——6 个色位下四台不撞的概率只有 28%。
+    func testEveryClusterMemberGetsADistinctColor() {
+        let nodes = [
+            "8469bfa8-c559-4a3b-8760-f7a594ca2ae8", // MacBook Air
+            "68aac07c-8e0d-4450-9e56-1434d18affed", // Mac mini
+            "b3b60b6b-56c2-4183-85f5-d568f070373e", // iMac
+            "fb4beca5-6318-48c1-8382-ba2fa371a9a4", // 3BP
+        ]
+        let colors = UsageStats.deviceColors(for: nodes)
+        XCTAssertEqual(colors.count, nodes.count)
+        XCTAssertEqual(Set(colors.values).count, nodes.count, "四台设备必须四个颜色")
+
+        // 传入顺序不影响分配：每台主机排出来的结果要一致，跨屏对照才成立
+        XCTAssertEqual(UsageStats.deviceColors(for: nodes.reversed()), colors)
+        XCTAssertEqual(UsageStats.deviceColors(for: nodes + nodes), colors, "重复项不占色位")
+        for color in colors.values {
+            XCTAssertTrue(UsageStats.devicePalette.contains(color))
+        }
+
+        // 花名册之外的来源仍要有个稳定颜色，而不是每次重绘都在变
+        XCTAssertEqual(UsageStats.fallbackDeviceColor("stranger"),
+                       UsageStats.fallbackDeviceColor("stranger"))
+        XCTAssertEqual(UsageStats.fallbackDeviceColor(nil), UsageStats.devicePalette[0])
+    }
 }
 
 private extension NSView {
