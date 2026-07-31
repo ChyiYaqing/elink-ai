@@ -670,4 +670,104 @@ final class ClusterTests: XCTestCase {
         XCTAssertEqual(preferred.primary.percent, 102)
         XCTAssertEqual(preferred.error, "Claude 用量 HTTP 429")
     }
+
+    /// 「今日」那一档以前只有本机数据：小时表没有节点维度，同步也只搬天级快照。
+    /// 于是同一个面板上，Week 能拆出设备而 Day 拆不出，且 Day 的总量在别的设备
+    /// 也有今日用量时会偏小，界面还不说明。小时行现在跟着快照走。
+    func testHourlyRowsTravelWithTheSnapshotAndKeepTheirNode() {
+        let (store, path) = store()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        store.configureClusterStorage(nodeID: "node-a", nodeName: "Mac A", aggregationEnabled: true)
+        store.recordHourly(day: "2026-07-31", provider: "claude",
+                           hours: [9: ["opus": 100], 10: ["opus": 40]],
+                           expectedBucketTimeZone: nil)
+
+        let key = ClusterSnapshotKey(originNodeID: "node-b", day: "2026-07-31", provider: "claude")
+        let remote = ClusterUsageSnapshot(
+            key: key, revision: 1, observedAt: Date(), models: ["opus": 70],
+            hours: ["9": ["opus": 70]]
+        )
+        XCTAssertEqual(
+            store.mergeClusterSnapshots([remote], ifEpoch: store.clusterDataEpoch())?.count, 1
+        )
+
+        let rows = store.hourlyUsage(provider: "claude", day: "2026-07-31")
+        XCTAssertEqual(rows.reduce(0) { $0 + $1.tokens }, 210, "两台设备的小时用量都要在")
+        XCTAssertEqual(Set(rows.compactMap(\.nodeID)), ["node-a", "node-b"])
+
+        // 「今日」的设备占比现在拆得出来，且悬停某个小时只统计那一个小时
+        let devices = UsageStats.deviceTotals(hourly: rows)
+        XCTAssertEqual(devices.map(\.nodeID), ["node-a", "node-b"])
+        XCTAssertEqual(devices.first?.total, 140)
+        XCTAssertEqual(UsageStats.deviceTotals(hourly: rows, bucketID: "10").map(\.total), [40])
+    }
+
+    /// 本机快照要带上自己的小时分布，否则对端的「今日」里这台永远缺席。
+    func testLocalSnapshotCarriesItsOwnHourlyDistribution() {
+        let (store, path) = store()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        store.configureClusterStorage(nodeID: "node-a", nodeName: "Mac A", aggregationEnabled: true)
+        store.record(day: "2026-07-31", provider: "claude", models: ["opus": 140],
+                     expectedBucketTimeZone: nil)
+        store.recordHourly(day: "2026-07-31", provider: "claude",
+                           hours: [9: ["opus": 100], 10: ["opus": 40]],
+                           expectedBucketTimeZone: nil)
+
+        let key = ClusterSnapshotKey(originNodeID: "node-a", day: "2026-07-31", provider: "claude")
+        let snapshot = store.clusterSnapshots(keys: [key]).first
+        XCTAssertEqual(snapshot?.hours?["9"], ["opus": 100])
+        XCTAssertEqual(snapshot?.hours?["10"], ["opus": 40])
+    }
+
+    /// 老版本节点不发这一段。nil 是「没告诉我」，不能当成「这天没有用量」——
+    /// 那会让一次来自旧节点的同步把已经拿到的分布抹掉。
+    func testAbsentHoursFromAnOlderPeerDoNotEraseWhatWeHave() {
+        let (store, path) = store()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        store.configureClusterStorage(nodeID: "node-a", nodeName: "Mac A", aggregationEnabled: true)
+        let key = ClusterSnapshotKey(originNodeID: "node-b", day: "2026-07-31", provider: "claude")
+        _ = store.mergeClusterSnapshots([ClusterUsageSnapshot(
+            key: key, revision: 1, observedAt: Date(), models: ["opus": 70],
+            hours: ["9": ["opus": 70]]
+        )], ifEpoch: store.clusterDataEpoch())
+
+        _ = store.mergeClusterSnapshots([ClusterUsageSnapshot(
+            key: key, revision: 2, observedAt: Date(), models: ["opus": 90], hours: nil
+        )], ifEpoch: store.clusterDataEpoch())
+        XCTAssertEqual(store.hourlyUsage(provider: "claude", day: "2026-07-31")
+            .reduce(0) { $0 + $1.tokens }, 70, "旧节点没提供小时数据，不能抹掉已有的")
+
+        // 空字典是「确实没有」，可以覆盖
+        _ = store.mergeClusterSnapshots([ClusterUsageSnapshot(
+            key: key, revision: 3, observedAt: Date(), models: ["opus": 90], hours: [:]
+        )], ifEpoch: store.clusterDataEpoch())
+        XCTAssertTrue(store.hourlyUsage(provider: "claude", day: "2026-07-31").isEmpty)
+    }
+
+    /// 刚升级完的那几分钟：集群表里还没有本机今天的小时行，要等下一轮采集。
+    /// 这段窗口里「今日」不能少掉本机自己。
+    func testLocalHoursFillInUntilTheClusterTableHasThem() {
+        let (store, path) = store()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        store.recordHourly(day: "2026-07-31", provider: "claude", hours: [9: ["opus": 100]],
+                           expectedBucketTimeZone: nil)
+        // 采集发生在组集群之前，所以集群表里没有本机这一份
+        store.configureClusterStorage(nodeID: "node-a", nodeName: "Mac A", aggregationEnabled: true)
+        _ = store.mergeClusterSnapshots([ClusterUsageSnapshot(
+            key: ClusterSnapshotKey(originNodeID: "node-b", day: "2026-07-31", provider: "claude"),
+            revision: 1, observedAt: Date(), models: ["opus": 70], hours: ["9": ["opus": 70]]
+        )], ifEpoch: store.clusterDataEpoch())
+
+        let rows = store.hourlyUsage(provider: "claude", day: "2026-07-31")
+        XCTAssertEqual(rows.reduce(0) { $0 + $1.tokens }, 170, "本机那份要补上")
+        XCTAssertEqual(rows.filter { $0.nodeID == "node-a" }.count, 1, "补上的只能有一份")
+
+        // 下一轮采集把本机写进集群表后，不能再补一次
+        store.recordHourly(day: "2026-07-31", provider: "claude", hours: [9: ["opus": 120]],
+                           expectedBucketTimeZone: nil)
+        XCTAssertEqual(
+            store.hourlyUsage(provider: "claude", day: "2026-07-31").reduce(0) { $0 + $1.tokens },
+            190
+        )
+    }
 }

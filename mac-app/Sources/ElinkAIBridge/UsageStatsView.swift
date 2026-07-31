@@ -76,6 +76,25 @@ enum UsageStats {
         }
     }
 
+    /// 「日」档的设备占比走小时行：那一档的图和明细都由小时行渲染，设备占比也必须
+    /// 同源，否则同一屏上会出现两个对不上的总量。
+    /// bucketID 非空时只统计那一个小时，与悬停某天/某月的口径一致。
+    static func deviceTotals(hourly rows: [HourlyModelUsage],
+                             bucketID: String? = nil) -> [DeviceUsage] {
+        var byNode: [String?: [String: Int]] = [:]
+        for row in rows {
+            if let bucketID, String(format: "%02d", row.hour) != bucketID { continue }
+            byNode[row.nodeID, default: [:]][row.model, default: 0] += row.tokens
+        }
+        return byNode
+            .map { DeviceUsage(nodeID: $0.key, models: $0.value) }
+            .sorted {
+                $0.total == $1.total
+                    ? ($0.nodeID ?? "") < ($1.nodeID ?? "")
+                    : $0.total > $1.total
+            }
+    }
+
     /// 范围内各设备的 token 总量与模型明细，按总量降序（并列按 nodeID 升序保证稳定）。
     /// bucketID 非空时只统计该桶（悬停某天/某月），与 detail 的口径保持一致
     static func deviceTotals(rows: [DailyModelUsage], range: StatsRange,
@@ -191,20 +210,26 @@ struct UsageStatsView: View {
 
     var body: some View {
         let chartRows = effectiveNodeID.map { id in rows.filter { $0.nodeID == id } } ?? rows
-        // 「日」档展示今日 24 小时分布；小时数据仅本机，不参与节点筛选/设备占比
+        // 「日」档展示今日 24 小时分布，来源是小时行；其余档走天级行
+        let chartHourly = effectiveNodeID.map { id in hourlyRows.filter { $0.nodeID == id } }
+            ?? hourlyRows
         let buckets = range == .day
-            ? UsageStats.hourlyBuckets(rows: hourlyRows)
+            ? UsageStats.hourlyBuckets(rows: chartHourly)
             : UsageStats.buckets(rows: chartRows, range: range)
         let order = UsageStats.modelOrder(buckets)
         let colors = UsageStats.colors(for: order)
         // 全范围的设备列表决定区块是否展示；悬停某个桶时明细跟随该桶，与 detail 口径一致
-        let rangeDevices = UsageStats.deviceTotals(rows: rows, range: range)
-        let devices = hoveredBucket.map {
-            UsageStats.deviceTotals(rows: rows, range: range, bucketID: $0)
+        let rangeDevices = range == .day
+            ? UsageStats.deviceTotals(hourly: hourlyRows)
+            : UsageStats.deviceTotals(rows: rows, range: range)
+        let devices = hoveredBucket.map { bucket in
+            range == .day
+                ? UsageStats.deviceTotals(hourly: hourlyRows, bucketID: bucket)
+                : UsageStats.deviceTotals(rows: rows, range: range, bucketID: bucket)
         } ?? rangeDevices
         return VStack(spacing: 10) {
             header
-            if clusterNodes.count > 1, range != .day { nodeFilter }
+            if clusterNodes.count > 1 { nodeFilter }
             if order.isEmpty {
                 emptyState
             } else {
@@ -214,7 +239,7 @@ struct UsageStatsView: View {
                         detail(buckets: buckets, order: order, colors: colors)
                         categorySection(
                             UsageStats.categoryTotals(rows: categoryRows, range: range))
-                        if clusterNodes.count > 1, range != .day, effectiveNodeID == nil,
+                        if clusterNodes.count > 1, effectiveNodeID == nil,
                            rangeDevices.count > 1 {
                             deviceSection(devices: devices, order: order, colors: colors,
                                           heading: deviceHeading(buckets))

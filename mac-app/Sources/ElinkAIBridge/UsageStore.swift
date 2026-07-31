@@ -15,6 +15,8 @@ struct HourlyModelUsage: Equatable {
     var provider: String
     var model: String
     var tokens: Int
+    /// 产生这一行的节点。nil = 本机且未组集群，与 `DailyModelUsage` 同一套约定。
+    var nodeID: String?
 }
 
 struct DailyCategoryUsage: Equatable {
@@ -292,9 +294,69 @@ final class UsageStore {
                 }
                 sqlite3_finalize(statement)
             }
+            // 组了集群就同时写一份到集群表：读路径统一走那张表，本机缺席会让「今日」
+            // 少算自己。快照按需从这张表取小时数据，对端下次拉取就能拿到。
+            if succeeded, let nodeID = clusterNodeID {
+                succeeded = replaceClusterHourlyLocked(
+                    nodeID: nodeID, day: day, provider: provider, hours: Self.hourBuckets(rows)
+                )
+            }
             return finishTransactionLocked(succeeded)
         }
         if changed { Self.notifyDataChanged() }
+    }
+
+    /// 小时行 → `"0"…"23"` → 模型 → token。协议里用字符串键，JSON 字典别无选择。
+    static func hourBuckets(_ rows: [HourlyModelUsage]) -> [String: [String: Int]] {
+        var result: [String: [String: Int]] = [:]
+        for row in rows where row.tokens > 0 {
+            result[String(row.hour), default: [:]][row.model, default: 0] += row.tokens
+        }
+        return result
+    }
+
+    /// 覆盖某节点某天某 provider 的小时行。须在事务与 queue 内调用。
+    private func replaceClusterHourlyLocked(nodeID: String, day: String, provider: String,
+                                            hours: [String: [String: Int]]) -> Bool {
+        var statement: OpaquePointer?
+        let delete = """
+        DELETE FROM cluster_hourly_usage
+        WHERE origin_node_id = ? AND day = ? AND provider = ?
+        """
+        guard sqlite3_prepare_v2(db, delete, -1, &statement, nil) == SQLITE_OK else { return false }
+        sqlite3_bind_text(statement, 1, nodeID, -1, Self.transient)
+        sqlite3_bind_text(statement, 2, day, -1, Self.transient)
+        sqlite3_bind_text(statement, 3, provider, -1, Self.transient)
+        var succeeded = sqlite3_step(statement) == SQLITE_DONE
+        sqlite3_finalize(statement)
+        statement = nil
+        guard succeeded else { return false }
+
+        let insert = """
+        INSERT INTO cluster_hourly_usage
+          (origin_node_id, day, hour, provider, model, tokens)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """
+        guard sqlite3_prepare_v2(db, insert, -1, &statement, nil) == SQLITE_OK else { return false }
+        defer { sqlite3_finalize(statement) }
+        for (hour, models) in hours {
+            guard let hourValue = Int(hour), (0...23).contains(hourValue) else { continue }
+            for (model, tokens) in models where tokens > 0 {
+                sqlite3_reset(statement)
+                sqlite3_bind_text(statement, 1, nodeID, -1, Self.transient)
+                sqlite3_bind_text(statement, 2, day, -1, Self.transient)
+                sqlite3_bind_int64(statement, 3, Int64(hourValue))
+                sqlite3_bind_text(statement, 4, provider, -1, Self.transient)
+                sqlite3_bind_text(statement, 5, model, -1, Self.transient)
+                sqlite3_bind_int64(statement, 6, Int64(tokens))
+                if sqlite3_step(statement) != SQLITE_DONE {
+                    succeeded = false
+                    break
+                }
+            }
+            if !succeeded { break }
+        }
+        return succeeded
     }
 
     /// 读单日小时行；失败返回 nil（与“空日”区分）。须在 queue 内调用
@@ -326,10 +388,57 @@ final class UsageStore {
     }
 
     /// 小时数据仅本机记录，不走集群聚合分支
+    /// 组了集群就走集群表：本机自己的小时行也在里面（`recordHourly` 会同时写一份），
+    /// 与 `usage(provider:since:)` 的做法一致。
+    ///
+    /// 唯一的例外是本机那一份还没写进去的时候——刚升级完，集群表里还没有今天的自己，
+    /// 要等下一轮采集。这时用本地表补上，否则「今日」会在几分钟里少掉本机。补的是
+    /// 「集群表里没有本机行」这一种情况，不会和已有的本机行重复计算。
     func hourlyUsage(provider: String, day: String) -> [HourlyModelUsage] {
+        let node: String? = queue.sync {
+            clusterAggregationEnabled ? clusterNodeID : nil
+        }
+        guard let node else {
+            return queue.sync {
+                guard db != nil else { return [] }
+                return hourlyRowsLocked(day: day, provider: provider) ?? []
+            }
+        }
+        let rows = clusterHourlyUsage(provider: provider, day: day)
+        guard !rows.contains(where: { $0.nodeID == node }) else { return rows }
+        let local = queue.sync {
+            db == nil ? [] : (hourlyRowsLocked(day: day, provider: provider) ?? [])
+        }
+        return rows + local.map {
+            HourlyModelUsage(day: $0.day, hour: $0.hour, provider: $0.provider,
+                             model: $0.model, tokens: $0.tokens, nodeID: node)
+        }
+    }
+
+    func clusterHourlyUsage(provider: String, day: String) -> [HourlyModelUsage] {
         queue.sync {
             guard db != nil else { return [] }
-            return hourlyRowsLocked(day: day, provider: provider) ?? []
+            let sql = """
+            SELECT hour, model, tokens, origin_node_id FROM cluster_hourly_usage
+            WHERE provider = ? AND day = ? ORDER BY hour, model, origin_node_id
+            """
+            var statement: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return [] }
+            defer { sqlite3_finalize(statement) }
+            sqlite3_bind_text(statement, 1, provider, -1, Self.transient)
+            sqlite3_bind_text(statement, 2, day, -1, Self.transient)
+            var result: [HourlyModelUsage] = []
+            while sqlite3_step(statement) == SQLITE_ROW,
+                  let model = sqlite3_column_text(statement, 1),
+                  let node = sqlite3_column_text(statement, 3) {
+                result.append(HourlyModelUsage(
+                    day: day, hour: Int(sqlite3_column_int64(statement, 0)),
+                    provider: provider, model: String(cString: model),
+                    tokens: Int(sqlite3_column_int64(statement, 2)),
+                    nodeID: String(cString: node)
+                ))
+            }
+            return result
         }
     }
 
@@ -1374,8 +1483,29 @@ final class UsageStore {
               let model = sqlite3_column_text(statement, 0) {
             models[String(cString: model)] = Int(sqlite3_column_int64(statement, 1))
         }
+        sqlite3_finalize(statement)
+        statement = nil
+
+        // 小时分布随快照一起发出去，对端的「今日」才拆得出设备
+        let hourRows = """
+        SELECT hour, model, tokens FROM cluster_hourly_usage
+        WHERE origin_node_id = ? AND day = ? AND provider = ? ORDER BY hour, model
+        """
+        var hours: [String: [String: Int]] = [:]
+        if sqlite3_prepare_v2(db, hourRows, -1, &statement, nil) == SQLITE_OK {
+            sqlite3_bind_text(statement, 1, key.originNodeID, -1, Self.transient)
+            sqlite3_bind_text(statement, 2, key.day, -1, Self.transient)
+            sqlite3_bind_text(statement, 3, key.provider, -1, Self.transient)
+            while sqlite3_step(statement) == SQLITE_ROW,
+                  let model = sqlite3_column_text(statement, 1) {
+                hours[String(sqlite3_column_int64(statement, 0)), default: [:]][String(cString: model)]
+                    = Int(sqlite3_column_int64(statement, 2))
+            }
+        }
+        sqlite3_finalize(statement)
+        statement = nil
         return ClusterUsageSnapshot(
-            key: key, revision: revision, observedAt: observedAt, models: models
+            key: key, revision: revision, observedAt: observedAt, models: models, hours: hours
         )
     }
 
@@ -1453,6 +1583,17 @@ final class UsageStore {
             }
         } else if succeeded { succeeded = false }
         sqlite3_finalize(statement)
+        statement = nil
+
+        // hours 为 nil 表示对端没提供（老版本节点），保留已有的那份；空字典才是
+        // 「这天确实没有小时数据」，覆盖成空。把两者混为一谈，一次来自旧节点的
+        // 同步就会把已经拿到的分布抹掉。
+        if succeeded, let hours = snapshot.hours {
+            succeeded = replaceClusterHourlyLocked(
+                nodeID: snapshot.key.originNodeID, day: snapshot.key.day,
+                provider: snapshot.key.provider, hours: hours
+            )
+        }
         return succeeded
     }
 
@@ -1711,6 +1852,15 @@ final class UsageStore {
           model TEXT NOT NULL,
           tokens INTEGER NOT NULL,
           PRIMARY KEY (origin_node_id, day, provider, model)
+        );
+        CREATE TABLE IF NOT EXISTS cluster_hourly_usage (
+          origin_node_id TEXT NOT NULL,
+          day TEXT NOT NULL,
+          hour INTEGER NOT NULL,
+          provider TEXT NOT NULL,
+          model TEXT NOT NULL,
+          tokens INTEGER NOT NULL,
+          PRIMARY KEY (origin_node_id, day, hour, provider, model)
         );
         CREATE TABLE IF NOT EXISTS cluster_credentials (
           singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
