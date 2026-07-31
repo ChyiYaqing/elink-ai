@@ -15,6 +15,21 @@ final class StatusService {
     private var hooks: [String: HookState] = [:]
     private var needsInput: [String: Date] = [:]
     private var historyMaintenanceRetryPending = false
+    /// Claude transcript 的增量读取状态：每个文件已经解析到第几个字节，以及跨轮
+    /// 保留的累加器。
+    ///
+    /// 以前每轮都把当天的 transcript 从第 0 字节整个重读一遍。这份工作量正比于
+    /// 「今天写了多少」，而它每 5 秒发生一次：实测 13.5MB 要 680ms，一天下来越攒
+    /// 越慢——一个只是在后台报数的菜单栏应用，稳定占掉一个核的 15%，傍晚更高。
+    ///
+    /// 累加器按 message id 去重、同一 id 取较大值，所以只喂新追加的字节，结果与
+    /// 全量重放一致。
+    private var claudeOffsets: [String: UInt64] = [:]
+    private var claudeAccumulator = ClaudeUsageAccumulator()
+    private var claudeAccumulatorKey = ""
+    /// Codex 的解析器跨行有状态（从累计值算增量），不适合切成片段喂。这里只做
+    /// 「文件没动过就不重解析」，随时间变化的 state 仍然每轮重算。
+    private var codexCache: (latest: Date?, status: AgentStatus)?
 
     private static let claudeRoot = URL(
         fileURLWithPath: ("~/.claude/projects" as NSString).expandingTildeInPath)
@@ -111,13 +126,19 @@ final class StatusService {
         calendar.timeZone = timeZone
         let start = calendar.startOfDay(for: Date())
         let dayKey = Self.dayKeyMaker(timeZone)
-        let accumulator = ClaudeUsageAccumulator()
-        for file in files where (modification(file) ?? .distantPast) >= start {
-            guard let text = try? String(contentsOf: file, encoding: .utf8) else { continue }
-            accumulator.add(lines: text.split(separator: "\n").map(String.init))
-        }
         // 只回写今日：今天修改过的文件可能包含更早的行，但早前日期的数据在此并不完整
         let today = dayKey(Date())
+        // 跨天或改时区就重来：累加器只该装当天、且按当前时区分桶的数据
+        let key = "\(today)\u{1f}\(timeZone.identifier)"
+        if claudeAccumulatorKey != key {
+            claudeAccumulator = ClaudeUsageAccumulator()
+            claudeOffsets = [:]
+            claudeAccumulatorKey = key
+        }
+        let accumulator = claudeAccumulator
+        for file in files where (modification(file) ?? .distantPast) >= start {
+            appendNewClaudeLines(of: file, into: accumulator)
+        }
         let totals = accumulator.dailyTotals(dayKey: dayKey)[today] ?? [:]
         store?.record(
             day: today, provider: "claude", models: totals,
@@ -142,9 +163,50 @@ final class StatusService {
         )
     }
 
+    /// 只把上次之后追加的字节喂给累加器。
+    ///
+    /// 停在最后一个换行符：JSONL 是一边写一边读的，最后一行很可能只写了一半，
+    /// 解析半行只会得到一条解不开的记录，而下一轮它就完整了。
+    /// 这一轮该从哪个字节读起；nil 表示没有新内容，连打开文件都不必。
+    ///
+    /// 比记下的偏移量还短，说明文件被截断或整个换掉了（会话重写、日志轮换），
+    /// 这时旧偏移量指向的位置已经不是原来那行，只能从头再来。累加器按 message id
+    /// 去重，重放一遍不会把用量算两次。
+    static func resumeOffset(size: UInt64, recorded: UInt64) -> UInt64? {
+        let from = size < recorded ? 0 : recorded
+        return size > from ? from : nil
+    }
+
+    private func appendNewClaudeLines(of file: URL, into accumulator: ClaudeUsageAccumulator) {
+        let path = file.path
+        guard let size = (try? file.resourceValues(forKeys: [.fileSizeKey]))?.fileSize else { return }
+        let total = UInt64(size)
+        guard let from = Self.resumeOffset(size: total, recorded: claudeOffsets[path] ?? 0) else {
+            return
+        }
+        guard let handle = try? FileHandle(forReadingFrom: file) else { return }
+        defer { try? handle.close() }
+        guard (try? handle.seek(toOffset: from)) != nil,
+              let data = try? handle.readToEnd(), !data.isEmpty,
+              let lastBreak = data.lastIndex(of: 0x0A) else { return }
+        let complete = data[data.startIndex...lastBreak]
+        accumulator.add(lines: complete.split(separator: 0x0A).compactMap {
+            String(data: Data($0), encoding: .utf8)
+        })
+        claudeOffsets[path] = from + UInt64(data.distance(from: data.startIndex, to: lastBreak)) + 1
+    }
+
     private func readCodex(in timeZone: TimeZone) -> AgentStatus {
         let files = Self.jsonlFiles(at: Self.codexRoot) ?? []
         let latest = latestModification(files)
+        // 文件一个字节都没动过，重解析一遍必然得到同样的数字。唯独 state 要重算：
+        // 它是拿最后写入时间和此刻比出来的，同一份文件放着不动也会从「工作中」
+        // 变成「空闲」。
+        if let cache = codexCache, cache.latest == latest {
+            var status = cache.status
+            status.state = state(latest)
+            return status
+        }
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = timeZone
         let start = calendar.startOfDay(for: Date())
@@ -196,7 +258,7 @@ final class StatusService {
         let models = Self.sorted(totals)
         let windows = latestRateLimits.map(UsageFetcher.codexLogWindows)
         let rateLimitDate = Self.timestamp(latestRateLimitsTimestamp)
-        return AgentStatus(
+        let status = AgentStatus(
             state: state(latest),
             tokensToday: models.reduce(0) { $0 + $1.tokens },
             modelUsageToday: models,
@@ -205,6 +267,8 @@ final class StatusService {
             usageFetchedAt: rateLimitDate,
             usageCached: windows != nil
         )
+        codexCache = (latest, status)
+        return status
     }
 
     /// 一次读取日志，再按一个或多个固定时区分桶。迁移时旧/新时区必须共用

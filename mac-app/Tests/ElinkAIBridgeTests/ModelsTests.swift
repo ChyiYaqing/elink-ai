@@ -1457,4 +1457,39 @@ final class ModelsTests: XCTestCase {
         )
         XCTAssertEqual(UsagePresentation.freshnessText(status, now: now), "缓存 · 2分钟前")
     }
+
+    // MARK: - transcript 增量读取
+
+    /// 每 5 秒把当天的 transcript 从头重放一遍，实测 13.5MB 要 680ms，一天下来越攒
+    /// 越慢。改成只喂新追加的字节后，结果必须和全量重放逐字节一致。
+    func testIncrementalFeedMatchesReplayingTheWholeFile() {
+        let lines = (1...6).map { index in
+            #"{"timestamp":"1970-01-01T00:20:0\#(index).000Z","uuid":"u\#(index)","message":{"id":"msg-\#(index)","model":"claude-a","usage":{"input_tokens":\#(index),"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#
+        }
+        let whole = StatusService.ClaudeUsageAccumulator()
+        whole.add(lines: lines)
+
+        // 分三次追加，模拟每轮只读到新写入的那几行
+        let incremental = StatusService.ClaudeUsageAccumulator()
+        incremental.add(lines: Array(lines[0..<2]))
+        incremental.add(lines: Array(lines[2..<5]))
+        incremental.add(lines: Array(lines[5...]))
+        XCTAssertEqual(incremental.dailyTotals(), whole.dailyTotals())
+
+        // 文件被截断重写时会整份重放：同一条消息喂两次不能翻倍
+        incremental.add(lines: lines)
+        XCTAssertEqual(incremental.dailyTotals(), whole.dailyTotals())
+    }
+
+    /// 续读的起点：没有新字节就不该打开文件，文件变短则说明偏移量已经失效。
+    func testResumeOffsetSkipsUnchangedFilesAndRereadsTruncatedOnes() {
+        XCTAssertNil(StatusService.resumeOffset(size: 4_096, recorded: 4_096),
+                     "一个字节都没追加，连打开都不必")
+        XCTAssertEqual(StatusService.resumeOffset(size: 5_000, recorded: 4_096), 4_096,
+                       "从上次停下的地方继续")
+        XCTAssertEqual(StatusService.resumeOffset(size: 2_000, recorded: 4_096), 0,
+                       "文件变短说明被截断或换掉了，旧偏移量指向的已不是原来那行")
+        XCTAssertEqual(StatusService.resumeOffset(size: 1, recorded: 0), 0)
+        XCTAssertNil(StatusService.resumeOffset(size: 0, recorded: 0), "空文件没有可读的")
+    }
 }
