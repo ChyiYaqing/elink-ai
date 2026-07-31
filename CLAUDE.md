@@ -43,10 +43,20 @@ version. At minimum, check these locations:
   differs from `CFBundleShortVersionString`.
 - `mac-app/Sources/ElinkAIBridge/LaunchAtLogin.swift`: update the fallback value
   of `AppInfo.version`.
+- `elink-tui/Cargo.toml`: set `version` to `X.Y.Z`, then refresh
+  `elink-tui/Cargo.lock` (any cargo command rewrites it). The workflow rejects a
+  tag whose version differs from this one, and both Linux TUI jobs fail before
+  building anything.
 - Swift tests: update hard-coded current-version fixtures such as
   `UpdateChecker(currentVersion:)` where they represent the app's current
   version.
 - `README.md`: update versioned DMG command and filename examples.
+
+Searching for the previous version string is not enough on its own: run
+`git show --stat vPREVIOUS` and confirm the new release commit touches the same
+set of files. v0.1.17-rc8 failed because a search restricted to `*.swift`,
+`*.md` and `*.plist` never looked at `.toml`, and the missing Cargo bump was
+only caught by CI after the tag was already pushed.
 
 Do not change `pyproject.toml` merely for the macOS DMG release: its version is
 for the separately packaged Python project and is not read by the Release
@@ -68,7 +78,17 @@ All of the following must pass:
 ```bash
 .venv/bin/pytest -q
 (cd mac-app && swift test)
+(cd elink-tui && cargo test)
 git diff --check
+```
+
+Replay the workflow's two version gates locally before tagging; both reject the
+tag outright, so a mismatch costs a whole release cycle:
+
+```bash
+VERSION=X.Y.Z
+[ "$VERSION" = "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' mac-app/Info.plist)" ]
+[ "$VERSION" = "$(sed -n 's/^version = "\([^"]*\)"$/\1/p' elink-tui/Cargo.toml)" ]
 ```
 
 Also verify that:
