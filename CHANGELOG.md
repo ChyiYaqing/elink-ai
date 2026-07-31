@@ -6,6 +6,36 @@ and `Removed`.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## 0.1.17-rc8
+
+### Added
+
+- The Nebula overlay page opens with a summary of what broke and when, sorts
+  nodes by severity so a down host is never buried below healthy ones, and
+  prints outage spans as clock times next to each node
+- The usage statistics `Day` range now shows the host filter and the per-device
+  share, matching the other ranges
+
+### Changed
+
+- Nebula overlay nodes collapse to a summary row by default; expanding one
+  shows its latency charts, which now label their own axis range
+- Occasional single-packet loss is drawn as a thin mark instead of filling its
+  cell, so a real outage stands out against normal background loss
+
+### Fixed
+
+- A lighthouse serving implausible values can no longer crash the app: roster
+  and history documents are now bounded where they are parsed
+- The Raspberry Pi agent no longer accepts an arbitrary bridge address from the
+  network, rejects redirects to other hosts, applies the minimum refresh
+  interval to manual refreshes, and bounds concurrent connections
+- A lighthouse with no configured listen address now binds its own overlay
+  address instead of every interface; the roster names every node and its WAN
+  mapping and is served without authentication
+- The example LaunchAgent writes its log under `~/Library/Logs` instead of a
+  fixed name in the shared `/tmp`
+
 ## 0.1.17-rc7
 
 ### Changed
