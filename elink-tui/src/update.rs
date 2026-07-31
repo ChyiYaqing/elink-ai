@@ -231,7 +231,23 @@ mod tests {
 
         assert_eq!(info.tag, "v0.1.17");
         assert_eq!(info.url, "https://x/17");
-        assert!(info.newer, "0.1.17 outranks the running release candidate");
+        // `newer` is measured against the running build, so pin it to versions
+        // that stay on the same side of it rather than to today's number:
+        // asserting that a specific release outranks the build turns every
+        // version bump into a failing test.
+        assert!(
+            !info.newer,
+            "a stable release older than the running build is not an update"
+        );
+        let ahead = serde_json::json!([
+            {"tag_name": "v99.0.0", "prerelease": false, "html_url": "https://x/99"}
+        ]);
+        assert!(
+            release_info(&ahead)
+                .expect("stable release found")
+                .newer,
+            "a stable release above the running build is an update"
+        );
         assert_eq!(release_info(&serde_json::json!([])), None);
     }
 }

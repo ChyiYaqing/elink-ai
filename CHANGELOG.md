@@ -6,6 +6,32 @@ and `Removed`.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## 0.1.18
+
+### Added
+
+- Each host in a sync cluster now has its own colour in the usage device
+  share, kept consistent across ranges and across machines
+
+### Changed
+
+- The usage statistics `Day` range now splits by host like the other ranges:
+  snapshots carry the day's hour-by-hour distribution between hosts. A host
+  still on an older version keeps syncing and simply contributes no hourly
+  detail, reported as unknown rather than as zero
+- The device share now appears whenever the cluster has more than one host,
+  even when a single machine did all the work, instead of disappearing and
+  leaving the host filter above it unexplained
+
+### Fixed
+
+- The bridge no longer re-reads the whole day's Claude transcripts every five
+  seconds. It used around 14% of a CPU core continuously with nothing to
+  report, climbing through the day as transcripts grew; a pass now costs
+  whatever was appended since the last one
+- A host that upgrades and then stays idle now still publishes the hourly
+  distribution it had already collected that day
+
 ## 0.1.17-rc9
 
 ### Added
