@@ -579,8 +579,7 @@ struct UsageStatsView: View {
             }
         }
         .padding(8)
-        .background(RoundedRectangle(cornerRadius: 8).fill(theme.glassBackground))
-        .overlay(RoundedRectangle(cornerRadius: 8).stroke(theme.glassBorder, lineWidth: 1))
+        .sectionCard(theme)
     }
 
     private func deviceName(_ nodeID: String?) -> String {

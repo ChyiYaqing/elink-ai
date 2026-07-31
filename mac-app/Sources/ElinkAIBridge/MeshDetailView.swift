@@ -101,22 +101,44 @@ struct MeshDetailView: View {
     let onBack: () -> Void
     @StateObject private var model = MeshDetailModel()
     @State private var hovered: [String: MeshBucketPoint] = [:]
+    @State private var expanded: Set<String> = []
+
+    /// 一台节点 + 它在这个窗口里的结论。
+    private typealias Row = (host: MeshHostView, report: MeshHostReport)
+
+    /// 坏的排前面。名册是字典序，而字典序里出事的那台可能排在第十个——表头写着
+    /// 「9 台可达」，却要滚过九个健康的区块才知道是哪一台不可达。
+    private var rows: [Row] {
+        let hosts = Dictionary(mesh.hosts.map { ($0.name, $0) }, uniquingKeysWith: { first, _ in first })
+        let reports = mesh.hosts.map { host in
+            MeshAnalysis.report(name: host.name, state: host.state,
+                                local: model.localHistory[host.name] ?? [],
+                                lighthouse: model.lighthouseHistory[host.name] ?? [])
+        }
+        return MeshAnalysis.sorted(reports).compactMap { report in
+            hosts[report.name].map { (host: $0, report: report) }
+        }
+    }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            header
+        let rows = self.rows
+        return VStack(alignment: .leading, spacing: 10) {
+            header(rows)
             ScrollView(.vertical, showsIndicators: false) {
                 VStack(alignment: .leading, spacing: 10) {
                     settings
                     legend
+                    // 时间轴放在列表上方共享：折叠状态下每台只有两条色带，它们用的是
+                    // 同一个窗口，每台各印一遍刻度只是把同一根轴抄十遍。
+                    axis
                     if mesh.hosts.isEmpty {
                         Text(tr("等待第一份名册…", "Waiting for the first roster…"))
                             .font(.system(size: 11))
                             .foregroundStyle(theme.textTertiary)
                             .padding(.vertical, 24)
                     }
-                    ForEach(mesh.hosts, id: \.name) { host in
-                        hostBlock(host)
+                    ForEach(rows, id: \.host.name) { row in
+                        hostBlock(row)
                     }
                 }
             }
@@ -136,7 +158,7 @@ struct MeshDetailView: View {
 
     // MARK: - 顶部
 
-    private var header: some View {
+    private func header(_ rows: [Row]) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
                 PillButton(title: tr("返回", "Back"), icon: "chevron.left", theme: theme,
@@ -164,6 +186,14 @@ struct MeshDetailView: View {
             .pickerStyle(.segmented)
             .labelsHidden()
             .frame(maxWidth: .infinity)
+            // 这一句要在不滚动、不悬停的情况下把「什么时候有问题」答完
+            if !rows.isEmpty {
+                Text(MeshAnalysis.headline(rows.map(\.report), window: model.window))
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(rows.contains { $0.report.fault >= .recovered }
+                        ? theme.statusWarning : theme.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             Text(UsagePanelView.meshSubtitle(
                 total: mesh.hosts.count,
                 reachable: mesh.hosts.filter { $0.state == .online }.count,
@@ -212,9 +242,9 @@ struct MeshDetailView: View {
                 .font(.system(size: 8, weight: .medium))
                 .foregroundStyle(theme.textTertiary)
         }
-        .padding(12)
+        .padding(8)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .glassCard(theme)
+        .sectionCard(theme)
     }
 
     private var legend: some View {
@@ -225,9 +255,7 @@ struct MeshDetailView: View {
                      (.lost, tr("全部不通", "nothing through")),
                      (.noData, tr("没有探测", "not probed"))], id: \.0) { status, text in
                 HStack(spacing: 4) {
-                    RoundedRectangle(cornerRadius: 1)
-                        .fill(strip.color(status))
-                        .frame(width: 12, height: 8)
+                    strip.swatch(status)
                     Text(text)
                         .font(.system(size: 8, weight: .medium))
                         .foregroundStyle(theme.textTertiary)
@@ -245,48 +273,107 @@ struct MeshDetailView: View {
 
     // MARK: - 每台节点
 
-    private func hostBlock(_ host: MeshHostView) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            // 440pt 宽放不下「名字 + overlay 地址 + 延迟 + 状态」一行，状态另起一行：
-            // 它是四者里最长的，挤在一行会先把 overlay 地址截断
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(alignment: .firstTextBaseline, spacing: 6) {
-                    Circle()
-                        .fill(UsagePanelView.meshStateColor(host.state, theme: theme))
-                        .frame(width: 6, height: 6)
-                    Text(host.name)
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(theme.textPrimary)
-                    Text(host.overlay)
-                        .font(.system(size: 9, design: .monospaced))
-                        .foregroundStyle(theme.textTertiary)
-                    Spacer()
-                    Text(host.latestRttUs.map { UsagePanelView.meshLatency(Int($0)) } ?? "—")
-                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                        .foregroundStyle(theme.textPrimary)
+    /// 一台节点。默认折叠：两条色带就够回答「什么时候不通」，折线回答的是「快不快」，
+    /// 那是追问。十台节点各展开两张折线是 3000pt 的滚动，出事的那台大概率不在第一屏。
+    private func hostBlock(_ row: Row) -> some View {
+        let host = row.host
+        let open = expanded.contains(host.name)
+        let local = model.localHistory[host.name] ?? []
+        let lighthouse = model.lighthouseHistory[host.name] ?? []
+        let missing = Self.lighthouseNotice(
+            model.lighthouseError, hasSeries: model.lighthouseHistory[host.name] != nil)
+        return VStack(alignment: .leading, spacing: 8) {
+            Button {
+                Log.user("\(open ? "collapse" : "expand") nebula host")
+                withAnimation(.easeOut(duration: 0.2)) {
+                    if open { expanded.remove(host.name) } else { expanded.insert(host.name) }
                 }
+            } label: {
+                hostHeader(row, open: open)
+            }
+            .buttonStyle(.plain)
+
+            if open {
+                series(key: "local:\(host.name)",
+                       title: tr("本机 → \(host.name)", "this host → \(host.name)"),
+                       points: local, missing: nil)
+                series(key: "lighthouse:\(host.name)",
+                       title: tr("lighthouse → \(host.name)", "lighthouse → \(host.name)"),
+                       points: lighthouse, missing: missing)
+                axis
+            } else {
+                compactSeries(title: tr("本机 →", "from here"), points: local, missing: nil)
+                compactSeries(title: tr("lighthouse →", "from lighthouse"),
+                              points: lighthouse, missing: missing)
+            }
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .sectionCard(theme)
+    }
+
+    private func hostHeader(_ row: Row, open: Bool) -> some View {
+        let host = row.host
+        // 440pt 宽放不下「名字 + overlay 地址 + 延迟 + 状态」一行，状态另起一行：
+        // 它是四者里最长的，挤在一行会先把 overlay 地址截断
+        return VStack(alignment: .leading, spacing: 2) {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Circle()
+                    .fill(stateColor(host))
+                    .frame(width: 6, height: 6)
+                Text(host.name)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(theme.textPrimary)
+                Text(host.overlay)
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(theme.textTertiary)
+                Spacer()
+                Text(host.latestRttUs.map { UsagePanelView.meshLatency(Int($0)) } ?? "—")
+                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(theme.textPrimary)
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(theme.textTertiary)
+                    .rotationEffect(.degrees(open ? 90 : 0))
+            }
+            HStack(spacing: 6) {
                 Text(UsagePanelView.meshStateText(host))
                     .font(.system(size: 9, weight: .medium))
-                    .foregroundStyle(UsagePanelView.meshStateColor(host.state, theme: theme))
-                    .padding(.leading, 12)
+                    .foregroundStyle(stateColor(host))
+                // 折叠状态下这一句就是答案：不必展开、不必悬停、不必数格子
+                if let when = MeshAnalysis.outageText(row.report.outages,
+                                                     window: model.window) {
+                    Text(when)
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(theme.statusWarning)
+                }
+                Spacer()
             }
-
-            series(key: "local:\(host.name)",
-                   title: tr("本机 → \(host.name)", "this host → \(host.name)"),
-                   points: model.localHistory[host.name] ?? [],
-                   missing: nil)
-
-            series(key: "lighthouse:\(host.name)",
-                   title: tr("lighthouse → \(host.name)", "lighthouse → \(host.name)"),
-                   points: model.lighthouseHistory[host.name] ?? [],
-                   missing: Self.lighthouseNotice(model.lighthouseError,
-                                                  hasSeries: model.lighthouseHistory[host.name] != nil))
-
-            axis
+            .padding(.leading, 12)
         }
-        .padding(12)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .glassCard(theme)
+        .contentShape(Rectangle())
+    }
+
+    private func stateColor(_ host: MeshHostView) -> Color {
+        UsagePanelView.meshStateColor(host.state, theme: theme)
+    }
+
+    /// 折叠时的一条链路：标题 + 色带。色带是这一页里信息密度最高的一段，只占 8pt。
+    private func compactSeries(title: String, points: [MeshBucketPoint],
+                               missing: String?) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(theme.textSecondary)
+            if let missing {
+                Text(missing)
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(theme.statusWarning)
+            } else {
+                MeshAvailabilityStrip(points: points, window: model.window, theme: theme)
+                    .frame(height: 8)
+            }
+        }
     }
 
     /// 一条链路的完整呈现：摘要 + 可达性色带 + 延迟折线。

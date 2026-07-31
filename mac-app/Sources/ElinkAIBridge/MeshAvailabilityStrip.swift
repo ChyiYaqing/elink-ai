@@ -72,12 +72,33 @@ struct MeshAvailabilityStrip: View {
         }
     }
 
+    /// 丢包只占底部这一条，全丢才铺满整格。
+    ///
+    /// 实测这张网上四台节点每五分钟都会丢一两个探测，铺满整格的橙色会让这四台看着和
+    /// 真的断掉一样严重——那正是要区分的两件事。压到底部一条，「这里丢过包」仍然看得见，
+    /// 但满高度的红色一眼就压过它。
+    static let partialMarkHeight: CGFloat = 3
+
     var body: some View {
         Canvas { context, size in
             // 整条先铺成「没在看」，有桶的时段再覆盖上去。没有这层底色，缺数据的时段
             // 会和背景一样，读起来像是「这段时间没出问题」。
             context.fill(Path(CGRect(origin: .zero, size: size)), with: .color(color(.noData)))
             for mark in Self.marks(points: points, window: window, width: size.width) {
+                if mark.status == .partial {
+                    // 丢包的那一格底下仍然是通的，先铺回全通色，再压一条告警
+                    context.fill(
+                        Path(CGRect(x: mark.x, y: 0, width: mark.width, height: size.height)),
+                        with: .color(color(.ok))
+                    )
+                    let height = min(Self.partialMarkHeight, size.height)
+                    context.fill(
+                        Path(CGRect(x: mark.x, y: size.height - height,
+                                    width: mark.width, height: height)),
+                        with: .color(color(.partial))
+                    )
+                    continue
+                }
                 context.fill(
                     Path(CGRect(x: mark.x, y: 0, width: mark.width, height: size.height)),
                     with: .color(color(mark.status))
@@ -85,5 +106,20 @@ struct MeshAvailabilityStrip: View {
             }
         }
         .clipShape(RoundedRectangle(cornerRadius: 2))
+    }
+
+    /// 图例里的一格，画法与色带一致——图例和图不一致比没有图例更糟。
+    func swatch(_ status: MeshBucketStatus, width: CGFloat = 12, height: CGFloat = 8) -> some View {
+        ZStack(alignment: .bottom) {
+            RoundedRectangle(cornerRadius: 1)
+                .fill(color(status == .partial ? .ok : status))
+            if status == .partial {
+                Rectangle()
+                    .fill(color(.partial))
+                    .frame(height: Self.partialMarkHeight)
+            }
+        }
+        .frame(width: width, height: height)
+        .clipShape(RoundedRectangle(cornerRadius: 1))
     }
 }

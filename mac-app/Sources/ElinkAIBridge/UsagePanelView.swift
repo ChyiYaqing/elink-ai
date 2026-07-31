@@ -254,6 +254,8 @@ struct UsagePanelView: View {
             Log.user("close nebula overlay")
             withAnimation(.easeOut(duration: 0.2)) { model.showMesh = false }
         }
+        // 和用量统计页同一层外壳：表头也在卡里，两页翻过去边界不跳
+        .glassCard(theme)
     }
 
     private func settingsCard(_ theme: PanelTheme) -> some View {
@@ -1779,6 +1781,21 @@ private struct GlassCard: ViewModifier {
     }
 }
 
+/// 卡片里的区块。比 `glassCard` 收一号：圆角 8、底色更淡。
+///
+/// 一张页面只该有一层 14pt 的卡——它是「这是一页」的边界。页内再用同样的卡片，
+/// 层级就说不清了。
+private struct SectionCard: ViewModifier {
+    let theme: PanelTheme
+
+    func body(content: Content) -> some View {
+        content
+            .background(RoundedRectangle(cornerRadius: 8).fill(theme.glassBackground))
+            .overlay(RoundedRectangle(cornerRadius: 8).stroke(theme.glassBorder, lineWidth: 1))
+    }
+}
+
 extension View {
     func glassCard(_ theme: PanelTheme) -> some View { modifier(GlassCard(theme: theme)) }
+    func sectionCard(_ theme: PanelTheme) -> some View { modifier(SectionCard(theme: theme)) }
 }

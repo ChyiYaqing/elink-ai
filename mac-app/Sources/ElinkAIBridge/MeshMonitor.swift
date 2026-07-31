@@ -244,6 +244,33 @@ final class MeshMonitor: ObservableObject {
         }
     }
 
+    /// 一次探测的往返上限。这个数字的作用不是「多久算慢」，而是划出一个**做算术不会
+    /// 溢出**的取值域：图表要算 `high - low`、报表要算 `samples - okSamples`，Swift 的
+    /// 整数运算越界会直接 trap，而这些数来自一份明文 HTTP 文档——lighthouse 被换掉、
+    /// 或者 overlay 上有人插在中间，就能用一个 `Int.max` 把 app 打崩。
+    ///
+    /// 一小时的往返在任何真实链路上都是荒谬值，所以拒绝它不会丢掉有意义的数据。
+    static let maxPlausibleRttUs = 3_600_000_000
+    /// 一个五分钟桶里最多容得下的探测次数，同上：给算术划一个安全域。
+    static let maxPlausibleSamples = 1_000_000
+
+    /// 计数必须自洽：非负、且成功数不超过总数。不自洽的桶直接丢弃而不是钳到边界——
+    /// 「探了 5 次成功 9 次」不是一个可以修正的值，它只说明这份文档不可信。
+    static func sanitizedCounts(samples: Int, ok: Int) -> (samples: Int, ok: Int)? {
+        guard samples >= 0, ok >= 0, ok <= samples, samples <= maxPlausibleSamples else {
+            return nil
+        }
+        return (samples, ok)
+    }
+
+    /// 往返值超出取值域就当作没有这个读数：延迟缺失只是少画一段线，而 trap 是崩溃。
+    static func sanitizedRtt(_ value: Any?) -> Int? {
+        guard let micros = value as? Int, micros >= 0, micros <= maxPlausibleRttUs else {
+            return nil
+        }
+        return micros
+    }
+
     static func historyURL(base: URL, window: TimeInterval) -> URL? {
         var components = URLComponents(url: base, resolvingAgainstBaseURL: false)
         components?.path = "/history"
@@ -268,13 +295,14 @@ final class MeshMonitor: ObservableObject {
                 // [bucket_at, samples, ok_samples, rtt_min_us, rtt_max_us, rtt_sum_us]
                 guard row.count >= 6,
                       let bucketAt = row[0] as? Double ?? (row[0] as? Int).map(Double.init),
-                      let samples = row[1] as? Int, let ok = row[2] as? Int else { return nil }
+                      let samples = row[1] as? Int, let ok = row[2] as? Int,
+                      let counts = Self.sanitizedCounts(samples: samples, ok: ok) else { return nil }
                 let sum = row[5] as? Int
                 return MeshBucketPoint(
                     bucketAt: Date(timeIntervalSince1970: bucketAt),
-                    samples: samples, okSamples: ok,
-                    rttMinUs: row[3] as? Int, rttMaxUs: row[4] as? Int,
-                    rttAvgUs: ok > 0 ? sum.map { $0 / ok } : nil
+                    samples: counts.samples, okSamples: counts.ok,
+                    rttMinUs: Self.sanitizedRtt(row[3]), rttMaxUs: Self.sanitizedRtt(row[4]),
+                    rttAvgUs: counts.ok > 0 ? Self.sanitizedRtt(sum).map { $0 / counts.ok } : nil
                 )
             }
         }
@@ -291,6 +319,13 @@ final class MeshMonitor: ObservableObject {
         }
     }
 
+    /// 名册的条数上限。每一条都会换来一次串行 ICMP 探测和一次落库，所以这份明文
+    /// 文档的长度直接决定本机干多少活。一张 nebula 网不会有几百台，超出就说明这份
+    /// 文档不是它自称的东西。
+    static let maxRosterHosts = 256
+    /// 名字只用来显示和当数据库主键，长的没有意义，只会撑大每一行。
+    static let maxHostNameLength = 64
+
     /// 解析 lighthouse 发布的名册。
     ///
     /// overlay 地址解析不出来的条目直接丢弃而不是猜：探测需要地址，编一个出来等于
@@ -298,15 +333,16 @@ final class MeshMonitor: ObservableObject {
     static func parseRoster(_ data: Data) -> [MeshRosterHost] {
         guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let hosts = object["hosts"] as? [[String: Any]] else { return [] }
-        return hosts.compactMap { host in
+        return hosts.prefix(maxRosterHosts).compactMap { host in
             guard let name = host["name"] as? String,
+                  !name.isEmpty, name.count <= maxHostNameLength,
                   let overlay = host["overlay"] as? String,
                   overlay.withCString({ pointer -> Bool in
                       var address = in_addr()
                       return inet_pton(AF_INET, pointer, &address) == 1
                   }) else { return nil }
             let probedAt = host["probed_at"] as? Int
-            let rtt = host["rtt_us"] as? Int
+            let rtt = sanitizedRtt(host["rtt_us"])
             return MeshRosterHost(
                 name: name, overlay: overlay,
                 lastActivityAt: host["last_activity_at"] as? Int ?? 0,

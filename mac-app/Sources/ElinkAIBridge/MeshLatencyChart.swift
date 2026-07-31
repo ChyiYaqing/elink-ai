@@ -60,8 +60,10 @@ struct MeshLatencyChart: View {
             let padding = max(Double(high) * 0.1, 1)
             return (Double(low) - padding, Double(high) + padding)
         }
-        // 上下各留一成，线和带不会贴着上下边缘被裁掉
-        let padding = Double(high - low) * 0.1
+        // 上下各留一成，线和带不会贴着上下边缘被裁掉。
+        // 先转 Double 再相减：这两个数来自 lighthouse 的明文 HTTP 文档，整数相减越界
+        // 在 Swift 里是 trap 而不是回绕，解析层已经限过取值域，这里不再依赖它。
+        let padding = (Double(high) - Double(low)) * 0.1
         return (Double(low) - padding, Double(high) + padding)
     }
 
@@ -94,6 +96,7 @@ struct MeshLatencyChart: View {
                 }
                 lossMarkers(in: size)
                 crosshair(in: size, scale: scale)
+                scaleLabels
             }
             .contentShape(Rectangle())
             .onContinuousHover { phase in
@@ -110,6 +113,35 @@ struct MeshLatencyChart: View {
                 }
             }
         }
+    }
+
+    /// 纵轴的上下界写在图里。
+    ///
+    /// 纵轴不从零起（见 `bounds`），所以两张叠在一起的图形状可以很像而量级差二十倍：
+    /// 本机到 3B 是 15–19ms，lighthouse 到 3B 是 210–467ms，两条线都铺满整个高度。
+    /// 不标出范围，读者会拿形状当量值比。
+    @ViewBuilder
+    private var scaleLabels: some View {
+        if let low = points.compactMap(\.rttMinUs).min(),
+           let high = points.compactMap(\.rttMaxUs).max() {
+            VStack(alignment: .leading, spacing: 0) {
+                label(UsagePanelView.meshLatency(high))
+                Spacer(minLength: 0)
+                if high != low { label(UsagePanelView.meshLatency(low)) }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .allowsHitTesting(false)
+        }
+    }
+
+    private func label(_ text: String) -> some View {
+        Text(text)
+            .font(.system(size: 8, design: .monospaced))
+            .foregroundStyle(theme.textTertiary)
+            .padding(.horizontal, 2)
+            // 折线会穿过左上角，垫一层表面色，数字才读得出来
+            .background(theme.glassBackground.opacity(0.75),
+                        in: RoundedRectangle(cornerRadius: 2))
     }
 
     // MARK: - 几何

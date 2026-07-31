@@ -34,7 +34,9 @@ struct MeshBucketPoint: Equatable {
     var rttMaxUs: Int?
     var rttAvgUs: Int?
 
-    var lostSamples: Int { max(0, samples - okSamples) }
+    // 减法写成先比后减：这两个数可能来自 lighthouse 的明文文档，越界相减在 Swift 里
+    // 是 trap。解析层已经限过取值域，这里不再依赖它。
+    var lostSamples: Int { okSamples >= samples ? 0 : samples - okSamples }
     var fullyLost: Bool { samples > 0 && okSamples == 0 }
 }
 

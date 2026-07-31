@@ -569,6 +569,211 @@ final class MeshTests: XCTestCase {
                      "一切正常时不该有横幅")
     }
 
+    // MARK: - 不可信文档的取值域
+
+    /// 名册和历史都来自一份明文 HTTP 文档。Swift 的整数越界是 trap 而不是回绕，所以
+    /// 一个 Int.max 就能把 app 打崩——图表要算 `high - low`，报表要算
+    /// `samples - okSamples`。取值域在解析处就要收干净。
+    func testHostileHistoryDocumentCannotProduceTrappingValues() throws {
+        let hostile = """
+        {"bucket_width_s":300,"hosts":[{"name":"evil","buckets":[
+          [1785000000,5,4,-9223372036854775808,9223372036854775807,1],
+          [1785000300,9223372036854775807,-9223372036854775808,1,2,3],
+          [1785000600,5,9,1,2,3],
+          [1785000900,-1,-1,1,2,3],
+          [1785001200,5,4,200000,240000,880000]
+        ]}]}
+        """
+        let parsed = try XCTUnwrap(MeshMonitor.parseHistory(Data(hostile.utf8)))
+        let points = try XCTUnwrap(parsed["evil"])
+        XCTAssertEqual(points.count, 2, "计数不自洽的桶要丢掉，实际留下：\(points)")
+
+        for point in points {
+            XCTAssertGreaterThanOrEqual(point.samples, 0)
+            XCTAssertLessThanOrEqual(point.okSamples, point.samples)
+            XCTAssertGreaterThanOrEqual(point.lostSamples, 0)
+            for rtt in [point.rttMinUs, point.rttMaxUs, point.rttAvgUs].compactMap({ $0 }) {
+                XCTAssertGreaterThanOrEqual(rtt, 0)
+                XCTAssertLessThanOrEqual(rtt, MeshMonitor.maxPlausibleRttUs)
+            }
+        }
+        // 极端值被剔除后仍要能画：这里真正保护的是「不 trap」，不是「不显示」
+        let chart = MeshLatencyChart(points: points, window: axis(), theme: PanelTheme(.light))
+        let (lower, upper) = chart.axisBounds
+        XCTAssertTrue(lower.isFinite && upper.isFinite, "纵轴范围必须是有限值")
+        XCTAssertLessThan(lower, upper)
+    }
+
+    /// 名册每多一条就多一次串行 ICMP 探测和一次落库，长度不能由对端说了算。
+    func testHostileRosterIsBoundedInCountAndNameLength() throws {
+        let entries = (0..<(MeshMonitor.maxRosterHosts + 50)).map { index in
+            "{\"name\":\"n\(index)\",\"overlay\":\"192.168.100.\(index % 250 + 1)\"}"
+        }
+        let long = String(repeating: "x", count: MeshMonitor.maxHostNameLength + 1)
+        let document = "{\"hosts\":[{\"name\":\"\(long)\",\"overlay\":\"192.168.100.9\"},"
+            + entries.joined(separator: ",") + "]}"
+        let roster = MeshMonitor.parseRoster(Data(document.utf8))
+        XCTAssertLessThanOrEqual(roster.count, MeshMonitor.maxRosterHosts)
+        XCTAssertFalse(roster.contains { $0.name == long }, "超长名字要丢掉")
+
+        // 荒谬的往返值当作没有读数：少画一段线，好过 trap
+        let absurdDocument = "{\"hosts\":[{\"name\":\"a\",\"overlay\":\"192.168.100.5\","
+            + "\"probed_at\":1,\"rtt_us\":9223372036854775807}]}"
+        let absurd = MeshMonitor.parseRoster(Data(absurdDocument.utf8))
+        XCTAssertEqual(absurd.count, 1)
+        XCTAssertNil(absurd[0].lighthouseRttUs)
+        XCTAssertEqual(absurd[0].lighthouseReachable, false, "没有可信的往返值就不算探通")
+    }
+
+    // MARK: - 中断判定与摘要
+
+    /// 一桶里丢一两个包和一桶全丢是两件事。实测这张网上有四台节点每五分钟都会丢
+    /// 一两个探测，把它算成中断，页面上就只剩告警。
+    func testOnlyFullyLostBucketsCountAsAnOutage() {
+        let start = Date(timeIntervalSince1970: 1_785_000_000)
+        let series = (0..<6).map { index in
+            MeshBucketPoint(bucketAt: start.addingTimeInterval(Double(index) * 300),
+                            samples: 5, okSamples: index == 3 ? 4 : 5,
+                            rttMinUs: 200_000, rttMaxUs: 240_000, rttAvgUs: 220_000)
+        }
+        XCTAssertTrue(MeshAnalysis.outages(in: series).isEmpty, "丢一个包不是中断")
+    }
+
+    /// 连续全丢并成一段，缺桶的地方断开——缺桶是「没在探」，算进中断等于替一段
+    /// 本机睡着的时间作证。
+    func testConsecutiveDownBucketsMergeButGapsSplit() {
+        let start = Date(timeIntervalSince1970: 1_785_000_000)
+        func down(_ index: Int) -> MeshBucketPoint {
+            MeshBucketPoint(bucketAt: start.addingTimeInterval(Double(index) * 300),
+                            samples: 5, okSamples: 0,
+                            rttMinUs: nil, rttMaxUs: nil, rttAvgUs: nil)
+        }
+        func good(_ index: Int) -> MeshBucketPoint {
+            MeshBucketPoint(bucketAt: start.addingTimeInterval(Double(index) * 300),
+                            samples: 5, okSamples: 5,
+                            rttMinUs: 200_000, rttMaxUs: 240_000, rttAvgUs: 220_000)
+        }
+
+        let merged = MeshAnalysis.outages(in: [down(0), down(1), down(2), good(3)])
+        XCTAssertEqual(merged.count, 1)
+        XCTAssertEqual(merged.first?.buckets, 3)
+        XCTAssertEqual(merged.first?.start, start)
+        XCTAssertEqual(merged.first?.end, start.addingTimeInterval(900))
+        XCTAssertFalse(merged.first?.ongoing ?? true, "后面还有通的桶，已经恢复")
+
+        // 第 2 桶完全没有记录（本机休眠），不能把 0 和 3 连成一段 20 分钟的中断
+        let split = MeshAnalysis.outages(in: [down(0), down(1), down(3)])
+        XCTAssertEqual(split.count, 2)
+        XCTAssertEqual(split.map(\.buckets), [2, 1])
+        XCTAssertTrue(split.last?.ongoing ?? false, "最后一个桶就是全丢的，还没恢复")
+    }
+
+    /// 没恢复和已恢复要分开说：前者是现在的事故。整窗口都断则连起点都不该说，
+    /// 「18:10 起不通」会让人以为 18:10 之前是好的。
+    func testOutageTextSeparatesOngoingFromRecovered() {
+        let english = Locale(identifier: "en_US")
+        let start = Date(timeIntervalSince1970: 1_785_000_000)
+        let window = start...start.addingTimeInterval(3600)
+        func down(_ index: Int) -> MeshBucketPoint {
+            MeshBucketPoint(bucketAt: start.addingTimeInterval(Double(index) * 300),
+                            samples: 5, okSamples: 0,
+                            rttMinUs: nil, rttMaxUs: nil, rttAvgUs: nil)
+        }
+        func good(_ index: Int) -> MeshBucketPoint {
+            MeshBucketPoint(bucketAt: start.addingTimeInterval(Double(index) * 300),
+                            samples: 5, okSamples: 5,
+                            rttMinUs: 200_000, rttMaxUs: 240_000, rttAvgUs: 220_000)
+        }
+
+        // locale 只决定时钟格式；文案跟随 app 语言，这个测试类固定中文
+        let recovered = MeshAnalysis.outageText(
+            MeshAnalysis.outages(in: [down(0), down(1), good(2)]),
+            window: window, locale: english)
+        XCTAssertTrue(recovered?.contains("–") ?? false, "已恢复要给出闭区间：\(recovered ?? "")")
+        XCTAssertTrue(recovered?.hasSuffix("不通") ?? false, "已恢复要给出闭区间：\(recovered ?? "")")
+
+        let wholeWindow = MeshAnalysis.outageText(
+            MeshAnalysis.outages(in: [down(0), down(1), down(2)]),
+            window: window, locale: english)
+        XCTAssertEqual(wholeWindow, "整个窗口都不通")
+
+        let since = MeshAnalysis.outageText(
+            MeshAnalysis.outages(in: [good(0), good(1), down(2), down(3)]),
+            window: window, locale: english)
+        XCTAssertEqual(since?.hasSuffix(" 起不通"), true, "窗口内才断的要给起点：\(since ?? "")")
+        XCTAssertFalse(since?.contains("–") ?? true, "还没恢复就没有终点可写：\(since ?? "")")
+
+        XCTAssertNil(MeshAnalysis.outageText([], window: window, locale: english))
+    }
+
+    /// 现在不通 > 断过又好了 > 只是丢包 > 干净，同级按名字。出事的排在最后一个，
+    /// 等于让人滚过九个健康的区块才看到问题。
+    func testWorstHostsSortFirst() {
+        let start = Date(timeIntervalSince1970: 1_785_000_000)
+        func series(ok: Int) -> [MeshBucketPoint] {
+            (0..<3).map { index in
+                MeshBucketPoint(bucketAt: start.addingTimeInterval(Double(index) * 300),
+                                samples: 5, okSamples: ok,
+                                rttMinUs: ok > 0 ? 200_000 : nil,
+                                rttMaxUs: ok > 0 ? 240_000 : nil,
+                                rttAvgUs: ok > 0 ? 220_000 : nil)
+            }
+        }
+        let reports = [
+            MeshAnalysis.report(name: "clean", state: .online, local: series(ok: 5),
+                                lighthouse: series(ok: 5)),
+            MeshAnalysis.report(name: "iMac", state: .offline, local: series(ok: 0),
+                                lighthouse: series(ok: 0)),
+            MeshAnalysis.report(name: "AAPC", state: .online, local: series(ok: 5),
+                                lighthouse: series(ok: 4)),
+            MeshAnalysis.report(name: "WSL", state: .online, local: series(ok: 5),
+                                lighthouse: [series(ok: 0)[0], series(ok: 5)[1], series(ok: 5)[2]]),
+        ]
+        XCTAssertEqual(MeshAnalysis.sorted(reports).map(\.name),
+                       ["iMac", "WSL", "AAPC", "clean"])
+        XCTAssertEqual(reports.map(\.fault), [.clean, .down, .loss, .recovered])
+
+        // 同级再分：没恢复的排前面，其次断得久的。只按名字排会让整窗口不通的 iMac
+        // 落到断过 5 分钟的 WSL 后面
+        let ongoing = MeshAnalysis.report(name: "iMac", state: .online, local: [],
+                                          lighthouse: series(ok: 0))
+        let brief = MeshAnalysis.report(
+            name: "AAPC", state: .online, local: [],
+            lighthouse: [series(ok: 0)[0], series(ok: 5)[1], series(ok: 5)[2]])
+        XCTAssertEqual(ongoing.fault, brief.fault, "两台都是「断过」")
+        XCTAssertEqual(MeshAnalysis.sorted([brief, ongoing]).map(\.name), ["iMac", "AAPC"])
+    }
+
+    /// 顶部那一句要在不滚动、不悬停的情况下把「什么时候有问题」答完。
+    func testHeadlineNamesTheWorstHostsAndWhen() {
+        let english = Locale(identifier: "en_US")
+        let start = Date(timeIntervalSince1970: 1_785_000_000)
+        let window = start...start.addingTimeInterval(3600)
+        func series(ok: Int) -> [MeshBucketPoint] {
+            (0..<3).map { index in
+                MeshBucketPoint(bucketAt: start.addingTimeInterval(Double(index) * 300),
+                                samples: 5, okSamples: ok,
+                                rttMinUs: ok > 0 ? 200_000 : nil,
+                                rttMaxUs: ok > 0 ? 240_000 : nil,
+                                rttAvgUs: ok > 0 ? 220_000 : nil)
+            }
+        }
+        let clean = MeshAnalysis.report(name: "DS925", state: .online, local: series(ok: 5),
+                                       lighthouse: series(ok: 5))
+        let lossy = MeshAnalysis.report(name: "AAPC", state: .online, local: series(ok: 5),
+                                       lighthouse: series(ok: 4))
+        let down = MeshAnalysis.report(name: "iMac", state: .offline, local: series(ok: 0),
+                                      lighthouse: series(ok: 0))
+
+        XCTAssertEqual(MeshAnalysis.headline([clean], window: window, locale: english),
+                       "窗口内没有中断")
+        XCTAssertEqual(MeshAnalysis.headline([clean, lossy], window: window, locale: english),
+                       "窗口内没有中断，只有零星丢包")
+        let broken = MeshAnalysis.headline([clean, lossy, down], window: window, locale: english)
+        XCTAssertTrue(broken.hasPrefix("iMac "), "最严重的排最前：\(broken)")
+        XCTAssertFalse(broken.contains("AAPC"), "零星丢包不该挤掉真中断的位置：\(broken)")
+    }
+
     /// 页面停在那里不动，图也得跟着走。表头的年龄在动而色带冻住，比整页都不动更误导。
     @MainActor
     func testTheOpenPageReloadsHistoryOnItsOwn() {
