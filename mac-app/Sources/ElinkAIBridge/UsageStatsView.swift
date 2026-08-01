@@ -185,9 +185,23 @@ enum UsageStats {
     static func costTotal(rows: [ModelCategoryUsage], range: StatsRange,
                           now: Date = Date(),
                           table: [String: ModelPricing] = Pricing.table())
-        -> (cost: Double, unpriced: Set<String>) {
+        -> (cost: Double, unpriced: Set<String>, pricedTokens: Int) {
         let inWindow = windowFilter(range: range, now: now)
-        return Pricing.total(rows: rows.filter { inWindow($0.day) }, table: table)
+        let windowed = rows.filter { inWindow($0.day) }
+        let result = Pricing.total(rows: windowed, table: table)
+        let priced = windowed
+            .filter { table[$0.model] != nil }
+            .reduce(0) { $0 + $1.tokens }
+        return (result.cost, result.unpriced, priced)
+    }
+
+    /// 金额覆盖了窗口内多大比例的 token。
+    ///
+    /// 分类明细可能缺席：还没升级的集群节点不发这份数据，历史回填也可能没跑完。
+    /// 缺的那部分静静地不计入总额，金额就会比实际低而毫无征兆——所以覆盖率不足时
+    /// 必须说出来。
+    static func costCoverage(pricedTokens: Int, windowTokens: Int) -> Double {
+        windowTokens > 0 ? min(1, Double(pricedTokens) / Double(windowTokens)) : 1
     }
 
     /// 金额文案。小额保留分位，超过 100 美元后分位没有意义，取整更好读。
@@ -319,7 +333,9 @@ struct UsageStatsView: View {
                         categorySection(
                             UsageStats.categoryTotals(rows: categoryRows, range: range))
                         costSection(
-                            UsageStats.costTotal(rows: modelCategoryRows, range: range))
+                            UsageStats.costTotal(rows: modelCategoryRows, range: range),
+                            // 与金额同一个窗口的 token 总量，用来判断覆盖了多少
+                            windowTokens: buckets.reduce(0) { $0 + $1.total })
                         if UsageStats.showsDeviceShare(
                             clusterNodes: clusterNodes.count,
                             filteredToOneHost: effectiveNodeID != nil,
@@ -554,7 +570,10 @@ struct UsageStatsView: View {
     /// 显示成「费用」会被当成已经扣过的钱。没有定价的模型要说出来，
     /// 否则残缺的总额会被当成全部。
     @ViewBuilder
-    private func costSection(_ result: (cost: Double, unpriced: Set<String>)) -> some View {
+    private func costSection(_ result: (cost: Double, unpriced: Set<String>, pricedTokens: Int),
+                             windowTokens: Int) -> some View {
+        let coverage = UsageStats.costCoverage(pricedTokens: result.pricedTokens,
+                                               windowTokens: windowTokens)
         if result.cost > 0 || !result.unpriced.isEmpty {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 5) {
@@ -571,6 +590,16 @@ struct UsageStatsView: View {
                         "Converted at list API prices — not what your subscription charged"))
                     .font(.system(size: 8))
                     .foregroundStyle(theme.textTertiary)
+                if coverage < 0.995 {
+                    Text(tr(
+                        "只覆盖了本区间 \(Int((coverage * 100).rounded()))% 的 token："
+                            + "尚未升级的设备不提供分类明细，实际金额更高",
+                        "Covers only \(Int((coverage * 100).rounded()))% of this range's tokens — "
+                            + "devices not yet upgraded send no breakdown, so the real figure is higher"
+                    ))
+                    .font(.system(size: 8))
+                    .foregroundStyle(theme.textTertiary)
+                }
                 if !result.unpriced.isEmpty {
                     Text(tr("未计入无公开定价的模型：\(result.unpriced.sorted().joined(separator: "、"))",
                             "Excludes models with no published price: "

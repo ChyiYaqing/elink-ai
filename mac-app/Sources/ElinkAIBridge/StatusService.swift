@@ -286,7 +286,12 @@ final class StatusService {
 
     /// 一次读取日志，再按一个或多个固定时区分桶。迁移时旧/新时区必须共用
     /// 同一份文件内容，否则两遍读取之间的追加或删除会伪造历史残差。
-    private func computeDailyTotals(in timeZones: [TimeZone]) -> [String: UsageHistoryTotals]? {
+    /// `scannedCategories` 带回金额折算所需的 模型×分类 明细：时区 -> provider ->
+    /// day -> model -> category -> tokens。与 token 总量出自同一次解析，不重复读盘。
+    private func computeDailyTotals(
+        in timeZones: [TimeZone],
+        scannedCategories: inout [String: [String: DayModelCategories]]
+    ) -> [String: UsageHistoryTotals]? {
         guard !timeZones.isEmpty else { return [:] }
         var dayKeys: [String: (Date) -> String] = [:]
         var cutoff = Date.distantFuture
@@ -318,6 +323,7 @@ final class StatusService {
             accumulator.add(lines: text.split(separator: "\n").map(String.init))
         }
         var codexDaily: [String: DailyUsageTotals] = [:]
+        var codexCategories: [String: DayModelCategories] = [:]
         for file in codexFiles {
             guard let modified = modification(file) else {
                 Log.warning("usage maintenance could not stat \(file.path)", category: "storage")
@@ -334,6 +340,11 @@ final class StatusService {
                 var totals = codexDaily[identifier] ?? [:]
                 Self.merge(Self.bucketCodexEvents(events, dayKey: dayKey), into: &totals)
                 codexDaily[identifier] = totals
+                // 分类明细出自同一批已解析的事件，不额外读盘
+                var categories = codexCategories[identifier] ?? [:]
+                Self.merge(Self.bucketCodexModelCategories(events, dayKey: dayKey),
+                           into: &categories)
+                codexCategories[identifier] = categories
             }
         }
         var result: [String: UsageHistoryTotals] = [:]
@@ -342,13 +353,19 @@ final class StatusService {
                 claude: accumulator.dailyTotals(dayKey: dayKey),
                 codex: codexDaily[identifier] ?? [:]
             )
+            // accumulator 已经持有全部消息，再分一次桶同样不需要重新读文件
+            scannedCategories[identifier] = [
+                "claude": accumulator.dailyModelCategoryTotals(dayKey: dayKey),
+                "codex": codexCategories[identifier] ?? [:],
+            ]
         }
         return result
     }
 
     /// 读取不完整时整次失败，不能把暂时读不到的日志误当成“已删除历史”。
     private func computeDailyTotals(in timeZone: TimeZone) -> UsageHistoryTotals? {
-        computeDailyTotals(in: [timeZone])?[timeZone.identifier]
+        var ignored: [String: [String: DayModelCategories]] = [:]
+        return computeDailyTotals(in: [timeZone], scannedCategories: &ignored)?[timeZone.identifier]
     }
 
     /// 解析行为变化时递增：触发一次精确重建，清洗旧解析器写入的错误归因。
@@ -360,7 +377,10 @@ final class StatusService {
     func backfillHistory(in timeZone: TimeZone? = nil, exact: Bool = false) -> Bool {
         guard let store else { return false }
         let capturedTimeZone = timeZone ?? Self.aggregationCalendar.timeZone
-        guard let totals = computeDailyTotals(in: capturedTimeZone) else {
+        var scannedCategories: [String: [String: DayModelCategories]] = [:]
+        guard let totals = computeDailyTotals(
+            in: [capturedTimeZone], scannedCategories: &scannedCategories
+        )?[capturedTimeZone.identifier] else {
             Log.warning("usage backfill skipped because history scan was incomplete", category: "storage")
             return false
         }
@@ -374,6 +394,12 @@ final class StatusService {
         }
         if exact {
             Log.info("usage history rebuilt for parser v\(Self.usageParserVersion)")
+        }
+        // token 总量回填了、分类没回填的话，周/月/年的金额会只覆盖最近几天
+        if let categories = scannedCategories[capturedTimeZone.identifier] {
+            store.backfillModelCategories(
+                expectedTimeZone: capturedTimeZone.identifier, usage: categories
+            )
         }
         Log.info("usage backfill: claude \(totals.claude.count) days, codex \(totals.codex.count) days")
         return true
@@ -425,9 +451,12 @@ final class StatusService {
         }
 
         let result: UsageBucketMigrationResult
+        var migrationCategories: [String: [String: DayModelCategories]] = [:]
         if let applied {
             guard let previous = TimeZone(identifier: applied),
-                  let totalsByTimeZone = computeDailyTotals(in: [target, previous]),
+                  let totalsByTimeZone = computeDailyTotals(
+                      in: [target, previous], scannedCategories: &migrationCategories
+                  ),
                   let targetTotals = totalsByTimeZone[current],
                   let oldTotals = totalsByTimeZone[previous.identifier] else {
                 Log.warning("usage bucket source timezone is invalid or unreadable: \(applied)",
@@ -443,7 +472,9 @@ final class StatusService {
         } else {
             // 老数据库没有来源时区，准确日期不可恢复；UsageStore 会守恒总量，并将
             // 现存日志按目标时区重建、不可解释残差稳定留在原日期。
-            guard let targetTotals = computeDailyTotals(in: target) else {
+            guard let targetTotals = computeDailyTotals(
+                in: [target], scannedCategories: &migrationCategories
+            )?[current] else {
                 Log.warning("usage maintenance skipped because history scan was incomplete",
                             category: "storage")
                 return
@@ -459,6 +490,11 @@ final class StatusService {
         switch result {
         case .applied:
             lock.holding { historyMaintenanceRetryPending = false }
+            // 分类也得按新时区重堆一遍，否则跨零点的那批 token 仍挂在旧的日期上，
+            // 金额与它上方的 token 数会对不上
+            if let categories = migrationCategories[current] {
+                store.backfillModelCategories(expectedTimeZone: current, usage: categories)
+            }
             if store.usageBucketHasLegacyUnknownData(), applied == nil {
                 Log.warning("legacy usage buckets normalized with unknown historical timezone",
                             category: "storage")

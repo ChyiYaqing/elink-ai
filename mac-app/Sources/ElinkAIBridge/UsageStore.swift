@@ -82,6 +82,9 @@ struct LinkEvent: Equatable {
 
 typealias DailyUsageTotals = [String: [String: Int]]
 
+/// day -> model -> category -> tokens
+typealias DayModelCategories = [String: [String: [String: Int]]]
+
 struct UsageHistoryTotals: Equatable {
     var claude: DailyUsageTotals
     var codex: DailyUsageTotals
@@ -609,6 +612,76 @@ final class UsageStore {
         if changed { Self.notifyDataChanged() }
     }
 
+    /// 回填多天的 模型×分类 用量（历史重扫的产物）。
+    ///
+    /// 这张表是纯派生数据：它只是把日志里已有的数字换一种维度堆叠，没有
+    /// `daily_model_usage` 那种「日志已删、用量要靠残差留住」的语义，所以直接按
+    /// 扫到的结果覆盖即可，不掺进 `mergeBackfillTotals` 的残差与精确重建逻辑。
+    ///
+    /// 缺了它，统计页的周/月/年金额只会算到「这张表建好之后」的那几天，
+    /// 而 token 总量是回填过的——两个数并排放着，金额会莫名其妙地小一截。
+    @discardableResult
+    func backfillModelCategories(expectedTimeZone: String?,
+                                 usage: [String: DayModelCategories]) -> Bool {
+        let changed: Bool = queue.sync {
+            guard db != nil,
+                  sqlite3_exec(db, "BEGIN IMMEDIATE", nil, nil, nil) == SQLITE_OK else { return false }
+            let marker = metadataValueLocked(Self.bucketTimeZoneMetadataKey)
+            guard marker.succeeded, marker.value == expectedTimeZone else {
+                _ = finishTransactionLocked(false)
+                return false
+            }
+            var succeeded = true
+            for (provider, days) in usage where ["claude", "codex"].contains(provider) {
+                guard succeeded else { break }
+                // 整个 provider 一次性重建：扫描覆盖的是全部历史，留下旧行只会
+                // 让改过归属的那些天既算新的又算旧的。
+                var deleteStatement: OpaquePointer?
+                if sqlite3_prepare_v2(
+                    db, "DELETE FROM daily_model_category_usage WHERE provider = ?",
+                    -1, &deleteStatement, nil) == SQLITE_OK {
+                    sqlite3_bind_text(deleteStatement, 1, provider, -1, Self.transient)
+                    succeeded = sqlite3_step(deleteStatement) == SQLITE_DONE
+                } else {
+                    succeeded = false
+                }
+                sqlite3_finalize(deleteStatement)
+                guard succeeded else { break }
+
+                let insert = """
+                INSERT INTO daily_model_category_usage
+                  (day, provider, model, category, tokens)
+                VALUES (?, ?, ?, ?, ?)
+                """
+                var statement: OpaquePointer?
+                guard sqlite3_prepare_v2(db, insert, -1, &statement, nil) == SQLITE_OK else {
+                    succeeded = false
+                    break
+                }
+                outer: for (day, models) in days {
+                    for (model, categories) in models {
+                        for (category, tokens) in categories where tokens > 0 {
+                            sqlite3_reset(statement)
+                            sqlite3_bind_text(statement, 1, day, -1, Self.transient)
+                            sqlite3_bind_text(statement, 2, provider, -1, Self.transient)
+                            sqlite3_bind_text(statement, 3, model, -1, Self.transient)
+                            sqlite3_bind_text(statement, 4, category, -1, Self.transient)
+                            sqlite3_bind_int64(statement, 5, Int64(tokens))
+                            if sqlite3_step(statement) != SQLITE_DONE {
+                                succeeded = false
+                                break outer
+                            }
+                        }
+                    }
+                }
+                sqlite3_finalize(statement)
+            }
+            return finishTransactionLocked(succeeded)
+        }
+        if changed { Self.notifyDataChanged() }
+        return changed
+    }
+
     /// 读单日 模型×分类 行；失败返回 nil（与“空日”区分）。须在 queue 内调用
     private func modelCategoryRowsLocked(day: String,
                                          provider: String) -> [String: [String: Int]]? {
@@ -633,8 +706,56 @@ final class UsageStore {
         }
     }
 
-    /// 金额折算的数据源。与分类表一样仅本机记录，不走集群聚合分支
+    /// 金额折算的数据源。口径必须与 `usage(provider:since:)` 一致：组了集群就读
+    /// 全节点，否则金额是本机的、上方的 token 数是全集群的，两个数并排放着却在
+    /// 讲不同的机器。
     func modelCategoryUsage(provider: String, since day: String) -> [ModelCategoryUsage] {
+        if queue.sync(execute: { clusterNodeID != nil && clusterAggregationEnabled }) {
+            return clusterModelCategoryUsage(provider: provider, since: day)
+        }
+        return localModelCategoryUsage(provider: provider, since: day)
+    }
+
+    /// 集群口径：各节点随快照送来的分类分布。没送分类的节点（老版本）在这里
+    /// 没有行，其用量因此不计入金额——调用方要把这个缺口说出来。
+    func clusterModelCategoryUsage(provider: String, since day: String,
+                                   nodeID: String? = nil) -> [ModelCategoryUsage] {
+        queue.sync {
+            guard db != nil else { return [] }
+            var sql = """
+            SELECT s.day, c.model, c.category, c.tokens
+            FROM cluster_usage_snapshots s
+            JOIN cluster_model_category_usage c
+              ON c.origin_node_id = s.origin_node_id
+             AND c.day = s.day AND c.provider = s.provider
+            WHERE s.provider = ? AND s.day >= ?
+            """
+            if nodeID != nil { sql += " AND s.origin_node_id = ?" }
+            sql += " ORDER BY s.day, c.model, c.category"
+            var statement: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return [] }
+            defer { sqlite3_finalize(statement) }
+            sqlite3_bind_text(statement, 1, provider, -1, Self.transient)
+            sqlite3_bind_text(statement, 2, day, -1, Self.transient)
+            if let nodeID { sqlite3_bind_text(statement, 3, nodeID, -1, Self.transient) }
+            var result: [ModelCategoryUsage] = []
+            while sqlite3_step(statement) == SQLITE_ROW,
+                  let dayText = sqlite3_column_text(statement, 0),
+                  let modelText = sqlite3_column_text(statement, 1),
+                  let categoryText = sqlite3_column_text(statement, 2) {
+                result.append(ModelCategoryUsage(
+                    day: String(cString: dayText),
+                    provider: provider,
+                    model: String(cString: modelText),
+                    category: String(cString: categoryText),
+                    tokens: Int(sqlite3_column_int64(statement, 3))
+                ))
+            }
+            return result
+        }
+    }
+
+    private func localModelCategoryUsage(provider: String, since day: String) -> [ModelCategoryUsage] {
         queue.sync {
             guard db != nil else { return [] }
             let sql = """

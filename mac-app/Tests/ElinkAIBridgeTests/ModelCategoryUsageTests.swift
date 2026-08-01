@@ -127,6 +127,56 @@ final class ModelCategoryUsageTests: XCTestCase {
         XCTAssertEqual(store.modelCategoryUsage(provider: "codex", since: epochDay)[0].tokens, 99)
     }
 
+    // MARK: - 历史回填
+
+    /// 回填要覆盖多天，否则周/月/年金额只算得到最近几天。
+    /// 现象是 Day 和 Week 显示同一个金额，而它们上方的 token 数差着好几倍。
+    func testBackfillCoversEveryScannedDay() {
+        let (store, path) = store()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let filled = store.backfillModelCategories(expectedTimeZone: nil, usage: [
+            "claude": [
+                "2026-07-30": ["claude-opus-5": ["input": 1_000_000]],
+                "2026-07-31": ["claude-opus-5": ["output": 1_000_000]],
+                "2026-08-01": ["claude-opus-5": ["cache_read": 1_000_000]],
+            ],
+        ])
+        XCTAssertTrue(filled)
+
+        let rows = store.modelCategoryUsage(provider: "claude", since: "2026-07-30")
+        XCTAssertEqual(Set(rows.map(\.day)), ["2026-07-30", "2026-07-31", "2026-08-01"])
+        // 1M input $5 + 1M output $25 + 1M cache_read $0.5
+        let total = Pricing.total(rows: rows, table: Pricing.builtIn)
+        XCTAssertEqual(total.cost, 30.5, accuracy: 0.000_001)
+    }
+
+    /// 回填是整个 provider 重建：改过归属的天不能既留旧行又加新行
+    func testBackfillReplacesRatherThanAccumulates() {
+        let (store, path) = store()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        store.backfillModelCategories(expectedTimeZone: nil, usage: [
+            "claude": ["2026-07-30": ["claude-opus-5": ["input": 1_000_000]]],
+        ])
+        store.backfillModelCategories(expectedTimeZone: nil, usage: [
+            "claude": ["2026-07-31": ["claude-opus-5": ["input": 2_000_000]]],
+        ])
+
+        let rows = store.modelCategoryUsage(provider: "claude", since: "2026-07-01")
+        XCTAssertEqual(rows.count, 1)
+        XCTAssertEqual(rows[0].day, "2026-07-31")
+    }
+
+    /// 时区标记对不上就整批放弃，避免把别的时区的分桶混进来
+    func testBackfillRefusesAMismatchedTimeZone() {
+        let (store, path) = store()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        // 新库的时区标记是 nil，传一个具体时区即为不匹配
+        XCTAssertFalse(store.backfillModelCategories(expectedTimeZone: "Asia/Shanghai", usage: [
+            "claude": ["2026-07-30": ["claude-opus-5": ["input": 1_000_000]]],
+        ]))
+        XCTAssertTrue(store.modelCategoryUsage(provider: "claude", since: "2026-07-01").isEmpty)
+    }
+
     // MARK: - 端到端折算
 
     /// 存进去的用量能按官方价折算出金额，这是整条链路的最终目的
