@@ -6,6 +6,21 @@ and `Removed`.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## 0.1.20-rc2
+
+### Fixed
+
+- The week, month, and year cost no longer stops at today. The breakdown behind
+  it was only recorded going forward while token totals were backfilled, so a
+  wider range showed the same figure as Day — reported from a build where both
+  read $41.97 against token counts that differed ninefold. History is now
+  backfilled from the session logs alongside the totals.
+- In a cluster the cost covered only this Mac while the tokens above it covered
+  every host. Both now read the same set of machines.
+- The cost says how much of the range it actually covers whenever some usage has
+  no breakdown behind it — a host still on an older build sends none, and its
+  usage would otherwise go missing from the total without a word.
+
 ## 0.1.20-rc1
 
 ### Added

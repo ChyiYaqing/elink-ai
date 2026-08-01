@@ -156,7 +156,7 @@ Build an ad-hoc-signed DMG installer with:
 ```bash
 cd mac-app
 sh build-dmg.sh
-open .build/elink-ai-v0.1.20-rc1.dmg
+open .build/elink-ai-v0.1.20-rc2.dmg
 ```
 
 Pushing a `v*` tag runs the release workflow, creates the matching GitHub
