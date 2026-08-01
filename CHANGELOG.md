@@ -6,6 +6,27 @@ and `Removed`.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## 0.1.20-rc1
+
+### Added
+
+- Usage now shows what it would have cost at list API prices, both in the
+  macOS stats panel and in the terminal dashboard. The figure is a conversion,
+  not a bill — subscription usage is not charged per token — and models with no
+  published price are named rather than counted as zero.
+- Prices are built in for the current Claude and Codex models and can be
+  overridden with a `pricing.json` next to the usage database, so a rate change
+  or a new model does not have to wait for a release.
+
+### Changed
+
+- Daily usage is now also recorded per model *and* category, which is what makes
+  a cost possible: the rate depends on both, and output runs five times input
+  while a cache read costs a tenth of it.
+- Cluster snapshots carry that breakdown so each host can price the others'
+  usage. Amounts never cross the network — every node converts with its own
+  price table — and snapshots from older hosts no longer look like empty ones.
+
 ## 0.1.19
 
 ### Fixed
