@@ -23,6 +23,16 @@ pub struct ProviderStatus {
     pub error: Option<String>,
     pub provider_usage_fetched_at: Option<i64>,
     pub provider_usage_cached: bool,
+    /// Today's usage priced at list API rates. This is not a bill — the usage
+    /// runs on a subscription — so the UI must label it as a conversion.
+    /// `None` when nothing could be priced at all.
+    /// `serde(default)` keeps payloads from older nodes parseable.
+    #[serde(default)]
+    pub cost_today: Option<f64>,
+    /// Models left out of `cost_today` for lack of a published price. Shown so
+    /// a partial total is never mistaken for the whole.
+    #[serde(default)]
+    pub unpriced_models: Vec<String>,
 }
 
 impl Default for ProviderStatus {
@@ -39,6 +49,8 @@ impl Default for ProviderStatus {
             error: None,
             provider_usage_fetched_at: None,
             provider_usage_cached: false,
+            cost_today: None,
+            unpriced_models: Vec::new(),
         }
     }
 }

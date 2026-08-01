@@ -155,6 +155,11 @@ final class StatusService {
             categories: accumulator.dailyCategoryTotals(dayKey: dayKey)[today] ?? [:],
             expectedBucketTimeZone: timeZone.identifier
         )
+        store?.recordModelCategories(
+            day: today, provider: "claude",
+            usage: accumulator.dailyModelCategoryTotals(dayKey: dayKey)[today] ?? [:],
+            expectedBucketTimeZone: timeZone.identifier
+        )
         let models = Self.sorted(totals)
         return AgentStatus(
             state: state(latest),
@@ -215,16 +220,19 @@ final class StatusService {
         var daily: [String: [String: Int]] = [:]
         var hourlyKeyed: [String: [String: Int]] = [:]
         var dailyCategories: [String: [String: Int]] = [:]
+        var dailyModelCategories: [String: [String: [String: Int]]] = [:]
         var latestRateLimits: [String: Any]?
         var latestRateLimitsTimestamp = ""
         for file in files where (modification(file) ?? .distantPast) >= start {
             guard let text = try? String(contentsOf: file, encoding: .utf8) else { continue }
             let lines = text.split(separator: "\n").map(String.init)
-            // 事件解析一次，按天/按小时/按分类各分桶一遍
+            // 事件解析一次，按天/按小时/按分类/按模型×分类各分桶一遍
             let events = Self.codexUsageEvents(lines: lines)
             Self.merge(Self.bucketCodexEvents(events, dayKey: dayKey), into: &daily)
             Self.merge(Self.bucketCodexEvents(events, dayKey: hourKey), into: &hourlyKeyed)
             Self.merge(Self.bucketCodexCategories(events, dayKey: dayKey), into: &dailyCategories)
+            Self.merge(Self.bucketCodexModelCategories(events, dayKey: dayKey),
+                       into: &dailyModelCategories)
             for line in lines where line.contains("\"token_count\"") {
                 guard let data = line.data(using: .utf8),
                       let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -248,6 +256,11 @@ final class StatusService {
         store?.recordHourly(
             day: today, provider: "codex",
             hours: Self.hourBuckets(from: hourlyKeyed, day: today),
+            expectedBucketTimeZone: timeZone.identifier
+        )
+        store?.recordModelCategories(
+            day: today, provider: "codex",
+            usage: dailyModelCategories[today] ?? [:],
             expectedBucketTimeZone: timeZone.identifier
         )
         store?.recordCategories(
@@ -553,6 +566,21 @@ final class StatusService {
             }
             return totals
         }
+
+        /// 按天聚合的 模型×分类 用量：[day: [model: [category: tokens]]]。
+        /// 解析时两维都在手上，只是上面两个方法各自丢掉了一维；算钱要两维同时在。
+        func dailyModelCategoryTotals(
+            dayKey: (Date) -> String = StatusService.dayKey
+        ) -> [String: [String: [String: Int]]] {
+            var totals: [String: [String: [String: Int]]] = [:]
+            for value in messages.values {
+                for (category, tokens) in value.categories {
+                    totals[dayKey(value.date), default: [:]][value.model, default: [:]][
+                        category, default: 0] += tokens
+                }
+            }
+            return totals
+        }
     }
 
     /// 单个 Codex 会话文件的行 -> (时间戳, 模型, token 增量, 分类增量) 事件序列。
@@ -658,6 +686,21 @@ final class StatusService {
         return totals
     }
 
+    /// Codex 侧的 模型×分类 交叉分桶，与 Claude 的 `dailyModelCategoryTotals` 同形
+    static func bucketCodexModelCategories(
+        _ events: [(date: Date, model: String, tokens: Int, categories: [String: Int])],
+        dayKey: (Date) -> String
+    ) -> [String: [String: [String: Int]]] {
+        var totals: [String: [String: [String: Int]]] = [:]
+        for event in events {
+            for (category, tokens) in event.categories {
+                totals[dayKey(event.date), default: [:]][event.model, default: [:]][
+                    category, default: 0] += tokens
+            }
+        }
+        return totals
+    }
+
     /// 单个 Codex 会话文件的行 -> 按天/模型的 token 增量
     static func codexDailyUsage(lines: [String],
                                 dayKey: (Date) -> String = StatusService.dayKey) -> [String: [String: Int]] {
@@ -668,6 +711,18 @@ final class StatusService {
         for (day, models) in addition {
             for (model, tokens) in models {
                 totals[day, default: [:]][model, default: 0] += tokens
+            }
+        }
+    }
+
+    /// 模型×分类 的三层合并，Codex 逐文件解析后汇总用
+    static func merge(_ addition: [String: [String: [String: Int]]],
+                      into totals: inout [String: [String: [String: Int]]]) {
+        for (day, models) in addition {
+            for (model, categories) in models {
+                for (category, tokens) in categories {
+                    totals[day, default: [:]][model, default: [:]][category, default: 0] += tokens
+                }
             }
         }
     }

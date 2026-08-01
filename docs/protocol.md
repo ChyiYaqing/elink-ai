@@ -86,3 +86,24 @@ Snapshots are absolute, not deltas. Receivers replace a source/day/provider
 only when its revision increases, so retries, relay through another host, and
 out-of-order delivery are idempotent. Offline nodes' last synchronized values
 remain part of aggregate history.
+
+Besides the required `models` map, a snapshot may carry two optional
+breakdowns: `hours` (`"0"`…`"23"` → model → tokens) and `categories` (model →
+`input`/`output`/`cache_read`/`cache_write`/`reasoning` → tokens). The latter
+is what lets a receiver price another node's usage, since a rate depends on
+both the model and the category. For both, a missing field and an empty object
+mean different things: missing is "the sender did not say" and must leave any
+previously stored breakdown intact, while an empty object means "there was
+none that day". Conflating the two lets one sync from an older node erase a
+breakdown that had already been received.
+
+Monetary amounts are never transmitted. Each node converts usage with its own
+price table, so hosts need not agree on prices — and a node that cannot price
+a model reports it as unpriced rather than counting it as zero.
+
+The content hash covers `models` only. Folding either breakdown into it would
+make different versions compute different hashes for identical usage, so they
+would never agree on what to pull. Receivers must also ignore snapshot fields
+they do not recognize, which is what keeps a mixed-version cluster in sync when
+one host upgrades first. `elink-tui` currently sends and consumes neither
+breakdown; it stays interoperable by ignoring both.

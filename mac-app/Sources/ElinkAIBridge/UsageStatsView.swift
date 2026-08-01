@@ -152,25 +152,47 @@ enum UsageStats {
         ]
     }
 
-    /// 当前范围窗口内的 token 分类总量；分类数据仅本机、按天累积
-    static func categoryTotals(rows: [DailyCategoryUsage], range: StatsRange,
-                               now: Date = Date()) -> [String: Int] {
-        var totals: [String: Int] = [:]
+    /// 某个 day 键是否落在当前范围窗口内。
+    /// 分类总量和金额必须共用这一套判断，否则面板上会出现「token 变了金额没跟着变」
+    /// 这种对不上的组合——两份各自实现的窗口逻辑迟早会分叉。
+    static func windowFilter(range: StatsRange, now: Date = Date()) -> (String) -> Bool {
         switch range {
         case .day:
             let today = StatusService.dayKey(now)
-            for row in rows where row.day == today {
-                totals[row.category, default: 0] += row.tokens
-            }
+            return { $0 == today }
         case .week, .month, .year:
             let keys = Set(buckets(rows: [], range: range, now: now).map(\.id))
-            for row in rows {
-                let key = range == .year ? String(row.day.prefix(7)) : row.day
-                guard keys.contains(key) else { continue }
-                totals[row.category, default: 0] += row.tokens
-            }
+            let monthly = range == .year
+            return { keys.contains(monthly ? String($0.prefix(7)) : $0) }
+        }
+    }
+
+    /// 当前范围窗口内的 token 分类总量；分类数据仅本机、按天累积
+    static func categoryTotals(rows: [DailyCategoryUsage], range: StatsRange,
+                               now: Date = Date()) -> [String: Int] {
+        let inWindow = windowFilter(range: range, now: now)
+        var totals: [String: Int] = [:]
+        for row in rows where inWindow(row.day) {
+            totals[row.category, default: 0] += row.tokens
         }
         return totals
+    }
+
+    /// 当前范围窗口内的 API 等价成本（美元），以及其中没有定价、因而未计入的模型。
+    ///
+    /// 这不是账单：日常用量走订阅，额度内并不按 token 收费。它回答的是
+    /// 「同样这些量走官方 API 要花多少」，展示时必须照这个口径措辞。
+    static func costTotal(rows: [ModelCategoryUsage], range: StatsRange,
+                          now: Date = Date(),
+                          table: [String: ModelPricing] = Pricing.table())
+        -> (cost: Double, unpriced: Set<String>) {
+        let inWindow = windowFilter(range: range, now: now)
+        return Pricing.total(rows: rows.filter { inWindow($0.day) }, table: table)
+    }
+
+    /// 金额文案。小额保留分位，超过 100 美元后分位没有意义，取整更好读。
+    static func costText(_ cost: Double) -> String {
+        cost >= 100 ? String(format: "$%.0f", cost) : String(format: "$%.2f", cost)
     }
 
     static let palette: [Color] = [
@@ -260,6 +282,7 @@ struct UsageStatsView: View {
     @State private var rows: [DailyModelUsage] = []
     @State private var hourlyRows: [HourlyModelUsage] = []
     @State private var categoryRows: [DailyCategoryUsage] = []
+    @State private var modelCategoryRows: [ModelCategoryUsage] = []
     @State private var loaded = false
     @State private var hoveredBucket: String?
     @State private var selectedNodeID = ""
@@ -295,6 +318,8 @@ struct UsageStatsView: View {
                         detail(buckets: buckets, order: order, colors: colors)
                         categorySection(
                             UsageStats.categoryTotals(rows: categoryRows, range: range))
+                        costSection(
+                            UsageStats.costTotal(rows: modelCategoryRows, range: range))
                         if UsageStats.showsDeviceShare(
                             clusterNodes: clusterNodes.count,
                             filteredToOneHost: effectiveNodeID != nil,
@@ -525,6 +550,38 @@ struct UsageStatsView: View {
     }
 
     /// Token 分类区块：占比条 + 各分类数量与百分比。分类数据仅本机记录，
+    /// 按官方 API 价折算的等价成本。措辞必须点明是折算：这些用量走的是订阅，
+    /// 显示成「费用」会被当成已经扣过的钱。没有定价的模型要说出来，
+    /// 否则残缺的总额会被当成全部。
+    @ViewBuilder
+    private func costSection(_ result: (cost: Double, unpriced: Set<String>)) -> some View {
+        if result.cost > 0 || !result.unpriced.isEmpty {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 5) {
+                    Text(tr("\(range.summaryTitle) API 等价成本",
+                            "\(range.summaryTitle) API-equivalent cost"))
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(theme.textSecondary)
+                    Spacer()
+                    Text(UsageStats.costText(result.cost))
+                        .font(.system(size: 11, weight: .bold, design: .monospaced))
+                        .foregroundStyle(theme.textPrimary)
+                }
+                Text(tr("按官方 API 价折算，非订阅实际扣费",
+                        "Converted at list API prices — not what your subscription charged"))
+                    .font(.system(size: 8))
+                    .foregroundStyle(theme.textTertiary)
+                if !result.unpriced.isEmpty {
+                    Text(tr("未计入无公开定价的模型：\(result.unpriced.sorted().joined(separator: "、"))",
+                            "Excludes models with no published price: "
+                                + result.unpriced.sorted().joined(separator: ", ")))
+                        .font(.system(size: 8))
+                        .foregroundStyle(theme.textTertiary)
+                }
+            }
+        }
+    }
+
     /// 从启用后随 5 分钟采集按天累积，历史日期不回填
     @ViewBuilder
     private func categorySection(_ totals: [String: Int]) -> some View {
@@ -699,10 +756,12 @@ struct UsageStatsView: View {
             let result = store.usage(provider: provider, since: since)
             let hourly = store.hourlyUsage(provider: provider, day: today)
             let categories = store.categoryUsage(provider: provider, since: since)
+            let modelCategories = store.modelCategoryUsage(provider: provider, since: since)
             DispatchQueue.main.async {
                 rows = result
                 hourlyRows = hourly
                 categoryRows = categories
+                modelCategoryRows = modelCategories
                 loaded = true
             }
         }

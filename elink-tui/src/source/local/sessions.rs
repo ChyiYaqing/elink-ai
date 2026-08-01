@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -50,7 +50,7 @@ pub fn full_daily_totals_in(
             continue;
         }
         let text = fs::read_to_string(&path).unwrap_or_default();
-        for (timestamp, model, tokens) in parse_codex_lines(&text).events {
+        for (timestamp, model, tokens, _categories) in parse_codex_lines(&text).events {
             *codex
                 .entry(day_key_in(timestamp, timezone))
                 .or_default()
@@ -68,12 +68,72 @@ pub struct ClaudeMessage {
     pub timestamp: i64,
     pub model: String,
     pub tokens: u64,
+    /// Per-category breakdown keyed by input / output / cache_read / cache_write.
+    /// Kept alongside the total because pricing depends on both the model and
+    /// the category — a summed total cannot be converted back into a cost.
+    pub categories: BTreeMap<String, u64>,
 }
 
 pub type ClaudeMessages = HashMap<String, ClaudeMessage>;
 
-/// (epoch seconds, model, token delta) for one Codex token_count event.
-pub type CodexEvent = (i64, String, u64);
+/// (epoch seconds, model, token delta, per-category deltas) for one Codex
+/// token_count event. Categories are disjoint: `cached` is subtracted out of
+/// `input` and `reasoning` out of `output`, so they sum back to the total.
+pub type CodexEvent = (i64, String, u64, BTreeMap<String, u64>);
+
+/// A Codex event before the file's model is known: subagent files emit
+/// token_count lines before declaring a model, so it stays optional until the
+/// fallback at the end of the parse resolves it.
+type PendingCodexEvent = (i64, Option<String>, u64, BTreeMap<String, u64>);
+
+/// Claude usage field -> category key. The four are disjoint, so they sum to
+/// the message total.
+const CLAUDE_CATEGORY_FIELDS: [(&str, &str); 4] = [
+    ("input_tokens", "input"),
+    ("output_tokens", "output"),
+    ("cache_creation_input_tokens", "cache_write"),
+    ("cache_read_input_tokens", "cache_read"),
+];
+
+/// Codex reports `cached` inside `input` and `reasoning` inside `output`.
+/// Subtract the overlap so the categories are disjoint and sum to the total.
+fn codex_disjoint_categories(fields: &BTreeMap<String, i64>) -> BTreeMap<String, u64> {
+    let get = |key: &str| fields.get(key).copied().unwrap_or(0).max(0);
+    let cached = get("cached_input_tokens");
+    let reasoning = get("reasoning_output_tokens");
+    let input = (get("input_tokens") - cached).max(0);
+    let output = (get("output_tokens") - reasoning).max(0);
+    let mut categories = BTreeMap::new();
+    for (key, value) in [
+        ("input", input),
+        ("output", output),
+        ("cache_read", cached),
+        ("reasoning", reasoning),
+    ] {
+        if value > 0 {
+            categories.insert(key.to_string(), value as u64);
+        }
+    }
+    categories
+}
+
+/// The category-relevant raw fields of one Codex token_count usage object.
+fn codex_category_fields(usage: &Value) -> BTreeMap<String, i64> {
+    [
+        "input_tokens",
+        "cached_input_tokens",
+        "output_tokens",
+        "reasoning_output_tokens",
+    ]
+    .iter()
+    .map(|key| {
+        (
+            (*key).to_string(),
+            usage.get(*key).and_then(Value::as_i64).unwrap_or(0),
+        )
+    })
+    .collect()
+}
 
 #[derive(Debug, Default, Clone)]
 pub struct CodexParsed {
@@ -330,6 +390,10 @@ pub struct ProviderScan {
     pub state: &'static str,
     pub models: Vec<ModelUsage>,
     pub tokens_today: u64,
+    /// model -> category -> tokens for today. Carried alongside `models`
+    /// because a cost needs both dimensions and the summed total cannot be
+    /// split back apart.
+    pub model_categories: HashMap<String, HashMap<String, u64>>,
 }
 
 pub struct ScanOutcome {
@@ -392,6 +456,9 @@ impl SessionScanner {
         let claude_totals = claude_daily_totals_in(&messages, self.timezone)
             .remove(&today)
             .unwrap_or_default();
+        let claude_categories = claude_model_category_totals(&messages, self.timezone)
+            .remove(&today)
+            .unwrap_or_default();
 
         let (codex_files, codex_rebuilt) = self.codex_files.files(start_of_day);
         if codex_rebuilt {
@@ -403,12 +470,17 @@ impl SessionScanner {
             .filter(|(_, mtime, _)| epoch(*mtime) >= start_of_day)
             .collect();
         let mut codex_totals: HashMap<String, u64> = HashMap::new();
+        let mut codex_categories: HashMap<String, HashMap<String, u64>> = HashMap::new();
         let mut latest_limits: Option<(String, Value)> = None;
         for (path, mtime, len) in &today_files {
             let parsed = cached_parse(&mut self.codex_cache, path, *mtime, *len, parse_codex_lines);
-            for (timestamp, model, tokens) in &parsed.events {
+            for (timestamp, model, tokens, categories) in &parsed.events {
                 if day_key_in(*timestamp, self.timezone) == today {
                     *codex_totals.entry(model.clone()).or_insert(0) += tokens;
+                    let bucket = codex_categories.entry(model.clone()).or_default();
+                    for (category, value) in categories {
+                        *bucket.entry(category.clone()).or_insert(0) += value;
+                    }
                 }
             }
             if let Some((timestamp, limits)) = parsed.rate_limits {
@@ -425,17 +497,22 @@ impl SessionScanner {
             .and_then(|(timestamp, limits)| Some((parse_iso_epoch(&timestamp)?, limits)));
 
         ScanOutcome {
-            claude: provider_scan(claude_state, claude_totals),
-            codex: provider_scan(codex_state, codex_totals),
+            claude: provider_scan(claude_state, claude_totals, claude_categories),
+            codex: provider_scan(codex_state, codex_totals, codex_categories),
             codex_rate_limits,
         }
     }
 }
 
-fn provider_scan(state: &'static str, totals: HashMap<String, u64>) -> ProviderScan {
+fn provider_scan(
+    state: &'static str,
+    totals: HashMap<String, u64>,
+    model_categories: HashMap<String, HashMap<String, u64>>,
+) -> ProviderScan {
     let models = sorted_models(totals);
     let tokens_today = models.iter().map(|value| value.tokens).sum();
     ProviderScan {
+        model_categories,
         state,
         models,
         tokens_today,
@@ -496,15 +573,16 @@ pub fn parse_claude_lines(text: &str, messages: &mut ClaudeMessages) {
         let Some(usage) = message.get("usage").filter(|value| value.is_object()) else {
             continue;
         };
-        let tokens: u64 = [
-            "input_tokens",
-            "output_tokens",
-            "cache_creation_input_tokens",
-            "cache_read_input_tokens",
-        ]
-        .iter()
-        .map(|key| token_count(usage.get(*key)))
-        .sum();
+        // The four fields are disjoint, so they double as the category split.
+        let mut categories = BTreeMap::new();
+        let mut tokens = 0u64;
+        for (field, category) in CLAUDE_CATEGORY_FIELDS {
+            let value = token_count(usage.get(field));
+            tokens += value;
+            if value > 0 {
+                categories.insert(category.to_string(), value);
+            }
+        }
         if tokens == 0 {
             continue;
         }
@@ -522,6 +600,7 @@ pub fn parse_claude_lines(text: &str, messages: &mut ClaudeMessages) {
                     timestamp,
                     model: normalized_model(message.get("model")),
                     tokens,
+                    categories,
                 },
             );
         }
@@ -547,6 +626,48 @@ pub fn claude_daily_totals_in(
     totals
 }
 
+/// Day -> model -> category -> tokens. Cost conversion needs both dimensions at
+/// once: the rate depends on the model *and* the category, so neither
+/// `claude_daily_totals` (model only) nor a category-only total can produce it.
+pub type ModelCategoryTotals = HashMap<String, HashMap<String, HashMap<String, u64>>>;
+
+pub fn claude_model_category_totals(
+    messages: &ClaudeMessages,
+    timezone: Option<Tz>,
+) -> ModelCategoryTotals {
+    let mut totals: ModelCategoryTotals = HashMap::new();
+    for message in messages.values() {
+        let day = totals
+            .entry(day_key_in(message.timestamp, timezone))
+            .or_default()
+            .entry(message.model.clone())
+            .or_default();
+        for (category, tokens) in &message.categories {
+            *day.entry(category.clone()).or_insert(0) += tokens;
+        }
+    }
+    totals
+}
+
+/// Codex counterpart, taking the already-parsed event deltas.
+pub fn codex_model_category_totals(
+    events: &[CodexEvent],
+    timezone: Option<Tz>,
+) -> ModelCategoryTotals {
+    let mut totals: ModelCategoryTotals = HashMap::new();
+    for (timestamp, model, _, categories) in events {
+        let day = totals
+            .entry(day_key_in(*timestamp, timezone))
+            .or_default()
+            .entry(model.clone())
+            .or_default();
+        for (category, tokens) in categories {
+            *day.entry(category.clone()).or_insert(0) += tokens;
+        }
+    }
+    totals
+}
+
 /// Port of StatusService.codexUsageEvents (usageParserVersion 2): token deltas
 /// prefer `last_token_usage.total_tokens`, an unchanged cumulative total means
 /// 0, otherwise the cumulative diff (or the cumulative itself on the first
@@ -555,10 +676,11 @@ pub fn claude_daily_totals_in(
 /// only a fully model-less file falls back to "unknown". Also captures the
 /// latest `payload.rate_limits` for the log-derived quota fallback.
 pub fn parse_codex_lines(text: &str) -> CodexParsed {
-    let mut events: Vec<(i64, Option<String>, u64)> = Vec::new();
+    let mut events: Vec<PendingCodexEvent> = Vec::new();
     let mut model: Option<String> = None;
     let mut first_model: Option<String> = None;
     let mut previous_total: Option<i64> = None;
+    let mut previous_fields: BTreeMap<String, i64> = BTreeMap::new();
     let mut rate_limits: Option<(String, Value)> = None;
     for line in text.lines() {
         let Ok(object) = serde_json::from_str::<Value>(line) else {
@@ -590,17 +712,39 @@ pub fn parse_codex_lines(text: &str) -> CodexParsed {
         else {
             continue;
         };
-        let last = info
-            .get("last_token_usage")
+        let last_usage = info.get("last_token_usage");
+        let last = last_usage
             .and_then(|value| value.get("total_tokens"))
             .and_then(Value::as_i64);
-        let delta = match (previous_total, last) {
-            (Some(previous), _) if cumulative == previous => 0,
-            (_, Some(last)) => last,
-            (Some(previous), None) => (cumulative - previous).max(0),
-            (None, None) => cumulative,
+        let cumulative_fields = info
+            .get("total_token_usage")
+            .map(codex_category_fields)
+            .unwrap_or_default();
+        // Category deltas follow the same three-way rule as the total: an
+        // unchanged cumulative means no work, an explicit last_token_usage is
+        // authoritative, otherwise fall back to differencing the cumulative.
+        let (delta, delta_fields) = match (previous_total, last) {
+            (Some(previous), _) if cumulative == previous => (0, BTreeMap::new()),
+            (_, Some(last)) => (
+                last,
+                last_usage.map(codex_category_fields).unwrap_or_default(),
+            ),
+            (Some(previous), None) => (
+                (cumulative - previous).max(0),
+                cumulative_fields
+                    .iter()
+                    .map(|(key, value)| {
+                        (
+                            key.clone(),
+                            (value - previous_fields.get(key).copied().unwrap_or(0)).max(0),
+                        )
+                    })
+                    .collect(),
+            ),
+            (None, None) => (cumulative, cumulative_fields.clone()),
         };
         previous_total = Some(cumulative);
+        previous_fields = cumulative_fields;
         if delta <= 0 {
             continue;
         }
@@ -611,14 +755,24 @@ pub fn parse_codex_lines(text: &str) -> CodexParsed {
         else {
             continue;
         };
-        events.push((timestamp, model.clone(), delta as u64));
+        events.push((
+            timestamp,
+            model.clone(),
+            delta as u64,
+            codex_disjoint_categories(&delta_fields),
+        ));
     }
     CodexParsed {
         events: events
             .into_iter()
-            .map(|(timestamp, model, tokens)| {
+            .map(|(timestamp, model, tokens, categories)| {
                 let model = model.or_else(|| first_model.clone());
-                (timestamp, normalized_model_string(model), tokens)
+                (
+                    timestamp,
+                    normalized_model_string(model),
+                    tokens,
+                    categories,
+                )
             })
             .collect(),
         rate_limits,
@@ -803,6 +957,124 @@ fn jsonl_files(root: &Path) -> Vec<(PathBuf, SystemTime, u64)> {
         }
     }
     files
+}
+
+#[cfg(test)]
+mod category_tests {
+    use super::*;
+    use crate::pricing;
+
+    /// The four Claude usage fields are disjoint, so they double as the split.
+    #[test]
+    fn claude_lines_keep_their_category_split() {
+        let mut messages = ClaudeMessages::new();
+        parse_claude_lines(
+            &serde_json::json!({
+                "timestamp": "1970-01-01T00:20:00.000Z",
+                "uuid": "u1",
+                "message": {"id": "m1", "model": "claude-opus-5", "usage": {
+                    "input_tokens": 10, "output_tokens": 2,
+                    "cache_creation_input_tokens": 3, "cache_read_input_tokens": 5}}
+            })
+            .to_string(),
+            &mut messages,
+        );
+        let message = messages.values().next().unwrap();
+        assert_eq!(message.tokens, 20);
+        assert_eq!(message.categories["input"], 10);
+        assert_eq!(message.categories["output"], 2);
+        assert_eq!(message.categories["cache_write"], 3);
+        assert_eq!(message.categories["cache_read"], 5);
+    }
+
+    /// Categories must sum back to the total, or the two numbers on screen
+    /// disagree with each other.
+    #[test]
+    fn claude_categories_sum_to_the_total() {
+        let mut messages = ClaudeMessages::new();
+        parse_claude_lines(
+            &serde_json::json!({
+                "timestamp": "1970-01-01T00:20:00.000Z",
+                "uuid": "u1",
+                "message": {"id": "m1", "model": "claude-opus-5", "usage": {
+                    "input_tokens": 11, "output_tokens": 7,
+                    "cache_creation_input_tokens": 3, "cache_read_input_tokens": 5}}
+            })
+            .to_string(),
+            &mut messages,
+        );
+        let message = messages.values().next().unwrap();
+        assert_eq!(message.categories.values().sum::<u64>(), message.tokens);
+    }
+
+    /// Codex nests cached inside input and reasoning inside output; the parser
+    /// has to subtract the overlap so the categories stay disjoint.
+    #[test]
+    fn codex_categories_are_disjoint() {
+        let parsed = parse_codex_lines(
+            &serde_json::json!({
+                "timestamp": "1970-01-01T00:20:00.000Z",
+                "type": "event_msg",
+                "payload": {"model": "gpt-5.6-sol", "type": "token_count", "info": {
+                    "total_token_usage": {"input_tokens": 100, "cached_input_tokens": 60,
+                        "output_tokens": 40, "reasoning_output_tokens": 10,
+                        "total_tokens": 140}}}
+            })
+            .to_string(),
+        );
+        let (_, _, tokens, categories) = &parsed.events[0];
+        assert_eq!(categories["input"], 40);
+        assert_eq!(categories["cache_read"], 60);
+        assert_eq!(categories["output"], 30);
+        assert_eq!(categories["reasoning"], 10);
+        assert_eq!(categories.values().sum::<u64>(), *tokens);
+    }
+
+    /// Deltas between events must be per-category, not just the total.
+    #[test]
+    fn codex_category_deltas_follow_the_cumulative() {
+        let first = serde_json::json!({
+            "timestamp": "1970-01-01T00:20:00.000Z", "type": "event_msg",
+            "payload": {"model": "gpt-5.6-sol", "type": "token_count", "info": {
+                "total_token_usage": {"input_tokens": 100, "cached_input_tokens": 0,
+                    "output_tokens": 0, "reasoning_output_tokens": 0, "total_tokens": 100}}}
+        });
+        let second = serde_json::json!({
+            "timestamp": "1970-01-01T00:21:00.000Z", "type": "event_msg",
+            "payload": {"model": "gpt-5.6-sol", "type": "token_count", "info": {
+                "total_token_usage": {"input_tokens": 150, "cached_input_tokens": 0,
+                    "output_tokens": 20, "reasoning_output_tokens": 0, "total_tokens": 170}}}
+        });
+        let parsed = parse_codex_lines(&format!("{first}\n{second}"));
+        assert_eq!(parsed.events.len(), 2);
+        let (_, _, tokens, categories) = &parsed.events[1];
+        assert_eq!(*tokens, 70);
+        assert_eq!(categories["input"], 50);
+        assert_eq!(categories["output"], 20);
+    }
+
+    /// End to end: parsed usage converts to a cost at published rates.
+    #[test]
+    fn parsed_usage_converts_to_a_cost() {
+        let mut messages = ClaudeMessages::new();
+        parse_claude_lines(
+            &serde_json::json!({
+                "timestamp": "1970-01-01T00:20:00.000Z",
+                "uuid": "u1",
+                "message": {"id": "m1", "model": "claude-opus-5", "usage": {
+                    "input_tokens": 1_000_000, "output_tokens": 1_000_000,
+                    "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}}
+            })
+            .to_string(),
+            &mut messages,
+        );
+        let totals = claude_model_category_totals(&messages, None);
+        let day = totals.values().next().unwrap();
+        // 1M input ($5) + 1M output ($25)
+        let result = pricing::total(day, &pricing::built_in());
+        assert!((result.cost - 30.0).abs() < 1e-9);
+        assert!(result.unpriced.is_empty());
+    }
 }
 
 #[cfg(test)]

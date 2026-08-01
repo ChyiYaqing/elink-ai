@@ -26,10 +26,25 @@ struct LegacyHistory {
     codex: DayTotals,
 }
 
+/// day -> model -> category -> tokens.
+pub type DayModelCategories = HashMap<String, HashMap<String, HashMap<String, u64>>>;
+
+/// One flushed day: (provider, day, model totals, model -> category totals).
+type DayWrite = (
+    String,
+    String,
+    HashMap<String, u64>,
+    HashMap<String, HashMap<String, u64>>,
+);
+
 #[derive(Default)]
 struct HistoryData {
     claude: DayTotals,
     codex: DayTotals,
+    /// Cost conversion needs the model and the category together; these ride
+    /// the same dirty set as the totals so the two can never drift apart.
+    claude_categories: DayModelCategories,
+    codex_categories: DayModelCategories,
     backfilled: bool,
     /// (provider, day) buckets changed in memory but not yet written.
     dirty: HashSet<(String, String)>,
@@ -55,12 +70,16 @@ impl History {
         match open_db(&path) {
             Ok(conn) => {
                 let (claude, codex) = load_days(&conn).unwrap_or_default();
+                let (claude_categories, codex_categories) =
+                    load_model_categories(&conn).unwrap_or_default();
                 let bucket_timezone = db::metadata_get(&conn, BUCKET_TIMEZONE_KEY).ok().flatten();
                 Self {
                     conn: Mutex::new(conn),
                     data: Mutex::new(HistoryData {
                         claude,
                         codex,
+                        claude_categories,
+                        codex_categories,
                         bucket_timezone,
                         ..HistoryData::default()
                     }),
@@ -118,13 +137,20 @@ impl History {
     /// Replaces one day's bucket with the latest scan result (the scan is
     /// authoritative for days whose logs are still on disk).
     pub fn record_day(&self, provider: &str, day: &str, models: &[ModelUsage]) {
-        self.record_day_inner(provider, day, models, None);
+        self.record_day_inner(provider, day, models, &HashMap::new(), None);
     }
 
     /// Same as `record_day`, but refuses to mix a new timezone into buckets
     /// until the atomic backfill migration has committed its marker.
-    pub fn record_day_in(&self, provider: &str, day: &str, models: &[ModelUsage], timezone: &str) {
-        self.record_day_inner(provider, day, models, Some(timezone));
+    pub fn record_day_in(
+        &self,
+        provider: &str,
+        day: &str,
+        models: &[ModelUsage],
+        model_categories: &HashMap<String, HashMap<String, u64>>,
+        timezone: &str,
+    ) {
+        self.record_day_inner(provider, day, models, model_categories, Some(timezone));
     }
 
     fn record_day_inner(
@@ -132,6 +158,7 @@ impl History {
         provider: &str,
         day: &str,
         models: &[ModelUsage],
+        model_categories: &HashMap<String, HashMap<String, u64>>,
         timezone: Option<&str>,
     ) {
         let totals: HashMap<String, u64> = models
@@ -142,12 +169,25 @@ impl History {
         if timezone.is_some_and(|timezone| data.bucket_timezone.as_deref() != Some(timezone)) {
             return;
         }
-        let days = match provider {
-            "claude" => &mut data.claude,
-            "codex" => &mut data.codex,
+        // Borrow the two maps one at a time: taking `&mut` on both fields in a
+        // single match is more than the borrow checker will allow here.
+        let claude = match provider {
+            "claude" => true,
+            "codex" => false,
             _ => return,
         };
-        if days.get(day) == Some(&totals) {
+        let unchanged_totals = if claude {
+            data.claude.get(day) == Some(&totals)
+        } else {
+            data.codex.get(day) == Some(&totals)
+        };
+        let categories_changed = !model_categories.is_empty()
+            && if claude {
+                data.claude_categories.get(day) != Some(model_categories)
+            } else {
+                data.codex_categories.get(day) != Some(model_categories)
+            };
+        if unchanged_totals && !categories_changed {
             return;
         }
         if totals.is_empty() {
@@ -155,8 +195,35 @@ impl History {
             // were cleaned up); only real totals overwrite.
             return;
         }
-        days.insert(day.to_string(), totals);
+        if claude {
+            data.claude.insert(day.to_string(), totals);
+        } else {
+            data.codex.insert(day.to_string(), totals);
+        }
+        if !model_categories.is_empty() {
+            let value = model_categories.clone();
+            if claude {
+                data.claude_categories.insert(day.to_string(), value);
+            } else {
+                data.codex_categories.insert(day.to_string(), value);
+            }
+        }
         data.dirty.insert((provider.to_string(), day.to_string()));
+    }
+
+    /// Today's model -> category usage for one provider, for cost conversion.
+    pub fn day_model_categories(
+        &self,
+        provider: &str,
+        day: &str,
+    ) -> HashMap<String, HashMap<String, u64>> {
+        let data = self.data();
+        let categories = match provider {
+            "claude" => &data.claude_categories,
+            "codex" => &data.codex_categories,
+            _ => return HashMap::new(),
+        };
+        categories.get(day).cloned().unwrap_or_default()
     }
 
     /// Merges a full backfill scan: every scanned day replaces the stored
@@ -310,20 +377,28 @@ impl History {
                 data.claude.retain(|day, _| day.as_str() >= key.as_str());
                 data.codex.retain(|day, _| day.as_str() >= key.as_str());
             }
-            let writes: Vec<(String, String, HashMap<String, u64>)> =
-                std::mem::take(&mut data.dirty)
-                    .into_iter()
-                    .map(|(provider, day)| {
-                        let bucket = match provider.as_str() {
-                            "claude" => data.claude.get(&day),
-                            "codex" => data.codex.get(&day),
-                            _ => None,
-                        }
-                        .cloned()
-                        .unwrap_or_default();
-                        (provider, day, bucket)
-                    })
-                    .collect();
+            if let Some(key) = &cutoff {
+                data.claude_categories
+                    .retain(|day, _| day.as_str() >= key.as_str());
+                data.codex_categories
+                    .retain(|day, _| day.as_str() >= key.as_str());
+            }
+            let writes: Vec<DayWrite> = std::mem::take(&mut data.dirty)
+                .into_iter()
+                .map(|(provider, day)| {
+                    let (bucket, categories) = match provider.as_str() {
+                        "claude" => (data.claude.get(&day), data.claude_categories.get(&day)),
+                        "codex" => (data.codex.get(&day), data.codex_categories.get(&day)),
+                        _ => (None, None),
+                    };
+                    (
+                        provider,
+                        day,
+                        bucket.cloned().unwrap_or_default(),
+                        categories.cloned().unwrap_or_default(),
+                    )
+                })
+                .collect();
             data.last_flush = now;
             (writes, cutoff)
         };
@@ -342,19 +417,19 @@ impl History {
     fn persist(
         &self,
         _now: i64,
-        writes: &[(String, String, HashMap<String, u64>)],
+        writes: &[DayWrite],
         cutoff: Option<&str>,
     ) -> Result<(), Vec<(String, String)>> {
         let restore = || {
             writes
                 .iter()
-                .map(|(p, d, _)| (p.clone(), d.clone()))
+                .map(|(p, d, _, _)| (p.clone(), d.clone()))
                 .collect()
         };
         let mut conn = self.conn();
         let transaction = conn.transaction().map_err(|_| restore())?;
         let result = (|| -> rusqlite::Result<()> {
-            for (provider, day, models) in writes {
+            for (provider, day, models, categories) in writes {
                 transaction.execute(
                     "DELETE FROM daily_model_usage WHERE provider = ?1 AND day = ?2",
                     (provider, day),
@@ -366,9 +441,32 @@ impl History {
                         (day, provider, model, *tokens as i64),
                     )?;
                 }
+                // An empty breakdown means this scan had none to offer; leave
+                // whatever is already stored rather than blanking the day.
+                if categories.is_empty() {
+                    continue;
+                }
+                transaction.execute(
+                    "DELETE FROM daily_model_category_usage WHERE provider = ?1 AND day = ?2",
+                    (provider, day),
+                )?;
+                for (model, buckets) in categories {
+                    for (category, tokens) in buckets {
+                        transaction.execute(
+                            "INSERT INTO daily_model_category_usage
+                             (day, provider, model, category, tokens)
+                             VALUES (?1, ?2, ?3, ?4, ?5)",
+                            (day, provider, model, category, *tokens as i64),
+                        )?;
+                    }
+                }
             }
             if let Some(cutoff) = cutoff {
                 transaction.execute("DELETE FROM daily_model_usage WHERE day < ?1", [cutoff])?;
+                transaction.execute(
+                    "DELETE FROM daily_model_category_usage WHERE day < ?1",
+                    [cutoff],
+                )?;
             }
             Ok(())
         })();
@@ -376,6 +474,40 @@ impl History {
             .and_then(|()| transaction.commit())
             .map_err(|_| restore())
     }
+}
+
+/// Loads the stored model x category breakdown, split by provider.
+fn load_model_categories(
+    conn: &Connection,
+) -> rusqlite::Result<(DayModelCategories, DayModelCategories)> {
+    let mut claude = DayModelCategories::new();
+    let mut codex = DayModelCategories::new();
+    let mut statement = conn.prepare(
+        "SELECT day, provider, model, category, tokens FROM daily_model_category_usage",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, i64>(4)?,
+        ))
+    })?;
+    for row in rows {
+        let (day, provider, model, category, tokens) = row?;
+        let days = match provider.as_str() {
+            "claude" => &mut claude,
+            "codex" => &mut codex,
+            _ => continue,
+        };
+        days.entry(day)
+            .or_default()
+            .entry(model)
+            .or_default()
+            .insert(category, tokens.max(0) as u64);
+    }
+    Ok((claude, codex))
 }
 
 /// Loads every stored day bucket, split by provider.
@@ -406,15 +538,21 @@ fn load_days(conn: &Connection) -> rusqlite::Result<(DayTotals, DayTotals)> {
     Ok((claude, codex))
 }
 
-fn all_writes(
-    claude: &DayTotals,
-    codex: &DayTotals,
-) -> Vec<(String, String, HashMap<String, u64>)> {
+/// Legacy migration and backfill rescans carry model totals only — the
+/// breakdown is left empty, and `persist` treats that as "nothing to say about
+/// categories" rather than blanking whatever is already stored.
+fn all_writes(claude: &DayTotals, codex: &DayTotals) -> Vec<DayWrite> {
     [("claude", claude), ("codex", codex)]
         .into_iter()
         .flat_map(|(provider, days)| {
-            days.iter()
-                .map(move |(day, models)| (provider.to_string(), day.clone(), models.clone()))
+            days.iter().map(move |(day, models)| {
+                (
+                    provider.to_string(),
+                    day.clone(),
+                    models.clone(),
+                    HashMap::new(),
+                )
+            })
         })
         .collect()
 }
@@ -637,6 +775,100 @@ mod tests {
             model: model.to_string(),
             tokens,
         }
+    }
+
+    fn categories(pairs: &[(&str, &[(&str, u64)])]) -> HashMap<String, HashMap<String, u64>> {
+        pairs
+            .iter()
+            .map(|(model, buckets)| {
+                (
+                    (*model).to_string(),
+                    buckets
+                        .iter()
+                        .map(|(key, value)| ((*key).to_string(), *value))
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// The breakdown must survive a flush and reopen, or the cost resets to
+    /// zero every time the dashboard restarts.
+    #[test]
+    fn model_categories_survive_a_flush_and_reopen() {
+        let path = temp_path();
+        let day = "2026-07-19";
+        {
+            let history = History::new(path.clone());
+            history.record_bucket_timezone("UTC");
+            history.record_day_in(
+                "claude",
+                day,
+                &[usage("claude-opus-5", 30)],
+                &categories(&[("claude-opus-5", &[("input", 10), ("output", 20)])]),
+                "UTC",
+            );
+            history.flush_if_dirty(
+                crate::util::epoch_now() + 10_000,
+                NaiveDate::from_ymd_opt(2026, 7, 19).unwrap(),
+            );
+        }
+        let reopened = History::new(path);
+        let stored = reopened.day_model_categories("claude", day);
+        assert_eq!(stored["claude-opus-5"]["input"], 10);
+        assert_eq!(stored["claude-opus-5"]["output"], 20);
+    }
+
+    /// A scan with no breakdown must not blank a day that already has one.
+    #[test]
+    fn empty_categories_do_not_erase_a_stored_breakdown() {
+        let history = temp_history();
+        let day = "2026-07-19";
+        history.record_bucket_timezone("UTC");
+        history.record_day_in(
+            "claude",
+            day,
+            &[usage("claude-opus-5", 30)],
+            &categories(&[("claude-opus-5", &[("input", 30)])]),
+            "UTC",
+        );
+        history.record_day_in(
+            "claude",
+            day,
+            &[usage("claude-opus-5", 45)],
+            &HashMap::new(),
+            "UTC",
+        );
+        assert_eq!(
+            history.day_model_categories("claude", day)["claude-opus-5"]["input"],
+            30
+        );
+    }
+
+    /// Categories changing on their own still has to mark the day dirty,
+    /// otherwise a same-total day silently never persists its breakdown.
+    #[test]
+    fn category_only_change_is_still_recorded() {
+        let history = temp_history();
+        let day = "2026-07-19";
+        history.record_bucket_timezone("UTC");
+        history.record_day_in(
+            "claude",
+            day,
+            &[usage("claude-opus-5", 30)],
+            &categories(&[("claude-opus-5", &[("input", 30)])]),
+            "UTC",
+        );
+        // Same total, different split (a cache read reclassified as input).
+        history.record_day_in(
+            "claude",
+            day,
+            &[usage("claude-opus-5", 30)],
+            &categories(&[("claude-opus-5", &[("input", 10), ("cache_read", 20)])]),
+            "UTC",
+        );
+        let stored = history.day_model_categories("claude", day);
+        assert_eq!(stored["claude-opus-5"]["cache_read"], 20);
     }
 
     #[test]
@@ -893,11 +1125,11 @@ mod tests {
     #[test]
     fn live_rows_wait_for_the_matching_timezone_marker() {
         let history = temp_history();
-        history.record_day_in("claude", "2026-07-19", &[usage("a", 10)], "UTC");
+        history.record_day_in("claude", "2026-07-19", &[usage("a", 10)], &HashMap::new(), "UTC");
         assert!(history.provider_days("claude").is_empty());
 
         history.record_bucket_timezone("UTC");
-        history.record_day_in("claude", "2026-07-19", &[usage("a", 10)], "UTC");
+        history.record_day_in("claude", "2026-07-19", &[usage("a", 10)], &HashMap::new(), "UTC");
         assert_eq!(history.provider_days("claude")["2026-07-19"]["a"], 10);
     }
 }

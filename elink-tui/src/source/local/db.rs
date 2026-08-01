@@ -75,6 +75,14 @@ fn create_schema(connection: &Connection) -> rusqlite::Result<()> {
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (day, provider, model)
         );
+        CREATE TABLE IF NOT EXISTS daily_model_category_usage (
+            day TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL,
+            category TEXT NOT NULL,
+            tokens INTEGER NOT NULL,
+            PRIMARY KEY (day, provider, model, category)
+        );
         CREATE TABLE IF NOT EXISTS provider_usage_cache (
             provider TEXT NOT NULL,
             window_type TEXT NOT NULL,

@@ -2160,6 +2160,10 @@ impl ClusterAgentStatus {
             error: self.error,
             provider_usage_fetched_at: self.usage_fetched_at.map(|value| value as i64),
             provider_usage_cached: self.usage_cached,
+            // Cost is derived locally from each node's own price table rather
+            // than shipped over the wire, so a remote snapshot carries none.
+            cost_today: None,
+            unpriced_models: Vec::new(),
         }
     }
 }
@@ -2329,6 +2333,52 @@ fn discard_expired(window: &mut ClusterUsageWindow, now: i64) {
     if window.reset_at.is_some_and(|reset| reset <= now as f64) {
         window.percent = None;
         window.reset_minutes = None;
+    }
+}
+
+#[cfg(test)]
+mod snapshot_compat_tests {
+    use super::*;
+
+    /// A newer mac-app sends `hours` and `categories` alongside `models`.
+    /// This node does not consume them yet, but it must keep parsing the
+    /// snapshot — a strict decode here would break sync across a mixed-version
+    /// cluster the moment one host upgrades.
+    #[test]
+    fn snapshot_with_unknown_fields_still_parses() {
+        let json = r#"{
+            "key": {"originNodeID": "node-a", "day": "2026-08-01", "provider": "claude"},
+            "revision": 3,
+            "observedAt": 1785000000.0,
+            "models": {"claude-opus-5": 42},
+            "hours": {"9": {"claude-opus-5": 42}},
+            "categories": {"claude-opus-5": {"input": 12, "output": 30}}
+        }"#;
+        let snapshot: ClusterUsageSnapshot =
+            serde_json::from_str(json).expect("forward-compatible decode");
+        assert_eq!(snapshot.revision, 3);
+        assert_eq!(snapshot.models["claude-opus-5"], 42);
+    }
+
+    /// The content hash must cover `models` only. If a newer node folded the
+    /// breakdown into the hash, the two versions would compute different
+    /// hashes for identical usage and never agree on what to pull.
+    #[test]
+    fn content_hash_ignores_the_breakdown() {
+        let with_breakdown = r#"{
+            "key": {"originNodeID": "node-a", "day": "2026-08-01", "provider": "claude"},
+            "revision": 3, "observedAt": 1785000000.0,
+            "models": {"claude-opus-5": 42},
+            "categories": {"claude-opus-5": {"input": 12, "output": 30}}
+        }"#;
+        let without = r#"{
+            "key": {"originNodeID": "node-a", "day": "2026-08-01", "provider": "claude"},
+            "revision": 3, "observedAt": 1785000000.0,
+            "models": {"claude-opus-5": 42}
+        }"#;
+        let a: ClusterUsageSnapshot = serde_json::from_str(with_breakdown).unwrap();
+        let b: ClusterUsageSnapshot = serde_json::from_str(without).unwrap();
+        assert_eq!(a.descriptor().content_hash, b.descriptor().content_hash);
     }
 }
 

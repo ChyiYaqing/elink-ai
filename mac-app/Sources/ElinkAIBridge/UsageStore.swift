@@ -26,6 +26,17 @@ struct DailyCategoryUsage: Equatable {
     var tokens: Int
 }
 
+/// 模型与分类的交叉用量。算钱必须同时知道这两维：单价既随模型变（Fable 是
+/// Sonnet 的三倍多），也随分类变（输出是输入的五倍、缓存读只有十分之一），
+/// 只按其中一维聚合的 `DailyModelUsage` / `DailyCategoryUsage` 都还原不出金额。
+struct ModelCategoryUsage: Equatable {
+    var day: String      // 本地时区 "yyyy-MM-dd"
+    var provider: String
+    var model: String
+    var category: String
+    var tokens: Int
+}
+
 /// 一个五分钟桶。`rttAvgUs` 为 nil 表示这五分钟一次都没通——必须与「0ms」区分，
 /// 否则图上会画出一条根本不存在的零延迟线。
 struct MeshBucketPoint: Equatable {
@@ -169,6 +180,20 @@ final class UsageStore {
             """
             if sqlite3_exec(db, createCategory, nil, nil, nil) != SQLITE_OK {
                 Log.error("category usage table create failed", category: "storage")
+            }
+            // 金额只能从这张交叉表算：单价同时取决于模型和分类，上面两张单维表都还原不出来
+            let createModelCategory = """
+            CREATE TABLE IF NOT EXISTS daily_model_category_usage (
+                day TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                model TEXT NOT NULL,
+                category TEXT NOT NULL,
+                tokens INTEGER NOT NULL,
+                PRIMARY KEY (day, provider, model, category)
+            )
+            """
+            if sqlite3_exec(db, createModelCategory, nil, nil, nil) != SQLITE_OK {
+                Log.error("model category usage table create failed", category: "storage")
             }
             let createCache = """
             CREATE TABLE IF NOT EXISTS provider_usage_cache (
@@ -513,6 +538,128 @@ final class UsageStore {
                 return nil
             }
             rows[String(cString: category)] = Int(sqlite3_column_int64(statement, 1))
+        }
+    }
+
+    /// 覆盖写入某天某 provider 的 模型×分类 用量。语义与 `recordCategories` 一致：
+    /// 空集当作“这次没读到日志”而不是“这天没用量”，直接忽略以免清掉已有数据。
+    func recordModelCategories(day: String, provider: String,
+                               usage: [String: [String: Int]],
+                               expectedBucketTimeZone: String?) {
+        var rows: [String: [String: Int]] = [:]
+        for (model, categories) in usage {
+            let positive = categories.filter { $0.value > 0 }
+            if !positive.isEmpty { rows[model] = positive }
+        }
+        guard !rows.isEmpty else { return }
+        let changed: Bool = queue.sync {
+            guard db != nil,
+                  sqlite3_exec(db, "BEGIN IMMEDIATE", nil, nil, nil) == SQLITE_OK else { return false }
+            let marker = metadataValueLocked(Self.bucketTimeZoneMetadataKey)
+            guard marker.succeeded, marker.value == expectedBucketTimeZone else {
+                _ = finishTransactionLocked(false)
+                return false
+            }
+            if let existing = modelCategoryRowsLocked(day: day, provider: provider), existing == rows {
+                _ = finishTransactionLocked(false)
+                return false
+            }
+            var succeeded = false
+            var deleteStatement: OpaquePointer?
+            if sqlite3_prepare_v2(
+                db, "DELETE FROM daily_model_category_usage WHERE day = ? AND provider = ?",
+                -1, &deleteStatement, nil) == SQLITE_OK {
+                sqlite3_bind_text(deleteStatement, 1, day, -1, Self.transient)
+                sqlite3_bind_text(deleteStatement, 2, provider, -1, Self.transient)
+                succeeded = sqlite3_step(deleteStatement) == SQLITE_DONE
+            }
+            sqlite3_finalize(deleteStatement)
+            if succeeded {
+                let insert = """
+                INSERT INTO daily_model_category_usage (day, provider, model, category, tokens)
+                VALUES (?, ?, ?, ?, ?)
+                """
+                var statement: OpaquePointer?
+                if sqlite3_prepare_v2(db, insert, -1, &statement, nil) == SQLITE_OK {
+                    outer: for (model, categories) in rows {
+                        for (category, tokens) in categories {
+                            sqlite3_reset(statement)
+                            sqlite3_bind_text(statement, 1, day, -1, Self.transient)
+                            sqlite3_bind_text(statement, 2, provider, -1, Self.transient)
+                            sqlite3_bind_text(statement, 3, model, -1, Self.transient)
+                            sqlite3_bind_text(statement, 4, category, -1, Self.transient)
+                            sqlite3_bind_int64(statement, 5, Int64(tokens))
+                            if sqlite3_step(statement) != SQLITE_DONE { succeeded = false; break outer }
+                        }
+                    }
+                } else {
+                    succeeded = false
+                }
+                sqlite3_finalize(statement)
+            }
+            // 与小时数据同理：组了集群就同时写一份到集群表，快照按需从那里取，
+            // 对端下次拉取就能拿到本机的分类分布并折算出金额。
+            if succeeded, let nodeID = clusterNodeID {
+                succeeded = replaceClusterCategoriesLocked(
+                    nodeID: nodeID, day: day, provider: provider, categories: rows
+                )
+            }
+            return finishTransactionLocked(succeeded)
+        }
+        if changed { Self.notifyDataChanged() }
+    }
+
+    /// 读单日 模型×分类 行；失败返回 nil（与“空日”区分）。须在 queue 内调用
+    private func modelCategoryRowsLocked(day: String,
+                                         provider: String) -> [String: [String: Int]]? {
+        let sql = """
+        SELECT model, category, tokens FROM daily_model_category_usage
+        WHERE day = ? AND provider = ?
+        """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return nil }
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_text(statement, 1, day, -1, Self.transient)
+        sqlite3_bind_text(statement, 2, provider, -1, Self.transient)
+        var rows: [String: [String: Int]] = [:]
+        while true {
+            let result = sqlite3_step(statement)
+            if result == SQLITE_DONE { return rows }
+            guard result == SQLITE_ROW,
+                  let model = sqlite3_column_text(statement, 0),
+                  let category = sqlite3_column_text(statement, 1) else { return nil }
+            rows[String(cString: model), default: [:]][String(cString: category)] =
+                Int(sqlite3_column_int64(statement, 2))
+        }
+    }
+
+    /// 金额折算的数据源。与分类表一样仅本机记录，不走集群聚合分支
+    func modelCategoryUsage(provider: String, since day: String) -> [ModelCategoryUsage] {
+        queue.sync {
+            guard db != nil else { return [] }
+            let sql = """
+            SELECT day, model, category, tokens FROM daily_model_category_usage
+            WHERE provider = ? AND day >= ? ORDER BY day, model, category
+            """
+            var statement: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return [] }
+            defer { sqlite3_finalize(statement) }
+            sqlite3_bind_text(statement, 1, provider, -1, Self.transient)
+            sqlite3_bind_text(statement, 2, day, -1, Self.transient)
+            var result: [ModelCategoryUsage] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                guard let dayText = sqlite3_column_text(statement, 0),
+                      let modelText = sqlite3_column_text(statement, 1),
+                      let categoryText = sqlite3_column_text(statement, 2) else { continue }
+                result.append(ModelCategoryUsage(
+                    day: String(cString: dayText),
+                    provider: provider,
+                    model: String(cString: modelText),
+                    category: String(cString: categoryText),
+                    tokens: Int(sqlite3_column_int64(statement, 3))
+                ))
+            }
+            return result
         }
     }
 
@@ -1546,8 +1693,29 @@ final class UsageStore {
         }
         sqlite3_finalize(statement)
         statement = nil
+
+        // 分类分布同样随快照发出，对端才折算得出这台机器的金额
+        let categoryRows = """
+        SELECT model, category, tokens FROM cluster_model_category_usage
+        WHERE origin_node_id = ? AND day = ? AND provider = ? ORDER BY model, category
+        """
+        var categories: [String: [String: Int]] = [:]
+        if sqlite3_prepare_v2(db, categoryRows, -1, &statement, nil) == SQLITE_OK {
+            sqlite3_bind_text(statement, 1, key.originNodeID, -1, Self.transient)
+            sqlite3_bind_text(statement, 2, key.day, -1, Self.transient)
+            sqlite3_bind_text(statement, 3, key.provider, -1, Self.transient)
+            while sqlite3_step(statement) == SQLITE_ROW,
+                  let model = sqlite3_column_text(statement, 0),
+                  let category = sqlite3_column_text(statement, 1) {
+                categories[String(cString: model), default: [:]][String(cString: category)]
+                    = Int(sqlite3_column_int64(statement, 2))
+            }
+        }
+        sqlite3_finalize(statement)
+        statement = nil
         return ClusterUsageSnapshot(
-            key: key, revision: revision, observedAt: observedAt, models: models, hours: hours
+            key: key, revision: revision, observedAt: observedAt, models: models,
+            hours: hours, categories: categories
         )
     }
 
@@ -1636,7 +1804,54 @@ final class UsageStore {
                 provider: snapshot.key.provider, hours: hours
             )
         }
+        // 与 hours 同理：nil 是「对端没提供」，保留旧值；空字典才是「确实没有」。
+        if succeeded, let categories = snapshot.categories {
+            succeeded = replaceClusterCategoriesLocked(
+                nodeID: snapshot.key.originNodeID, day: snapshot.key.day,
+                provider: snapshot.key.provider, categories: categories
+            )
+        }
         return succeeded
+    }
+
+    private func replaceClusterCategoriesLocked(
+        nodeID: String, day: String, provider: String,
+        categories: [String: [String: Int]]
+    ) -> Bool {
+        var statement: OpaquePointer?
+        let delete = """
+        DELETE FROM cluster_model_category_usage
+        WHERE origin_node_id = ? AND day = ? AND provider = ?
+        """
+        guard sqlite3_prepare_v2(db, delete, -1, &statement, nil) == SQLITE_OK else { return false }
+        sqlite3_bind_text(statement, 1, nodeID, -1, Self.transient)
+        sqlite3_bind_text(statement, 2, day, -1, Self.transient)
+        sqlite3_bind_text(statement, 3, provider, -1, Self.transient)
+        var succeeded = sqlite3_step(statement) == SQLITE_DONE
+        sqlite3_finalize(statement)
+        statement = nil
+        guard succeeded else { return false }
+
+        let insert = """
+        INSERT INTO cluster_model_category_usage
+          (origin_node_id, day, provider, model, category, tokens)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """
+        guard sqlite3_prepare_v2(db, insert, -1, &statement, nil) == SQLITE_OK else { return false }
+        defer { sqlite3_finalize(statement) }
+        for (model, buckets) in categories {
+            for (category, tokens) in buckets where tokens > 0 {
+                sqlite3_reset(statement)
+                sqlite3_bind_text(statement, 1, nodeID, -1, Self.transient)
+                sqlite3_bind_text(statement, 2, day, -1, Self.transient)
+                sqlite3_bind_text(statement, 3, provider, -1, Self.transient)
+                sqlite3_bind_text(statement, 4, model, -1, Self.transient)
+                sqlite3_bind_text(statement, 5, category, -1, Self.transient)
+                sqlite3_bind_int64(statement, 6, Int64(tokens))
+                if sqlite3_step(statement) != SQLITE_DONE { return false }
+            }
+        }
+        return true
     }
 
     private func snapshotCountLocked(originNodeID: String) -> Int {
@@ -1903,6 +2118,15 @@ final class UsageStore {
           model TEXT NOT NULL,
           tokens INTEGER NOT NULL,
           PRIMARY KEY (origin_node_id, day, hour, provider, model)
+        );
+        CREATE TABLE IF NOT EXISTS cluster_model_category_usage (
+          origin_node_id TEXT NOT NULL,
+          day TEXT NOT NULL,
+          provider TEXT NOT NULL,
+          model TEXT NOT NULL,
+          category TEXT NOT NULL,
+          tokens INTEGER NOT NULL,
+          PRIMARY KEY (origin_node_id, day, provider, model, category)
         );
         CREATE TABLE IF NOT EXISTS cluster_credentials (
           singleton INTEGER PRIMARY KEY CHECK (singleton = 1),

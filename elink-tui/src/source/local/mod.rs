@@ -9,6 +9,7 @@ pub mod sessions;
 pub mod store;
 pub mod stun;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -17,6 +18,7 @@ use std::time::{Duration, Instant};
 use crate::cluster::ClusterService;
 use crate::config::Config;
 use crate::model::{ProviderStatus, Snapshot};
+use crate::pricing::{self, ModelPricing};
 use crate::util::epoch_now;
 use history::History;
 use hooks::HookRegistry;
@@ -43,6 +45,9 @@ pub struct LocalSource {
     backfill_generation: Arc<AtomicU64>,
     backfill_running: Arc<AtomicBool>,
     cluster: Arc<ClusterService>,
+    /// Loaded once at startup: a price change means editing pricing.json and
+    /// restarting, which beats re-reading the file on every two-second poll.
+    prices: HashMap<String, ModelPricing>,
 }
 
 impl LocalSource {
@@ -105,6 +110,7 @@ impl LocalSource {
             backfill_generation: Arc::new(AtomicU64::new(0)),
             backfill_running: Arc::new(AtomicBool::new(false)),
             cluster,
+            prices: pricing::table(&pricing_override_path(&config.usage_db)),
         }
     }
 
@@ -264,17 +270,29 @@ impl LocalSource {
             let today = self.cluster.day_key(now);
             let timezone = self.bucket_timezone_id();
             if let Some(history) = &self.history {
-                history.record_day_in("claude", &today, &outcome.claude.models, &timezone);
-                history.record_day_in("codex", &today, &outcome.codex.models, &timezone);
+                history.record_day_in(
+                    "claude",
+                    &today,
+                    &outcome.claude.models,
+                    &outcome.claude.model_categories,
+                    &timezone,
+                );
+                history.record_day_in(
+                    "codex",
+                    &today,
+                    &outcome.codex.models,
+                    &outcome.codex.model_categories,
+                    &timezone,
+                );
                 history.flush_if_dirty(now, self.cluster.today());
             }
         }
 
-        let mut claude = provider_status(outcome.claude);
+        let mut claude = provider_status(outcome.claude, &self.prices);
         apply_usage(&mut claude, &self.quota.claude(now), now);
         self.hooks.apply("claude", &mut claude, now);
 
-        let mut codex = provider_status(outcome.codex);
+        let mut codex = provider_status(outcome.codex, &self.prices);
         // Log-derived quota is the codex base; a live fetch overlays it.
         if let Some((observed_at, limits)) = &outcome.codex_rate_limits {
             let (primary, weekly) = quota::codex_log_windows(limits, now);
@@ -309,15 +327,30 @@ impl LocalSource {
     }
 }
 
+/// pricing.json sits next to usage.db, mirroring where the mac-app looks.
+fn pricing_override_path(usage_db: &std::path::Path) -> PathBuf {
+    usage_db
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join("pricing.json")
+}
+
 fn listener_retry_due(retry_at: Option<Instant>, now: Instant) -> bool {
     retry_at.is_none_or(|retry_at| now >= retry_at)
 }
 
-fn provider_status(scan: ProviderScan) -> ProviderStatus {
+fn provider_status(scan: ProviderScan, prices: &HashMap<String, ModelPricing>) -> ProviderStatus {
+    // Priced from the scan's own breakdown, so the figure matches the tokens
+    // shown next to it even before the day is flushed to disk.
+    let total = pricing::total(&scan.model_categories, prices);
+    let mut unpriced: Vec<String> = total.unpriced.into_iter().collect();
+    unpriced.sort();
     ProviderStatus {
         status: scan.state.to_string(),
         tokens_today: scan.tokens_today,
         model_usage_today: scan.models,
+        cost_today: (!scan.model_categories.is_empty()).then_some(total.cost),
+        unpriced_models: unpriced,
         ..ProviderStatus::default()
     }
 }
@@ -345,6 +378,81 @@ fn set_windows(status: &mut ProviderStatus, primary: UsageWindow, weekly: UsageW
     status.primary_reset_min = primary.reset_minutes(now);
     status.weekly_pct = weekly.percent;
     status.weekly_reset_min = weekly.reset_minutes(now);
+}
+
+#[cfg(test)]
+mod cost_tests {
+    use super::*;
+    use crate::model::ModelUsage;
+
+    fn scan(model_categories: HashMap<String, HashMap<String, u64>>) -> ProviderScan {
+        let tokens = model_categories
+            .values()
+            .flat_map(|buckets| buckets.values())
+            .sum();
+        ProviderScan {
+            state: "idle",
+            models: model_categories
+                .keys()
+                .map(|model| ModelUsage {
+                    model: model.clone(),
+                    tokens,
+                })
+                .collect(),
+            tokens_today: tokens,
+            model_categories,
+        }
+    }
+
+    fn categories(pairs: &[(&str, &[(&str, u64)])]) -> HashMap<String, HashMap<String, u64>> {
+        pairs
+            .iter()
+            .map(|(model, buckets)| {
+                (
+                    (*model).to_string(),
+                    buckets
+                        .iter()
+                        .map(|(key, value)| ((*key).to_string(), *value))
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn provider_status_prices_the_scan_breakdown() {
+        // 1M input ($5) + 1M output ($25) on opus-5
+        let status = provider_status(
+            scan(categories(&[(
+                "claude-opus-5",
+                &[("input", 1_000_000), ("output", 1_000_000)],
+            )])),
+            &pricing::built_in(),
+        );
+        assert!((status.cost_today.expect("cost") - 30.0).abs() < 1e-9);
+        assert!(status.unpriced_models.is_empty());
+    }
+
+    /// An unpriced model must be named, not folded into the total as zero.
+    #[test]
+    fn provider_status_reports_unpriced_models() {
+        let status = provider_status(
+            scan(categories(&[
+                ("claude-opus-5", &[("input", 1_000_000)]),
+                ("codex-auto-review", &[("input", 9_000_000)]),
+            ])),
+            &pricing::built_in(),
+        );
+        assert!((status.cost_today.expect("cost") - 5.0).abs() < 1e-9);
+        assert_eq!(status.unpriced_models, vec!["codex-auto-review".to_string()]);
+    }
+
+    /// No usage at all means no figure, rather than a misleading $0.00.
+    #[test]
+    fn provider_status_without_usage_has_no_cost() {
+        let status = provider_status(scan(HashMap::new()), &pricing::built_in());
+        assert_eq!(status.cost_today, None);
+    }
 }
 
 #[cfg(test)]

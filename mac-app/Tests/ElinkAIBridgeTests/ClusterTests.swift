@@ -118,6 +118,58 @@ final class ClusterTests: XCTestCase {
         )
     }
 
+    /// 分类分布必须随快照落库，否则远端节点的用量算不出金额
+    func testRemoteSnapshotCarriesTheCategoryBreakdown() {
+        let (store, path) = store()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        store.configureClusterStorage(nodeID: "node-a", nodeName: "Mac A", aggregationEnabled: true)
+        let key = ClusterSnapshotKey(originNodeID: "node-b", day: "2026-07-15", provider: "claude")
+        _ = store.mergeClusterSnapshots([ClusterUsageSnapshot(
+            key: key, revision: 1, observedAt: Date(),
+            models: ["claude-opus-5": 300],
+            categories: ["claude-opus-5": ["input": 100, "output": 200]]
+        )], ifEpoch: store.clusterDataEpoch())
+
+        let stored = store.clusterSnapshots(keys: [key]).first
+        XCTAssertEqual(stored?.categories?["claude-opus-5"], ["input": 100, "output": 200])
+    }
+
+    /// 内容哈希只覆盖 models：把分类算进去，新旧版本对同一份用量会算出不同哈希，
+    /// 混版集群从此互相不认。
+    func testContentHashIgnoresTheCategoryBreakdown() {
+        let key = ClusterSnapshotKey(originNodeID: "node-b", day: "2026-07-15", provider: "claude")
+        let observedAt = Date()
+        let bare = ClusterUsageSnapshot(key: key, revision: 1, observedAt: observedAt,
+                                        models: ["claude-opus-5": 300])
+        let detailed = ClusterUsageSnapshot(
+            key: key, revision: 1, observedAt: observedAt,
+            models: ["claude-opus-5": 300],
+            categories: ["claude-opus-5": ["input": 100, "output": 200]]
+        )
+        XCTAssertEqual(bare.descriptor.contentHash, detailed.descriptor.contentHash)
+    }
+
+    /// 老节点不发分类（nil），不能把已经收到的那份抹掉——nil 与空字典意思不同
+    func testSnapshotWithoutCategoriesKeepsThePreviousBreakdown() {
+        let (store, path) = store()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        store.configureClusterStorage(nodeID: "node-a", nodeName: "Mac A", aggregationEnabled: true)
+        let key = ClusterSnapshotKey(originNodeID: "node-b", day: "2026-07-15", provider: "claude")
+        _ = store.mergeClusterSnapshots([ClusterUsageSnapshot(
+            key: key, revision: 1, observedAt: Date(),
+            models: ["claude-opus-5": 300],
+            categories: ["claude-opus-5": ["input": 100, "output": 200]]
+        )], ifEpoch: store.clusterDataEpoch())
+        // 老版本节点的后续快照：只有 models
+        _ = store.mergeClusterSnapshots([ClusterUsageSnapshot(
+            key: key, revision: 2, observedAt: Date(), models: ["claude-opus-5": 500]
+        )], ifEpoch: store.clusterDataEpoch())
+
+        let stored = store.clusterSnapshots(keys: [key]).first
+        XCTAssertEqual(stored?.models["claude-opus-5"], 500)
+        XCTAssertEqual(stored?.categories?["claude-opus-5"], ["input": 100, "output": 200])
+    }
+
     func testRemoteSnapshotsAreIdempotentAndOlderRevisionCannotOverwrite() {
         let (store, path) = store()
         defer { try? FileManager.default.removeItem(atPath: path) }

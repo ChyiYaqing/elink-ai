@@ -23,18 +23,26 @@ struct ClusterUsageSnapshot: Codable, Equatable {
     /// Linux 上的 elink-tui 还没实现），空字典才是「这天没有用量」。分不清这两者，
     /// 一台不发小时数据的节点就会在「今日」里显示成零，而不是显示成未知。
     let hours: [String: [String: Int]]?
+    /// 这一天的 模型 → 分类 → token，用来把远端用量折算成金额。
+    ///
+    /// 与 `hours` 同样是可选，且 nil 与空字典意思不同：nil 是「对端没告诉我」，
+    /// 这时那台机器的金额只能显示成未知；空字典才是「这天没有用量」。金额本身
+    /// 不过网——各节点用自己的价格表折算，价格表不必在集群里保持一致。
+    let categories: [String: [String: Int]]?
 
     init(key: ClusterSnapshotKey, revision: Int64, observedAt: Date,
-         models: [String: Int], hours: [String: [String: Int]]? = nil) {
+         models: [String: Int], hours: [String: [String: Int]]? = nil,
+         categories: [String: [String: Int]]? = nil) {
         self.key = key
         self.revision = revision
         self.observedAt = observedAt
         self.models = models
         self.hours = hours
+        self.categories = categories
     }
 
-    /// 内容哈希只覆盖 models：拉取与否由 revision 决定，而把小时数据算进哈希会让
-    /// 新旧版本对同一份快照算出不同的值，在混版集群里永远互相不认。
+    /// 内容哈希只覆盖 models：拉取与否由 revision 决定，而把小时或分类数据算进
+    /// 哈希会让新旧版本对同一份快照算出不同的值，在混版集群里永远互相不认。
     var descriptor: ClusterSnapshotDescriptor {
         ClusterSnapshotDescriptor(key: key, revision: revision, contentHash: Self.hash(models))
     }

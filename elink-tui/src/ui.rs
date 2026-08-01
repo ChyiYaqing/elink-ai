@@ -227,15 +227,28 @@ fn provider_lines(
     scroll: usize,
 ) -> Vec<Line<'static>> {
     let width = inner.width as usize;
-    let mut lines = vec![
-        two_column(
-            "Tokens today",
-            &format_tokens(provider.tokens_today),
+    let mut lines = vec![two_column(
+        "Tokens today",
+        &format_tokens(provider.tokens_today),
+        width,
+        Style::new().bold(),
+    )];
+    // Labelled "API cost" rather than "cost": the usage runs on a subscription,
+    // and this is what it would have cost at list API rates.
+    if let Some(cost) = provider.cost_today {
+        let label = if provider.unpriced_models.is_empty() {
+            "API cost today".to_string()
+        } else {
+            format!("API cost today ({} unpriced)", provider.unpriced_models.len())
+        };
+        lines.push(two_column(
+            &label,
+            &crate::pricing::format_cost(cost),
             width,
-            Style::new().bold(),
-        ),
-        Line::raw(""),
-    ];
+            Style::new().dim(),
+        ));
+    }
+    lines.push(Line::raw(""));
 
     // Quota, error, and the separating blank line occupy the bottom; the
     // model list gets the rest. Reserve another row for the overflow marker
@@ -1152,6 +1165,53 @@ mod tests {
         assert_eq!(bottom[0].style.bg, Some(Color::Black));
 
         assert!(preview_lines(&preview, 0, 0).is_empty());
+    }
+
+    fn line_text(lines: &[Line<'static>]) -> String {
+        lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    /// The cost has to say "API" — the usage is on a subscription, and a bare
+    /// "cost" reads as money already charged.
+    #[test]
+    fn cost_line_is_labelled_as_an_api_conversion() {
+        let provider = ProviderStatus {
+            tokens_today: 1_000_000,
+            cost_today: Some(5.0),
+            ..ProviderStatus::default()
+        };
+        let text = line_text(&provider_lines(&provider, 0, Rect::new(0, 0, 40, 12), 0));
+        assert!(text.contains("API cost today"), "{text}");
+        assert!(text.contains("$5.00"), "{text}");
+    }
+
+    /// A partial total must announce that something was left out.
+    #[test]
+    fn unpriced_models_are_counted_on_the_cost_line() {
+        let provider = ProviderStatus {
+            tokens_today: 1_000_000,
+            cost_today: Some(5.0),
+            unpriced_models: vec!["codex-auto-review".to_string()],
+            ..ProviderStatus::default()
+        };
+        let text = line_text(&provider_lines(&provider, 0, Rect::new(0, 0, 40, 12), 0));
+        assert!(text.contains("1 unpriced"), "{text}");
+    }
+
+    /// No priced usage means no line at all, rather than a misleading $0.00.
+    #[test]
+    fn no_cost_means_no_cost_line() {
+        let provider = ProviderStatus {
+            tokens_today: 1_000_000,
+            cost_today: None,
+            ..ProviderStatus::default()
+        };
+        let text = line_text(&provider_lines(&provider, 0, Rect::new(0, 0, 40, 12), 0));
+        assert!(!text.contains("API cost"), "{text}");
     }
 
     #[test]
