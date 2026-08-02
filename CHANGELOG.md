@@ -6,6 +6,16 @@ and `Removed`.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## 0.1.20-rc3
+
+### Fixed
+
+- Codex showed no cost in any range, despite months of recorded usage. The
+  history backfill wrote only this Mac's own table, while a paired Mac reads the
+  cluster one — so a provider that happened to be idle today never landed there
+  at all. The backfill now fills both, and databases from the previous build are
+  rebuilt once on launch to pick up what they are missing.
+
 ## 0.1.20-rc2
 
 ### Fixed
