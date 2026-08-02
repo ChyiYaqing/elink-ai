@@ -675,6 +675,13 @@ final class UsageStore {
                     }
                 }
                 sqlite3_finalize(statement)
+                // 组了集群就得同时补一份到集群表：读路径走的是那张表，只写本机表
+                // 等于白填——本机今天没用过的 provider 会一整年都没有金额。
+                if succeeded, let nodeID = clusterNodeID {
+                    succeeded = replaceClusterCategoryHistoryLocked(
+                        nodeID: nodeID, provider: provider, days: days
+                    )
+                }
             }
             return finishTransactionLocked(succeeded)
         }
@@ -1933,6 +1940,49 @@ final class UsageStore {
             )
         }
         return succeeded
+    }
+
+    /// 回填口径：把本机某 provider 的全部历史分类一次性重建进集群表。
+    /// 与按天覆盖的 `replaceClusterCategoriesLocked` 分开，因为回填扫描覆盖的是
+    /// 整段历史，留下旧行会让改过归属的天既算新的又算旧的。
+    private func replaceClusterCategoryHistoryLocked(
+        nodeID: String, provider: String, days: DayModelCategories
+    ) -> Bool {
+        var statement: OpaquePointer?
+        let delete = """
+        DELETE FROM cluster_model_category_usage
+        WHERE origin_node_id = ? AND provider = ?
+        """
+        guard sqlite3_prepare_v2(db, delete, -1, &statement, nil) == SQLITE_OK else { return false }
+        sqlite3_bind_text(statement, 1, nodeID, -1, Self.transient)
+        sqlite3_bind_text(statement, 2, provider, -1, Self.transient)
+        let deleted = sqlite3_step(statement) == SQLITE_DONE
+        sqlite3_finalize(statement)
+        statement = nil
+        guard deleted else { return false }
+
+        let insert = """
+        INSERT INTO cluster_model_category_usage
+          (origin_node_id, day, provider, model, category, tokens)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """
+        guard sqlite3_prepare_v2(db, insert, -1, &statement, nil) == SQLITE_OK else { return false }
+        defer { sqlite3_finalize(statement) }
+        for (day, models) in days {
+            for (model, categories) in models {
+                for (category, tokens) in categories where tokens > 0 {
+                    sqlite3_reset(statement)
+                    sqlite3_bind_text(statement, 1, nodeID, -1, Self.transient)
+                    sqlite3_bind_text(statement, 2, day, -1, Self.transient)
+                    sqlite3_bind_text(statement, 3, provider, -1, Self.transient)
+                    sqlite3_bind_text(statement, 4, model, -1, Self.transient)
+                    sqlite3_bind_text(statement, 5, category, -1, Self.transient)
+                    sqlite3_bind_int64(statement, 6, Int64(tokens))
+                    if sqlite3_step(statement) != SQLITE_DONE { return false }
+                }
+            }
+        }
+        return true
     }
 
     private func replaceClusterCategoriesLocked(

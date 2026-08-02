@@ -370,7 +370,10 @@ final class StatusService {
 
     /// 解析行为变化时递增：触发一次精确重建，清洗旧解析器写入的错误归因。
     /// v2：subagent 文件里模型声明前的 token_count 归属文件首个声明的模型。
-    static let usageParserVersion = "2"
+    /// v3：分类明细的历史回填。解析没变，但已经装过前一版的库里，集群表缺这份
+    /// 数据——金额读的正是集群表，不重跑一次，本机当天没用过的 provider 会在所有
+    /// 区间里都没有金额。
+    static let usageParserVersion = "3"
 
     /// 启动时后台回填近一年历史，让统计页首次打开就有周/月/年数据
     @discardableResult

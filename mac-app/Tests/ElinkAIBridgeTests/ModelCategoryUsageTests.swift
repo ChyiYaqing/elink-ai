@@ -177,6 +177,29 @@ final class ModelCategoryUsageTests: XCTestCase {
         XCTAssertTrue(store.modelCategoryUsage(provider: "claude", since: "2026-07-01").isEmpty)
     }
 
+    /// 回填必须同时补进集群表：读路径在组了集群时走的是那张表。
+    /// 只写本机表的话，本机今天没用过的 provider（比如今天没跑 codex）
+    /// 会在所有区间里都没有金额，哪怕历史用量摆在那里。
+    func testBackfillAlsoFeedsTheClusterReadPath() {
+        let (store, path) = store()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        store.configureClusterStorage(nodeID: "node-a", nodeName: "Mac A", aggregationEnabled: true)
+        // 集群口径要 JOIN 快照，先让这一天有一份本机快照
+        store.record(day: "2026-07-18", provider: "codex",
+                     models: ["gpt-5.6-sol": 1_000_000], expectedBucketTimeZone: nil)
+
+        store.backfillModelCategories(expectedTimeZone: nil, usage: [
+            "codex": ["2026-07-18": ["gpt-5.6-sol": ["input": 1_000_000]]],
+        ])
+
+        // 走 UI 实际使用的入口（集群启用 -> 集群表）
+        let rows = store.modelCategoryUsage(provider: "codex", since: "2026-07-01")
+        XCTAssertEqual(rows.count, 1, "回填的历史必须能从集群口径读到")
+        XCTAssertEqual(rows[0].tokens, 1_000_000)
+        XCTAssertEqual(Pricing.total(rows: rows, table: Pricing.builtIn).cost, 5,
+                       accuracy: 0.000_001)
+    }
+
     // MARK: - 端到端折算
 
     /// 存进去的用量能按官方价折算出金额，这是整条链路的最终目的
