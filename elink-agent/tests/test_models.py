@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+
 from elink_agent.models import StatusSnapshot
 
 
@@ -32,6 +35,45 @@ def test_parse_bridge_shape_and_preserve_overage_percentage():
         ("claude-opus", 12),
     ]
     assert snapshot.codex.primary_pct == 12.5
+
+
+def test_parse_sanitized_dynamic_fields_and_ignore_invalid_entries():
+    snapshot = StatusSnapshot.from_dict({
+        "current_sessions": [
+            {"id": "session-1", "provider": "claude", "project": "elink-ai",
+             "model": "sonnet", "state": "working", "updated_at": 123},
+            {"id": "bad", "provider": "unknown"},
+        ],
+        "recent_events": [
+            {"id": "event-1", "provider": "codex", "kind": "needs_input",
+             "occurred_at": 124},
+            {"id": "bad", "provider": "codex", "kind": "raw_prompt"},
+        ],
+    })
+
+    assert [(item.id, item.project, item.state) for item in snapshot.current_sessions] == [
+        ("session-1", "elink-ai", "working"),
+    ]
+    assert [(item.id, item.kind) for item in snapshot.recent_events] == [
+        ("event-1", "needs_input"),
+    ]
+
+
+def test_dynamic_fields_are_optional_and_limited_to_three_items():
+    assert StatusSnapshot.from_dict({}).current_sessions == []
+    items = [{"provider": "invalid"}] + [
+        {"id": f"s{index}", "provider": "codex", "state": "idle"}
+             for index in range(5)]
+    parsed = StatusSnapshot.from_dict({"current_sessions": items}).current_sessions
+    assert [item.id for item in parsed] == ["s0", "s1", "s2"]
+
+
+def test_shared_status_fixture_contains_the_dynamic_contract():
+    fixture = Path(__file__).parents[2] / "fixtures" / "status-v1.json"
+    snapshot = StatusSnapshot.from_dict(json.loads(fixture.read_text()))
+
+    assert snapshot.current_sessions[0].project == "elink-ai"
+    assert snapshot.recent_events[0].kind == "needs_input"
 
 
 def test_percentage_clamps_negative_and_rejects_non_finite_values():

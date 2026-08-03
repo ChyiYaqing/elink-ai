@@ -113,6 +113,7 @@ def test_busy_timeout_closes_spi_and_powers_off():
         image = Image.new("1", (648, 480), 255)
         with pytest.raises(TimeoutError, match="BUSY remained low"):
             display.show(image, kind="full")
+        assert display.last_busy_wait_s >= 0.01
         assert not display._opened
         assert spi.opened is None
         assert display._power.value == 0

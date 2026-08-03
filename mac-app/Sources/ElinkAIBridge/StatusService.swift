@@ -14,6 +14,8 @@ final class StatusService {
     private var cachedAt = Date.distantPast
     private var hooks: [String: HookState] = [:]
     private var needsInput: [String: Date] = [:]
+    private var currentSessions: [BridgeSessionSummary] = []
+    private var recentEvents: [BridgeRecentEvent] = []
     private var historyMaintenanceRetryPending = false
     /// Claude transcript 的增量读取状态：每个文件已经解析到第几个字节，以及跨轮
     /// 保留的累加器。
@@ -64,6 +66,10 @@ final class StatusService {
                 claude: value.claude.usageFetchedAt,
                 codex: value.codex.usageFetchedAt
             )
+            value.currentSessions = currentSessions
+            value.recentEvents = recentEvents.filter {
+                Date().timeIntervalSince($0.occurredAt) < 6 * 3600
+            }
             return value
         }
     }
@@ -78,17 +84,75 @@ final class StatusService {
             let now = Date()
             if ["PermissionRequest", "Elicitation"].contains(event)
                 || (event == "Notification" && isPermission(message)) {
+                if !Self.attentionIsCurrent(previousAt: needsInput[agent], now: now) {
+                    appendRecentEvent(provider: agent, kind: "needs_input", at: now)
+                }
                 needsInput[agent] = now
                 return
             }
             let working = ["UserPromptSubmit", "PreToolUse", "PostToolUse", "SubagentStart",
                            "SubagentStop", "PreCompact", "PostCompact", "WorktreeCreate"]
             let idle = ["Stop", "SessionEnd", "SessionStart"]
-            if working.contains(event) { hooks[agent] = HookState(state: "working", at: now) }
-            else if idle.contains(event) { hooks[agent] = HookState(state: "idle", at: now) }
+            let state: String
+            if working.contains(event) { state = "working" }
+            else if idle.contains(event) { state = "idle" }
             else { return }
+            let sameCurrentState = Self.stateIsCurrent(
+                previousState: hooks[agent]?.state, previousAt: hooks[agent]?.at,
+                state: state, now: now
+            )
+            if !sameCurrentState {
+                appendRecentEvent(provider: agent, kind: state, at: now)
+            }
+            hooks[agent] = HookState(state: state, at: now)
             needsInput.removeValue(forKey: agent)
         }
+    }
+
+    func updateSessions(_ sessions: [AgentSession]) {
+        lock.holding { currentSessions = Self.sessionSummaries(sessions) }
+    }
+
+    static func sessionSummaries(_ sessions: [AgentSession]) -> [BridgeSessionSummary] {
+        sessions.filter(\.anyLive).prefix(3).map { session in
+            let rawID = session.threadID.isEmpty
+                ? URL(fileURLWithPath: session.id).deletingPathExtension().lastPathComponent
+                : session.threadID
+            return BridgeSessionSummary(
+                id: protocolText(rawID, limit: 128),
+                provider: session.kind == .claude ? "claude" : "codex",
+                project: protocolText(session.title, limit: 80),
+                model: protocolText(session.model, limit: 80),
+                state: session.anyBusy ? "working" : "idle",
+                updatedAt: session.lastActivity ?? session.effectiveLastModified
+            )
+        }
+    }
+
+    static func attentionIsCurrent(previousAt: Date?, now: Date) -> Bool {
+        previousAt.map { now.timeIntervalSince($0) < 300 } ?? false
+    }
+
+    static func stateIsCurrent(previousState: String?, previousAt: Date?,
+                               state: String, now: Date) -> Bool {
+        guard previousState == state, let previousAt else { return false }
+        let activeFor: TimeInterval = state == "working" ? 600 : 60
+        return now.timeIntervalSince(previousAt) < activeFor
+    }
+
+    private func appendRecentEvent(provider: String, kind: String, at: Date) {
+        recentEvents.insert(BridgeRecentEvent(
+            id: "\(provider)-\(kind)-\(Int(at.timeIntervalSince1970))",
+            provider: provider,
+            kind: kind,
+            occurredAt: at
+        ), at: 0)
+        if recentEvents.count > 3 { recentEvents.removeLast(recentEvents.count - 3) }
+    }
+
+    private static func protocolText(_ value: String, limit: Int) -> String {
+        let printable = value.components(separatedBy: .controlCharacters).joined(separator: " ")
+        return String(printable.prefix(limit))
     }
 
     private func overlay(_ input: AgentStatus, provider: String, usage: ProviderUsage) -> AgentStatus {

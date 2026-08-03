@@ -6,6 +6,24 @@ and `Removed`.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## 0.1.20-rc4
+
+### Added
+
+- E-ink dashboard updates now support bounded dynamic session and event rows,
+  region refresh telemetry, and Linux TUI release artifacts for arm64 and
+  amd64.
+
+### Changed
+
+- The display agent exposes refresh duration, BUSY wait, refresh counters, and
+  planned area to support hardware soak validation.
+
+### Fixed
+
+- Dynamic provider status and session content stays inside fixed dashboard
+  regions, preserving the full-frame fallback and privacy bounds.
+
 ## 0.1.20-rc3
 
 ### Fixed

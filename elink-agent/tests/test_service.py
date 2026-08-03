@@ -147,6 +147,11 @@ def test_successful_full_then_small_change_uses_region_refresh():
         assert info["last_refresh_kind"] == "region"
         assert info["last_refresh_region_count"] == 1
         assert info["last_refresh_area"] == 8
+        assert info["refresh_counts"] == {
+            "full": 1, "fast-full": 0, "region": 1, "skipped": 0, "failed": 0,
+        }
+        assert info["cumulative_planned_area"] == 648 * 480 + 8
+        assert info["last_refresh_duration_ms"] >= 0
 
 
 def test_display_failure_invalidates_baseline_and_next_retry_is_full():
@@ -165,6 +170,7 @@ def test_display_failure_invalidates_baseline_and_next_retry_is_full():
         service._refresh("partial", False)
         assert service._displayed_frame is None
         assert service.runtime.last_refresh_reason == "display-failed-baseline-unknown"
+        assert service.runtime.refresh_counts["failed"] == 1
         service._refresh("partial", False)
         assert display.calls == ["full", "full"]
         assert service.runtime.last_refresh_reason == "missing-baseline"
@@ -182,6 +188,7 @@ def test_smart_refresh_skips_an_identical_render_and_finishes_request():
         service._refresh("smart", False)
         assert display.calls == ["full"]
         assert service._force is None
+        assert service.runtime.refresh_counts["skipped"] == 1
 
 
 class StubClient:

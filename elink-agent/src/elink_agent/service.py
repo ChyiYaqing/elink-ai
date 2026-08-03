@@ -5,7 +5,7 @@ import json
 import logging
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -62,6 +62,12 @@ class RuntimeState:
     last_refresh_region_count: int = 0
     last_refresh_area: int = 0
     last_refresh_reason: str = "none"
+    last_refresh_duration_ms: int = 0
+    last_busy_wait_ms: int = 0
+    refresh_counts: dict[str, int] = field(default_factory=lambda: {
+        "full": 0, "fast-full": 0, "region": 0, "skipped": 0, "failed": 0,
+    })
+    cumulative_planned_area: int = 0
 
 
 class AgentService:
@@ -89,6 +95,7 @@ class AgentService:
         self._fetch_failures = 0
         self._next_fetch_at = 0.0
         self._display_retry_at = 0.0
+        self._started_at = time.time()
         self._load_state()
 
     def start(self) -> None:
@@ -156,6 +163,11 @@ class AgentService:
                 "last_refresh_region_count": self.runtime.last_refresh_region_count,
                 "last_refresh_area": self.runtime.last_refresh_area,
                 "last_refresh_reason": self.runtime.last_refresh_reason,
+                "last_refresh_duration_ms": self.runtime.last_refresh_duration_ms,
+                "last_busy_wait_ms": self.runtime.last_busy_wait_ms,
+                "refresh_counts": dict(self.runtime.refresh_counts),
+                "cumulative_planned_area": self.runtime.cumulative_planned_area,
+                "process_uptime_s": int(now - self._started_at),
                 "partial_count": self.policy.partial_count,
                 "error": self.runtime.refresh_error or self.runtime.last_error,
             }
@@ -241,9 +253,11 @@ class AgentService:
         plan = self._refresh_plan(kind, image)
         if plan.kind == "none":
             with self._lock:
+                self.runtime.refresh_counts["skipped"] += 1
                 self._finish_refresh(marker)
             logger.info("skipped refresh because the rendered frame is unchanged")
             return
+        display_started = time.monotonic()
         try:
             self.display.show(image, kind=plan.kind, regions=plan.regions)
         except Exception as error:
@@ -251,6 +265,13 @@ class AgentService:
             with self._lock:
                 self.runtime.refresh_error = f"display: {error}"
                 self.runtime.last_refresh_reason = "display-failed-baseline-unknown"
+                self.runtime.last_refresh_duration_ms = int(
+                    (time.monotonic() - display_started) * 1000
+                )
+                self.runtime.last_busy_wait_ms = int(
+                    getattr(self.display, "last_busy_wait_s", 0.0) * 1000
+                )
+                self.runtime.refresh_counts["failed"] += 1
                 self._display_retry_at = time.time() + 60
                 self._displayed_frame = None
             logger.exception("display refresh failed")
@@ -273,6 +294,14 @@ class AgentService:
             self.runtime.last_refresh_region_count = len(plan.regions)
             self.runtime.last_refresh_area = plan.planned_area
             self.runtime.last_refresh_reason = plan.reason
+            self.runtime.last_refresh_duration_ms = int(
+                (time.monotonic() - display_started) * 1000
+            )
+            self.runtime.last_busy_wait_ms = int(
+                getattr(self.display, "last_busy_wait_s", 0.0) * 1000
+            )
+            self.runtime.refresh_counts[plan.kind] += 1
+            self.runtime.cumulative_planned_area += plan.planned_area
             self._display_retry_at = 0.0
             self._finish_refresh(marker)
             try:

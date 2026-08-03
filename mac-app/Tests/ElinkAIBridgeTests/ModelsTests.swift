@@ -29,6 +29,14 @@ final class ModelsTests: XCTestCase {
         snapshot.claude.state = "working"
         snapshot.claude.primary.percent = 42
         snapshot.claude.modelUsageToday = [ModelUsage(model: "claude-sonnet", tokens: 1200)]
+        snapshot.currentSessions = [BridgeSessionSummary(
+            id: "session-1", provider: "claude", project: "elink-ai",
+            model: "sonnet", state: "working", updatedAt: Date(timeIntervalSince1970: 123)
+        )]
+        snapshot.recentEvents = [BridgeRecentEvent(
+            id: "event-1", provider: "codex", kind: "needs_input",
+            occurredAt: Date(timeIntervalSince1970: 124)
+        )]
         let object = try XCTUnwrap(JSONSerialization.jsonObject(with: snapshot.jsonData()) as? [String: Any])
         XCTAssertEqual(object["schema_version"] as? Int, 1)
         let claude = try XCTUnwrap(object["claude"] as? [String: Any])
@@ -40,6 +48,54 @@ final class ModelsTests: XCTestCase {
         let cluster = try XCTUnwrap(object["cluster"] as? [String: Any])
         XCTAssertEqual(cluster["enabled"] as? Bool, false)
         XCTAssertEqual(cluster["node_count"] as? Int, 1)
+        let sessions = try XCTUnwrap(object["current_sessions"] as? [[String: Any]])
+        XCTAssertEqual(sessions.first?["project"] as? String, "elink-ai")
+        XCTAssertEqual(sessions.first?["updated_at"] as? Int, 123)
+        let events = try XCTUnwrap(object["recent_events"] as? [[String: Any]])
+        XCTAssertEqual(events.first?["kind"] as? String, "needs_input")
+    }
+
+    func testSessionSummaryDoesNotExposePromptSnippetOrFullPath() throws {
+        var session = AgentSession(
+            id: "/Users/alice/secret-project/session-123.jsonl", kind: .claude,
+            title: "elink-ai", snippet: "private assistant output", model: "sonnet",
+            lastModified: Date(timeIntervalSince1970: 100), prompt: "private user prompt"
+        )
+        session.isLive = true
+        session.lastActivity = Date()
+
+        let summary = try XCTUnwrap(StatusService.sessionSummaries([session]).first)
+        XCTAssertEqual(summary.id, "session-123")
+        XCTAssertEqual(summary.project, "elink-ai")
+        XCTAssertFalse(summary.id.contains("/Users/alice"))
+
+        var snapshot = BridgeSnapshot()
+        snapshot.currentSessions = [summary]
+        let json = String(decoding: snapshot.jsonData(), as: UTF8.self)
+        XCTAssertFalse(json.contains("private user prompt"))
+        XCTAssertFalse(json.contains("private assistant output"))
+        XCTAssertFalse(json.contains("/Users/alice"))
+    }
+
+    func testDynamicEventDeduplicationExpiresWithTheDisplayedState() {
+        let now = Date(timeIntervalSince1970: 1_000)
+        XCTAssertTrue(StatusService.attentionIsCurrent(
+            previousAt: now.addingTimeInterval(-299), now: now
+        ))
+        XCTAssertFalse(StatusService.attentionIsCurrent(
+            previousAt: now.addingTimeInterval(-300), now: now
+        ))
+        XCTAssertTrue(StatusService.stateIsCurrent(
+            previousState: "working", previousAt: now.addingTimeInterval(-599),
+            state: "working", now: now
+        ))
+        XCTAssertFalse(StatusService.stateIsCurrent(
+            previousState: "working", previousAt: now.addingTimeInterval(-600),
+            state: "working", now: now
+        ))
+        XCTAssertFalse(StatusService.stateIsCurrent(
+            previousState: "idle", previousAt: now, state: "working", now: now
+        ))
     }
 
     func testAggregationDayBoundaryStaysConsistentWithDayKeyAcrossTimeZones() {

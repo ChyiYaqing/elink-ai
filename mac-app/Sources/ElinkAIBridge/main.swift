@@ -11,6 +11,8 @@ let usageStore = UsageStore.shared
 let usage = UsageFetcher(cacheStore: usageStore)
 let cluster = ClusterManager(store: usageStore)
 let status = StatusService(usage: usage, store: usageStore, cluster: cluster)
+let bridgeSessionMonitor = AgentSessionMonitor()
+var bridgeSessionPollInFlight = false
 // 出口 NAT 是本机属性，与集群同步无关，因此独立于 ClusterManager 驱动
 let linkMonitor = LinkMonitor(store: usageStore, nodeID: { cluster.nodeID })
 // nebula overlay 也和用量集群无关：那是 VPN 上的每一台设备，不只是配对过的那几台
@@ -56,6 +58,19 @@ server.onRequest = { path, ip in
 Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { _ in
     DeviceClient.healPairingIfNeeded(port: port)
 }
+func pollBridgeSessions() {
+    guard AgentSessionMonitor.isEnabled, !bridgeSessionPollInFlight else {
+        if !AgentSessionMonitor.isEnabled { status.updateSessions([]) }
+        return
+    }
+    bridgeSessionPollInFlight = true
+    bridgeSessionMonitor.poll { sessions in
+        status.updateSessions(sessions)
+        bridgeSessionPollInFlight = false
+    }
+}
+pollBridgeSessions()
+Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { _ in pollBridgeSessions() }
 // 回填历史用量到 SQLite（时区标记不一致时先完成重分桶迁移）；
 // 此后每 5 分钟落一次今日数据，即使没有设备轮询也持续记录
 usageMaintenanceQueue.async { status.runUsageMaintenance() }

@@ -1,4 +1,4 @@
-from elink_agent.models import ProviderStatus, StatusSnapshot
+from elink_agent.models import ProviderStatus, SessionSummary, StatusSnapshot
 from elink_agent.refresh_policy import RefreshPolicy
 
 
@@ -77,6 +77,20 @@ def test_reset_minutes_are_grouped_in_five_minute_buckets():
     assert not policy.decide(second, stale=False, now=200).refresh
     second.claude.primary_reset_min = 24
     assert policy.decide(second, stale=False, now=200).refresh
+
+
+def test_session_summary_change_triggers_refresh():
+    policy = RefreshPolicy(min_interval_s=0)
+    before = snapshot()
+    policy.record(before, stale=False, kind="full", now=100)
+    after = snapshot()
+    after.current_sessions = [SessionSummary(
+        "s1", "claude", "elink-ai", "sonnet", "working", 123,
+    )]
+
+    decision = policy.decide(after, stale=False, now=101)
+
+    assert decision.refresh and decision.kind == "partial"
 
 
 def test_manual_refresh_still_obeys_the_minimum_interval():

@@ -88,6 +88,14 @@ class RefreshPolicy:
             "stale": stale,
             "claude": self._provider_view(snapshot.claude),
             "codex": self._provider_view(snapshot.codex),
+            "sessions": [
+                (item.id, item.provider, item.project, item.model, item.state, item.updated_at)
+                for item in snapshot.current_sessions
+            ],
+            "events": [
+                (item.id, item.provider, item.kind, item.occurred_at)
+                for item in snapshot.recent_events
+            ],
         }
         raw = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
         return hashlib.sha256(raw).hexdigest()

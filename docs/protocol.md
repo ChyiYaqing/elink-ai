@@ -11,6 +11,15 @@ zero. Each provider may also include `model_usage_today`, sorted by descending
 token count, as objects containing `model` and `tokens`. See
 `fixtures/status-v1.json` for the complete shape.
 
+The optional additive `current_sessions` array contains at most three display
+summaries with `id`, `provider`, `project`, `model`, `state`, and `updated_at`.
+The optional `recent_events` array contains at most three state transitions
+with `id`, `provider`, `kind`, and `occurred_at`; `kind` is `working`, `idle`,
+or `needs_input`. Session IDs are opaque, projects are basename-only, and
+neither array carries prompts, transcript text, full paths, credentials, or
+tool output. Older producers may omit both arrays and clients must treat that
+as an empty list.
+
 When Multi-Host Sync is enabled, token/model fields contain the sum of all known
 node snapshots. The additive `cluster` object reports `enabled`, `node_count`,
 `online_count`, and `last_synced_at`. Existing v1 clients may ignore it.
@@ -36,7 +45,8 @@ would publish internal network topology to anything that can reach the bridge.
 
 Supported lifecycle events update working/idle state. `PermissionRequest` and
 `Elicitation` set the attention flag for five minutes or until another concrete
-lifecycle event arrives.
+lifecycle event arrives. Repeated hook events in the same state do not append
+new recent-event entries.
 
 ## Device
 

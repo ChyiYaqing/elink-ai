@@ -94,3 +94,24 @@ invalidation, and the following recovery refresh selecting `full`. The runtime
 API exposes the actual operation, region count, planned area, and selection
 reason so these decisions can be checked without inferring them from the
 requested refresh kind.
+
+### D3/D4 live validation
+
+On 2026-08-03 the bridge began publishing at most three sanitized current
+sessions and recent state transitions. The production preview showed the
+Claude error badge and Codex current-session row inside their reserved provider
+regions; prompts, transcript snippets, and full paths were absent from the live
+status response.
+
+The D4 telemetry build reports cumulative counts for `full`, `fast-full`,
+`region`, skipped, and failed operations, plus planned area, display duration,
+and time spent waiting for BUSY. Per the shortened validation requested for this
+release, `3BP` produced 163 samples at one-minute intervals from 2026-08-03
+10:03 CST, covering 9,722.6 seconds (about 2 h 42 min) in
+`/var/lib/elink-ai/soak-d4-20260803-v2.jsonl`. There were no sample errors,
+stale samples, refresh failures, or agent restarts; uptime advanced from 84 to
+9,806 seconds. Counters advanced from `full=1, fast-full=0, region=2` to
+`full=5, fast-full=2, region=91`, with `skipped=0, failed=0`; 155 samples ended
+with a region operation. Region refreshes were about 1.24 s with about 0.42 s
+BUSY wait. The 24-hour ambient run is intentionally deferred; defaults remain
+unchanged and the shorter window is the evidence used for this release.

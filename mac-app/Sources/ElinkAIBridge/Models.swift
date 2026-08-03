@@ -27,6 +27,22 @@ struct ModelUsage: Codable, Equatable {
     var tokens: Int
 }
 
+struct BridgeSessionSummary: Codable, Equatable {
+    var id: String
+    var provider: String
+    var project: String
+    var model: String
+    var state: String
+    var updatedAt: Date
+}
+
+struct BridgeRecentEvent: Codable, Equatable {
+    var id: String
+    var provider: String
+    var kind: String
+    var occurredAt: Date
+}
+
 struct AgentStatus: Codable, Equatable {
     var state = "offline"
     var tokensToday = 0
@@ -52,6 +68,8 @@ struct BridgeSnapshot: Codable {
     var generatedAt = Date()
     var usageFetchedAt: Date?
     var cluster = ClusterSummary()
+    var currentSessions: [BridgeSessionSummary] = []
+    var recentEvents: [BridgeRecentEvent] = []
 
     func jsonData() -> Data {
         func nullable(_ value: Any?) -> Any { value ?? NSNull() }
@@ -87,6 +105,24 @@ struct BridgeSnapshot: Codable {
                 "online_count": cluster.onlineCount,
                 "last_synced_at": nullable(cluster.lastSyncedAt.map { Int($0.timeIntervalSince1970) }),
             ],
+            "current_sessions": currentSessions.prefix(3).map {
+                [
+                    "id": $0.id,
+                    "provider": $0.provider,
+                    "project": $0.project,
+                    "model": $0.model,
+                    "state": $0.state,
+                    "updated_at": Int($0.updatedAt.timeIntervalSince1970),
+                ] as [String: Any]
+            },
+            "recent_events": recentEvents.prefix(3).map {
+                [
+                    "id": $0.id,
+                    "provider": $0.provider,
+                    "kind": $0.kind,
+                    "occurred_at": Int($0.occurredAt.timeIntervalSince1970),
+                ] as [String: Any]
+            },
             "claude": provider(claude, claude: true),
             "codex": provider(codex, claude: false),
         ]

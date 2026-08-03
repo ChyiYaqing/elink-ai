@@ -2,6 +2,24 @@
   "schema_version": 1,
   "generated_at": 1783933200,
   "usage_fetched_at": 1783933140,
+  "current_sessions": [
+    {
+      "id": "session-claude-1",
+      "provider": "claude",
+      "project": "elink-ai",
+      "model": "claude-sonnet-4-5",
+      "state": "working",
+      "updated_at": 1783933180
+    }
+  ],
+  "recent_events": [
+    {
+      "id": "codex-needs_input-1783933190",
+      "provider": "codex",
+      "kind": "needs_input",
+      "occurred_at": 1783933190
+    }
+  ],
   "claude": {
     "status": "working",
     "tokens_today": 4868001,

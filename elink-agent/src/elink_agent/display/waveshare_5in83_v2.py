@@ -33,6 +33,7 @@ class Waveshare583V2Display(Display):
         self._power = gpiozero.LED(self.PWR_PIN)
         self._busy = gpiozero.Button(self.BUSY_PIN, pull_up=False)
         self._busy_timeout_s = busy_timeout_s
+        self.last_busy_wait_s = 0.0
         self._lock = Lock()
         self._opened = False
 
@@ -48,6 +49,7 @@ class Waveshare583V2Display(Display):
             if len(packed) != self.width * self.height // 8:
                 raise ValueError("unexpected packed image size")
         with self._lock:
+            self.last_busy_wait_s = 0.0
             try:
                 self._open()
                 if kind == "region":
@@ -91,11 +93,15 @@ class Waveshare583V2Display(Display):
         self._spi.writebytes2(value)
 
     def _wait_busy(self) -> None:
+        started = time.monotonic()
         deadline = time.monotonic() + self._busy_timeout_s
-        while self._busy.value == 0:
-            if time.monotonic() >= deadline:
-                raise TimeoutError(f"e-paper BUSY remained low for {self._busy_timeout_s}s")
-            time.sleep(0.01)
+        try:
+            while self._busy.value == 0:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"e-paper BUSY remained low for {self._busy_timeout_s}s")
+                time.sleep(0.01)
+        finally:
+            self.last_busy_wait_s += time.monotonic() - started
 
     def _init_full(self) -> None:
         self._reset()

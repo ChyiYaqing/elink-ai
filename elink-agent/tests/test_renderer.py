@@ -5,7 +5,8 @@ from unittest.mock import Mock
 from PIL import Image, ImageDraw
 
 from elink_agent.display.frame_diff import FrameDiffer
-from elink_agent.models import ModelUsage, ProviderStatus, StatusSnapshot
+from elink_agent.models import (ModelUsage, ProviderStatus, RecentEvent,
+                                SessionSummary, StatusSnapshot)
 from elink_agent.renderer import DashboardRenderer
 
 FIXED_TIME = datetime(2026, 7, 31, 9, 30, tzinfo=timezone.utc)
@@ -129,6 +130,16 @@ def test_attention_change_stays_inside_the_status_badge():
     _assert_within(plan.regions, renderer.component_boxes()["claude.badge"], renderer)
 
 
+def test_error_change_stays_inside_the_status_badge():
+    before = _snapshot()
+    after = replace(before, codex=replace(before.codex, error="bridge failed"))
+
+    renderer, plan = _plan(before, after)
+
+    assert plan.kind == "region"
+    _assert_within(plan.regions, renderer.component_boxes()["codex.badge"], renderer)
+
+
 def test_one_provider_change_leaves_the_other_card_untouched():
     before = _snapshot()
     after = replace(before, codex=replace(before.codex, tokens_today=99_000,
@@ -164,3 +175,31 @@ def test_model_rows_beyond_the_fixed_count_are_reported_not_dropped():
     overflow_row = _model_row_top(DashboardRenderer._MODEL_ROWS - 1)
     band = image.crop((34, overflow_row, 300, overflow_row + DashboardRenderer._MODEL_ROW_HEIGHT))
     assert band.getextrema()[0] == 0, "the hidden-model count should render, not vanish"
+
+
+def test_session_change_stays_inside_its_reserved_row():
+    before = _snapshot()
+    after = replace(before, current_sessions=[
+        SessionSummary("s1", "claude", "elink-ai", "sonnet", "working", 1_783_933_140),
+    ])
+
+    renderer, plan = _plan(before, after)
+
+    assert plan.kind == "region"
+    boxes = renderer.component_boxes()
+    allowed = (boxes["claude"][0], boxes["claude.session"][1],
+               boxes["claude"][2], boxes["claude.session"][3])
+    _assert_within(plan.regions, allowed, renderer)
+
+
+def test_recent_event_change_stays_inside_its_reserved_row():
+    session = SessionSummary("s1", "codex", "elink-ai", "5.6", "idle", 1_783_933_140)
+    before = replace(_snapshot(), current_sessions=[session])
+    after = replace(before, recent_events=[
+        RecentEvent("e1", "codex", "needs_input", 1_783_933_180),
+    ])
+
+    renderer, plan = _plan(before, after)
+
+    assert plan.kind == "region"
+    _assert_within(plan.regions, renderer.component_boxes()["codex.event"], renderer)
