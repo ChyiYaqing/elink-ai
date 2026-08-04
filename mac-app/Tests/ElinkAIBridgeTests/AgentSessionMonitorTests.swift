@@ -270,4 +270,41 @@ final class AgentSessionMonitorTests: XCTestCase {
         XCTAssertEqual(AgentSessionsCard.relativeTime(now.addingTimeInterval(-7200), now: now), "2h")
         XCTAssertEqual(AgentSessionsCard.relativeTime(now.addingTimeInterval(-2 * 86_400), now: now), "2d")
     }
+
+    // MARK: - 子进程超时
+
+    private func liveThreadCount() -> Int {
+        var list: thread_act_array_t?
+        var count: mach_msg_type_number_t = 0
+        guard task_threads(mach_task_self_, &list, &count) == KERN_SUCCESS, let list else { return -1 }
+        for i in 0..<Int(count) { mach_port_deallocate(mach_task_self_, list[i]) }
+        vm_deallocate(mach_task_self_, vm_address_t(UInt(bitPattern: list)),
+                      vm_size_t(Int(count) * MemoryLayout<thread_t>.stride))
+        return Int(count)
+    }
+
+    /// 忽略 SIGTERM 的单进程，对应 lsof 卡在内核态时 `terminate()` 无效的真实故障。
+    /// 用 sleep 复现不出问题：它会乖乖响应 SIGTERM，掩盖掉这里要守住的不变量。
+    private static let stubbornChild = ["-e", #"$SIG{TERM} = "IGNORE"; sleep 30"#]
+
+    func testRunTimesOutPromptlyEvenWhenChildIgnoresSIGTERM() {
+        let start = Date()
+        XCTAssertNil(ProcessDiscovery().run("/usr/bin/perl", Self.stubbornChild, timeout: 0.2))
+        // 只有 SIGKILL 能让管道立刻 EOF；靠 SIGTERM 会一路拖满 30 秒
+        XCTAssertLessThan(Date().timeIntervalSince(start), 5)
+    }
+
+    /// 每次超时漏掉一个全局池线程时，漏满 64 个软上限后整个 app 都会饿死。
+    func testRepeatedTimeoutsDoNotLeakThreads() {
+        let discovery = ProcessDiscovery()
+        for _ in 0..<3 { _ = discovery.run("/usr/bin/perl", Self.stubbornChild, timeout: 0.05) }
+        let baseline = liveThreadCount()
+
+        for _ in 0..<70 { _ = discovery.run("/usr/bin/perl", Self.stubbornChild, timeout: 0.05) }
+
+        XCTAssertLessThan(liveThreadCount() - baseline, 16)
+        // 池子仍然健康的最终判据：超时之后普通命令依旧跑得通
+        XCTAssertEqual(discovery.run("/bin/echo", ["ok"], timeout: 5)?
+            .trimmingCharacters(in: .whitespacesAndNewlines), "ok")
+    }
 }
