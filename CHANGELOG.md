@@ -6,6 +6,33 @@ and `Removed`.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## 0.1.20
+
+### Changed
+
+- The e-paper screen now marks usage as `STALE` rather than `ERROR` when the
+  quota API is unreachable but the cached percentages are still trustworthy, and
+  reserves the inverted badge for things that actually need attention. An error
+  with no usable figures behind it still reads `ERROR`.
+- The Raspberry Pi agent versions independently of the macOS app, starting at
+  0.1.13, so the version shown on screen and by `/v1/device` identifies the code
+  actually deployed.
+
+### Fixed
+
+- The menu bar stopped responding after a couple of hours while the HTTP service
+  kept answering normally. Each timed-out `ps`/`lsof` probe stranded a dispatch
+  thread for good; once 64 were gone, everything scheduled on a global queue
+  starved and the app could not recover without a restart.
+- Update checks could hang permanently. The GitHub CLI fallback waited for the
+  process to exit before reading its output, so enough output on either pipe
+  deadlocked both sides — and because the in-flight guard never cleared,
+  every later check was refused for the life of the process.
+- Claude usage could stay rate limited indefinitely. The response headers were
+  discarded, so a `Retry-After` of 414 seconds went unseen and the fixed backoff
+  retried every 360 seconds — always inside the window the server had asked us
+  to wait out. Backoff now follows what the server asks for.
+
 ## 0.1.20-rc4
 
 ### Added
