@@ -74,6 +74,19 @@ class ProviderStatus:
     weekly_reset_min: int | None = None
     needs_input: bool = False
     error: str | None = None
+    usage_cached: bool = False
+
+    @property
+    def usage_is_stale(self) -> bool:
+        """取数失败，但手上仍有可信的缓存额度。
+
+        额度接口被限流时 bridge 会回退到状态栏缓存，百分比照样是准的，只是
+        停止了实时刷新。这种情况按第 6 节的约定属于陈旧而非错误 —— 画 ERROR
+        会让人以为屏幕上的数字不能信，而它们其实可信。
+        """
+        if not self.error or not self.usage_cached:
+            return False
+        return self.primary_pct is not None or self.weekly_pct is not None
 
     @classmethod
     def from_dict(cls, value: Any, *, provider: str) -> "ProviderStatus":
@@ -105,6 +118,7 @@ class ProviderStatus:
             weekly_reset_min=_int(obj.get(f"{weekly_prefix}_reset_min")),
             needs_input=bool(obj.get("needs_input", False)),
             error=obj.get("error") if isinstance(obj.get("error"), str) else None,
+            usage_cached=bool(obj.get("provider_usage_cached", False)),
         )
 
 

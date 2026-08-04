@@ -10,6 +10,9 @@ final class UsageFetcher {
     private var lastLogSummary = ""
     private var timer: Timer?
     private var refreshCompletions: [() -> Void] = []
+    /// 本轮 fetch 中服务端要求的最长等待。只在 refresh 的串行 async 块里写，
+    /// 在同一块末尾读出并清空，因此不需要额外加锁。
+    private var pendingRetryAfter: TimeInterval?
     var onUpdate: (() -> Void)?
 
     var claude: ProviderUsage { lock.holding { Self.discardingExpiredWindows(storedClaude) } }
@@ -60,7 +63,9 @@ final class UsageFetcher {
                 self.storedCodex = Self.keepLastGood(old: self.storedCodex, new: codex)
                 self.fetching = false
                 let rateLimited = claude.error?.contains("429") == true || codex.error?.contains("429") == true
-                self.nextAllowed = Date().addingTimeInterval(rateLimited ? 300 : 60)
+                self.nextAllowed = Date().addingTimeInterval(
+                    Self.backoffInterval(retryAfter: self.pendingRetryAfter, rateLimited: rateLimited))
+                self.pendingRetryAfter = nil
                 let summary = "usage claude=\(Self.describe(claude)) codex=\(Self.describe(codex))"
                 if summary != self.lastLogSummary {
                     self.lastLogSummary = summary
@@ -132,6 +137,13 @@ final class UsageFetcher {
         return value
     }
 
+    /// 两家 provider 同轮都被限流时取更长的那个，避免为了迁就一家而顶着
+    /// 另一家的窗口重试。
+    private func noteRetryAfter(_ outcome: HTTPOutcome) {
+        guard let seconds = outcome.retryAfter else { return }
+        pendingRetryAfter = max(pendingRetryAfter ?? 0, seconds)
+    }
+
     private func fetchClaude() -> ProviderUsage {
         let token: String
         switch Self.claudeToken() {
@@ -150,13 +162,15 @@ final class UsageFetcher {
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
-        guard let (data, status) = Self.request(request) else {
+        guard let outcome = Self.request(request) else {
             return Self.claudeFallback(error: tr("Claude 用量请求失败", "Claude usage request failed"))
         }
-        guard status == 200 else {
-            return Self.claudeFallback(error: tr("Claude 用量 HTTP \(status)", "Claude usage HTTP \(status)"))
+        guard outcome.status == 200 else {
+            noteRetryAfter(outcome)
+            return Self.claudeFallback(
+                error: tr("Claude 用量 HTTP \(outcome.status)", "Claude usage HTTP \(outcome.status)"))
         }
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        guard let json = try? JSONSerialization.jsonObject(with: outcome.data) as? [String: Any] else {
             return Self.claudeFallback(error: tr("Claude 用量响应解析失败", "Failed to parse Claude usage response"))
         }
         let primary = Self.isoWindow(json["five_hour"])
@@ -227,10 +241,13 @@ final class UsageFetcher {
         request.setValue("Bearer \(credentials.token)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         if let account = credentials.account { request.setValue(account, forHTTPHeaderField: "ChatGPT-Account-Id") }
-        guard let (data, status) = Self.request(request) else {
+        guard let outcome = Self.request(request) else {
             return ProviderUsage(error: tr("Codex 用量请求失败", "Codex usage request failed"))
         }
+        let data = outcome.data
+        let status = outcome.status
         guard (200...299).contains(status) else {
+            noteRetryAfter(outcome)
             let error = status == 401 || status == 403
                 ? tr("Codex 凭据过期，请运行 codex 重新登录",
                      "Codex credentials expired — run codex to sign in again")
@@ -439,15 +456,57 @@ final class UsageFetcher {
         return formatter.date(from: value)
     }
 
-    private static func request(_ request: URLRequest) -> (Data, Int)? {
+    struct HTTPOutcome {
+        let data: Data
+        let status: Int
+        let retryAfter: TimeInterval?
+    }
+
+    private static func request(_ request: URLRequest) -> HTTPOutcome? {
         let semaphore = DispatchSemaphore(value: 0)
-        var result: (Data, Int)?
+        var result: HTTPOutcome?
         URLSession.shared.dataTask(with: request) { data, response, _ in
-            if let data, let response = response as? HTTPURLResponse { result = (data, response.statusCode) }
+            if let data, let response = response as? HTTPURLResponse {
+                result = HTTPOutcome(
+                    data: data,
+                    status: response.statusCode,
+                    retryAfter: retryAfterSeconds(response.value(forHTTPHeaderField: "Retry-After"))
+                )
+            }
             semaphore.signal()
         }.resume()
         semaphore.wait()
         return result
+    }
+
+    private static let httpDate: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "GMT")
+        formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
+        return formatter
+    }()
+
+    /// RFC 7231 允许 `Retry-After` 是秒数或 HTTP-date，两种都接受。
+    /// 解析不出来返回 nil，退回调用方的默认退避，绝不当作 0 立即重试。
+    static func retryAfterSeconds(_ value: String?, now: Date = Date()) -> TimeInterval? {
+        guard let raw = value?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
+            return nil
+        }
+        if let seconds = TimeInterval(raw) { return seconds > 0 ? seconds : nil }
+        guard let date = httpDate.date(from: raw) else { return nil }
+        let delta = date.timeIntervalSince(now)
+        return delta > 0 ? delta : nil
+    }
+
+    /// 服务端说了等多久就等多久。此前这里硬编码 300 秒，而实测响应头是
+    /// `Retry-After: 414` —— 配合 120 秒 timer 得到的 360 秒重试间隔永远落在
+    /// 限流窗口内，跨越两天 25 次请求无一成功，且失败本身又把窗口顺延，
+    /// 靠自己走不出来。加 5 秒余量避开边界抖动；封顶 1 小时，免得服务端给出
+    /// 一个超长值把刷新彻底饿死。
+    static func backoffInterval(retryAfter: TimeInterval?, rateLimited: Bool) -> TimeInterval {
+        guard let retryAfter else { return rateLimited ? 300 : 60 }
+        return min(max(retryAfter + 5, 60), 3600)
     }
 }
 

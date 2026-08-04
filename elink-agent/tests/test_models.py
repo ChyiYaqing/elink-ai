@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from elink_agent.models import StatusSnapshot
+from elink_agent.models import ProviderStatus, StatusSnapshot
 
 
 def test_parse_bridge_shape_and_preserve_overage_percentage():
@@ -93,3 +93,40 @@ def test_invalid_status_degrades_to_offline():
 def test_invalid_model_usage_degrades_to_empty_list():
     snapshot = StatusSnapshot.from_dict({"claude": {"model_usage_today": None}})
     assert snapshot.claude.model_usage_today == []
+
+
+class TestProviderUsageStale:
+    """额度取数失败但仍有可信缓存时，属于陈旧而非错误。"""
+
+    def _status(self, **overrides):
+        obj = {
+            "status": "working",
+            "five_hour_pct": 33,
+            "seven_day_pct": 38,
+            "error": "Claude usage HTTP 429",
+            "provider_usage_cached": True,
+        }
+        obj.update(overrides)
+        return ProviderStatus.from_dict(obj, provider="claude")
+
+    def test_parses_usage_cached(self):
+        assert self._status().usage_cached is True
+        assert self._status(provider_usage_cached=False).usage_cached is False
+
+    def test_omitted_field_defaults_false(self):
+        status = ProviderStatus.from_dict({"status": "idle"}, provider="claude")
+        assert status.usage_cached is False
+        assert status.usage_is_stale is False
+
+    def test_cached_values_with_error_are_stale(self):
+        assert self._status().usage_is_stale is True
+
+    def test_error_without_cache_is_not_stale(self):
+        assert self._status(provider_usage_cached=False).usage_is_stale is False
+
+    def test_cache_without_any_percentage_is_not_stale(self):
+        status = self._status(five_hour_pct=None, seven_day_pct=None)
+        assert status.usage_is_stale is False
+
+    def test_no_error_is_never_stale(self):
+        assert self._status(error=None).usage_is_stale is False
