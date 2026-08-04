@@ -158,7 +158,21 @@ final class ProcessDiscovery {
         }
     }
 
-    private func run(_ path: String, _ args: [String], timeout: TimeInterval) -> String? {
+    /// 超时收割队列：只发信号，永不阻塞，因此一条串行队列足够。
+    private static let reaper = DispatchQueue(label: "ai.elink.proc-reaper")
+
+    /// 只在调用方自己的线程上阻塞，绝不把等待派发到全局并发队列。
+    ///
+    /// 旧实现把 `readDataToEndOfFile` + `waitUntilExit` 派发到
+    /// `DispatchQueue.global(qos: .utility)`，超时后只 `terminate()` 就返回，
+    /// 不解除那个 block，于是每超时一次就永久漏掉一个池线程。漏满 64 个软上限
+    /// 后，Foundation 投递子进程退出通知同样抢不到线程，已经退出的子进程也再
+    /// 等不到通知，泄漏变得不可逆，全 app 依赖全局队列的工作随之饿死 —— 表现
+    /// 为菜单栏无响应而 HTTP 服务（独占串行队列）仍然正常。
+    ///
+    /// 超时改由只发 SIGKILL 的 timer source 兜底。SIGKILL 不可被忽略或阻塞，
+    /// 子进程必死、管道必然 EOF，因此下面的阻塞读取必然返回。
+    func run(_ path: String, _ args: [String], timeout: TimeInterval) -> String? {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: path)
         p.arguments = args
@@ -166,17 +180,31 @@ final class ProcessDiscovery {
         p.standardOutput = pipe
         p.standardError = Pipe()
         do { try p.run() } catch { return nil }
-        var data = Data()
-        let group = DispatchGroup()
-        group.enter()
-        DispatchQueue.global(qos: .utility).async {
-            data = pipe.fileHandleForReading.readDataToEndOfFile()
-            p.waitUntilExit()
-            group.leave()
-        }
-        guard group.wait(timeout: .now() + timeout) == .success else { p.terminate(); return nil }
+
+        // pid 被收割后可能立即复用，届时 SIGKILL 会打到无关进程上。
+        // kill 与「已收割」标记都排在 reaper 上，靠串行队列互斥。
+        let pid = p.processIdentifier
+        let reaped = Reaped()
+        let killer = DispatchSource.makeTimerSource(queue: Self.reaper)
+        killer.schedule(deadline: .now() + timeout)
+        killer.setEventHandler { if !reaped.value { kill(pid, SIGKILL) } }
+        killer.resume()
+
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        Self.reaper.sync { reaped.value = true }
+        killer.cancel()
+
+        // 超时被杀时判为失败，与旧实现返回 nil 的语义一致；
+        // 正常退出即使退出码非 0 也照用输出（lsof 部分失败时常见）。
+        guard p.terminationReason == .exit else { return nil }
         return String(data: data, encoding: .utf8)
     }
+}
+
+/// 仅供 `ProcessDiscovery.run` 在 reaper 队列上串行访问。
+private final class Reaped {
+    var value = false
 }
 
 // MARK: - 会话扫描
