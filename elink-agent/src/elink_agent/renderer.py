@@ -169,9 +169,14 @@ class DashboardRenderer:
         反而触发了整帧刷新。徽章把同一个信号收进一个固定矩形，代价约 2.5% 屏幕。
         """
         bx0, by0, bx1, by1 = self._badge_box(box, large)
-        attention = provider.needs_input or bool(provider.error)
+        # 反白只留给真正要人处理的事。额度停止刷新但数字仍可信时画 STALE 且
+        # 不反白，免得它跟 ACTION REQUIRED 抢同一份注意力。
+        stale = provider.usage_is_stale
+        attention = provider.needs_input or (bool(provider.error) and not stale)
         if provider.needs_input:
             text = "ACTION REQUIRED"
+        elif stale:
+            text = "STALE"
         elif provider.error:
             text = "ERROR"
         else:

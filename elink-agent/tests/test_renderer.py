@@ -203,3 +203,49 @@ def test_recent_event_change_stays_inside_its_reserved_row():
 
     assert plan.kind == "region"
     _assert_within(plan.regions, renderer.component_boxes()["codex.event"], renderer)
+
+
+class TestStaleBadge:
+    """限流导致的取数失败不该画成 ERROR —— 那会让人以为数字不能信。"""
+
+    def _badge_text(self, provider: ProviderStatus) -> str:
+        renderer = DashboardRenderer()
+        image = Image.new("1", (renderer.width, renderer.height), 255)
+        draw = ImageDraw.Draw(image)
+        captured = []
+        original = draw.text
+        draw.text = lambda xy, text, **kw: captured.append(text) or original(xy, text, **kw)
+        renderer._status_badge(draw, (40, 170, 390, 620), provider, False)
+        return captured[0]
+
+    def _cached(self, **overrides) -> ProviderStatus:
+        base = ProviderStatus(status="working", primary_pct=33, weekly_pct=38,
+                              error="Claude usage HTTP 429", usage_cached=True)
+        return replace(base, **overrides)
+
+    def test_rate_limited_with_cached_values_shows_stale(self):
+        assert self._badge_text(self._cached()) == "STALE"
+
+    def test_error_without_usable_values_still_shows_error(self):
+        assert self._badge_text(
+            self._cached(usage_cached=False, primary_pct=None, weekly_pct=None)) == "ERROR"
+
+    def test_needs_input_outranks_stale(self):
+        assert self._badge_text(self._cached(needs_input=True)) == "ACTION REQUIRED"
+
+    def test_healthy_provider_shows_status(self):
+        assert self._badge_text(self._cached(error=None)) == "WORKING"
+
+    def test_stale_is_not_inverted(self):
+        """反白留给要人处理的事；STALE 与 WORKING 同一视觉层级。"""
+        renderer = DashboardRenderer()
+        box = (40, 170, 390, 620)
+        bx0, by0, bx1, by1 = renderer._badge_box(box, False)
+
+        def filled(provider) -> bool:
+            image = Image.new("1", (renderer.width, renderer.height), 255)
+            renderer._status_badge(ImageDraw.Draw(image), box, provider, False)
+            return image.getpixel((bx0 + 2, by0 + 2)) == 0
+
+        assert filled(self._cached()) is False
+        assert filled(self._cached(usage_cached=False, primary_pct=None, weekly_pct=None)) is True
