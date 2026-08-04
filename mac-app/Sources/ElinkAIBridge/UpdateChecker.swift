@@ -185,34 +185,27 @@ final class UpdateChecker: ObservableObject {
             return
         }
 
-        let process = Process()
-        let output = Pipe()
-        let errors = Pipe()
-        process.executableURL = executable
-        process.arguments = [
+        let arguments = [
             "api",
             "repos/ChyiYaqing/elink-ai/releases?per_page=20",
             "--jq",
             "[.[] | {tag_name,draft,prerelease,html_url,assets:[.assets[] | {name,browser_download_url}]}]",
         ]
-        process.standardOutput = output
-        process.standardError = errors
 
         do {
-            try process.run()
-            process.waitUntilExit()
-            let data = output.fileHandleForReading.readDataToEndOfFile()
-            if process.terminationStatus == 0 {
+            let outcome = try Self.runCLI(executable, arguments: arguments, timeout: Self.cliTimeout)
+            if !outcome.timedOut, outcome.status == 0 {
                 let result = Self.releaseResult(
-                    data: data,
+                    data: outcome.stdout,
                     currentVersion: currentVersion,
                     includesPrereleases: includesPrereleases
                 )
                 DispatchQueue.main.async { self.finish(result) }
             } else {
-                let errorData = errors.fileHandleForReading.readDataToEndOfFile()
-                let detail = String(data: errorData, encoding: .utf8)?
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                let detail = outcome.timedOut
+                    ? tr("命令超时", "command timed out")
+                    : String(data: outcome.stderr, encoding: .utf8)?
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
                 DispatchQueue.main.async {
                     self.finish(.failure(CheckError.githubCLI(detail)))
                 }
@@ -226,6 +219,66 @@ final class UpdateChecker: ObservableObject {
                 }
             }
         }
+    }
+
+    struct CLIOutcome {
+        let stdout: Data
+        let stderr: Data
+        let status: Int32
+        let timedOut: Bool
+    }
+
+    static let cliTimeout: TimeInterval = 30
+
+    /// 超时收割队列：只发信号，永不阻塞，因此一条串行队列足够。
+    private static let cliReaper = DispatchQueue(label: "ai.elink.update-cli-reaper")
+
+    /// 两个管道都必须在等待退出之前排空。gh 写满 stdout 或 stderr 的内核缓冲区
+    /// （约 64KB）就会阻塞在 write() 上，而调用方在 `waitUntilExit()` 等它退出 ——
+    /// 双方互等，永久死锁，且没有任何超时。这条路径尤其致命：仓库是私有的，
+    /// 匿名 API 必然 404，所以每次检查都会走到 gh 回退；一旦卡住，`isChecking`
+    /// 再也回不到 false，更新检查在整个进程生命周期内彻底失效。
+    ///
+    /// 只排空一个管道不够 —— 另一个写满照样卡住 gh，所以 stderr 交给一条后台
+    /// 线程，stdout 留在当前线程读，两者并发。超时由只发 SIGKILL 的 timer source
+    /// 兜底：SIGKILL 不可被忽略或阻塞，子进程必死、两个管道必然 EOF，两处读取
+    /// 因此必然返回，那条后台线程也一定会被释放。
+    nonisolated static func runCLI(_ executable: URL, arguments: [String],
+                                   timeout: TimeInterval) throws -> CLIOutcome {
+        let process = Process()
+        let output = Pipe()
+        let errors = Pipe()
+        process.executableURL = executable
+        process.arguments = arguments
+        process.standardOutput = output
+        process.standardError = errors
+        try process.run()
+
+        // pid 被收割后可能立即复用，届时 SIGKILL 会打到无关进程上。
+        let pid = process.processIdentifier
+        let lock = NSLock()
+        var reaped = false
+        let killer = DispatchSource.makeTimerSource(queue: cliReaper)
+        killer.schedule(deadline: .now() + timeout)
+        killer.setEventHandler { lock.holding { if !reaped { kill(pid, SIGKILL) } } }
+        killer.resume()
+
+        var errorData = Data()
+        let group = DispatchGroup()
+        group.enter()
+        DispatchQueue.global(qos: .utility).async {
+            errorData = errors.fileHandleForReading.readDataToEndOfFile()
+            group.leave()
+        }
+        let outputData = output.fileHandleForReading.readDataToEndOfFile()
+        group.wait()
+        process.waitUntilExit()
+        lock.holding { reaped = true }
+        killer.cancel()
+
+        return CLIOutcome(stdout: outputData, stderr: errorData,
+                          status: process.terminationStatus,
+                          timedOut: process.terminationReason != .exit)
     }
 
     private enum CheckError: LocalizedError {
