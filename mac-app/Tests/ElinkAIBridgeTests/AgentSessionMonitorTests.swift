@@ -73,6 +73,71 @@ final class AgentSessionMonitorTests: XCTestCase {
         XCTAssertFalse(s.isLive)
     }
 
+    /// 展开区按时间正序列出对话与工具活动；thinking 与 tool_result 不进列表。
+    func testClaudeTranscriptRowsInOrder() throws {
+        let now = Self.iso.string(from: Date())
+        let longPrompt = String(repeating: "详细需求。", count: 40)
+        try write([
+            #"{"type":"user","message":{"content":"\#(longPrompt)"},"timestamp":"\#(now)"}"#,
+            #"{"type":"assistant","message":{"model":"claude-opus-5","content":[{"type":"thinking","thinking":"内部推理"},{"type":"text","text":"第一段\n第二段"}]},"timestamp":"\#(now)"}"#,
+            #"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"/Users/me/myproj/App.swift"}}]},"timestamp":"\#(now)"}"#,
+            #"{"type":"user","message":{"content":[{"type":"tool_result","content":"文件内容"}]},"timestamp":"\#(now)"}"#,
+            #"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"swift test --filter X","description":"跑测试"}}]},"timestamp":"\#(now)"}"#,
+        ], to: "-Users-me-myproj/sess.jsonl", under: claudeRoot)
+
+        let s = try XCTUnwrap(scanner().scan(live: [], claudeCwdCounts: [:]).first)
+        XCTAssertTrue(AgentSessionsCard.hasTranscript(s))
+        XCTAssertEqual(s.transcript.map(\.role), [.user, .assistant, .tool, .tool])
+        // 展开区保留完整正文与换行，折叠行仍是压扁的 90 字符单行
+        XCTAssertEqual(s.transcript[1].text, "第一段\n第二段")
+        XCTAssertGreaterThan(s.transcript[0].text.count, s.prompt.count)
+        // 工具行：路径只留文件名，Bash 优先用比命令更可读的 description
+        XCTAssertEqual(s.transcript[2].title, "Read")
+        XCTAssertEqual(s.transcript[2].text, "App.swift")
+        XCTAssertEqual(s.transcript[3].text, "跑测试")
+        // id 要稳定且互不相同，否则滚动区每次 poll 都会错位
+        XCTAssertEqual(Set(s.transcript.map(\.id)).count, s.transcript.count)
+        let again = try XCTUnwrap(scanner().scan(live: [], claudeCwdCounts: [:]).first)
+        XCTAssertEqual(again.transcript.map(\.id), s.transcript.map(\.id))
+    }
+
+    func testCodexTranscriptRows() throws {
+        let now = Self.iso.string(from: Date())
+        try write([
+            #"{"payload":{"id":"root-1","cwd":"/Users/me/myproj"}}"#,
+            #"{"type":"event_msg","payload":{"type":"user_message","message":"跑一下测试"},"timestamp":"\#(now)"}"#,
+            #"{"type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"const r = await tools.exec_command({cmd:\"pytest -q\"})"}}"#,
+            #"{"type":"event_msg","payload":{"type":"agent_message","message":"测试已通过"},"timestamp":"\#(now)"}"#,
+        ], to: "rollout-2026-07-22T10-00-00-aaa.jsonl", under: codexRoot)
+
+        let s = try XCTUnwrap(scanner().scan(live: [], claudeCwdCounts: [:]).first)
+        XCTAssertEqual(s.transcript.map(\.role), [.user, .tool, .assistant])
+        XCTAssertEqual(s.transcript[0].text, "跑一下测试")
+        XCTAssertEqual(s.transcript[1].title, "exec")
+        XCTAssertEqual(s.transcript[2].text, "测试已通过")
+    }
+
+    /// 无界增长会让展开区越滚越慢，也会把 3 秒一次的解析成本推上去。
+    func testTranscriptKeepsOnlyTheMostRecentEntries() throws {
+        let now = Self.iso.string(from: Date())
+        let lines = (0..<80).map {
+            #"{"type":"assistant","message":{"content":[{"type":"text","text":"第 \#($0) 条"}]},"timestamp":"\#(now)"}"#
+        }
+        try write(lines, to: "-Users-me-myproj/sess.jsonl", under: claudeRoot)
+
+        let s = try XCTUnwrap(scanner().scan(live: [], claudeCwdCounts: [:]).first)
+        XCTAssertEqual(s.transcript.count, SessionScanner.maxTranscriptEntries)
+        // 留下的必须是最近的那一批，不是最早的
+        XCTAssertEqual(s.transcript.last?.text, "第 79 条")
+    }
+
+    /// 没有正文可读时不该给出一个展开后是空的箭头。
+    func testSessionWithoutTranscriptIsNotExpandable() {
+        let s = AgentSession(id: "/a", kind: .claude, title: "a", snippet: "摘要",
+                             model: "", lastModified: Date())
+        XCTAssertFalse(AgentSessionsCard.hasTranscript(s))
+    }
+
     func testClaudeSubagentScan() throws {
         let now = Self.iso.string(from: Date())
         try write([

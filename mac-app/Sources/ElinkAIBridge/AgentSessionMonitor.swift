@@ -12,6 +12,17 @@ private func sanitizedClaudeProjectPath(_ path: String) -> String {
     path.replacingOccurrences(of: "[^a-zA-Z0-9]", with: "-", options: .regularExpression)
 }
 
+/// 展开会话时滚动区里的一行。transcript 里没有 token 级流式数据 —— 两家都是
+/// 整条消息写完才追加一行 —— 所以「实时」的颗粒度就是这里的一条。
+struct TranscriptEntry: Identifiable {
+    enum Role { case user, assistant, tool }
+    let id: String
+    let role: Role
+    /// 工具行的工具名；对话行为空
+    let title: String
+    let text: String
+}
+
 struct AgentSession: Identifiable {
     let id: String
     let kind: AgentKind
@@ -20,6 +31,8 @@ struct AgentSession: Identifiable {
     let model: String
     let lastModified: Date
     var prompt: String = ""
+    // 展开会话时滚动显示的最近若干条正文与工具活动，按时间正序
+    var transcript: [TranscriptEntry] = []
     var threadID: String = ""
     var parentID: String?
     var nickname: String?
@@ -283,6 +296,7 @@ final class SessionScanner {
                 var sess = AgentSession(id: f.path, kind: .claude, title: projName,
                                         snippet: info.snippet, model: info.model, lastModified: mtime)
                 sess.prompt = info.prompt
+                sess.transcript = info.transcript
                 sess.lastActivity = info.activity
                 sess.isLive = live.contains(f.path) || idx < liveByCwd
                 sess.children = claudeSubagents(sessionFile: f, parentLive: sess.isLive)
@@ -304,6 +318,7 @@ final class SessionScanner {
             var sess = AgentSession(id: f.path, kind: .codex, title: meta.title,
                                     snippet: info.snippet, model: info.model, lastModified: mtime)
             sess.prompt = info.prompt
+            sess.transcript = info.transcript
             sess.isLive = live.contains(f.path)
             sess.threadID = meta.id
             sess.parentID = meta.parentID
@@ -326,6 +341,7 @@ final class SessionScanner {
                                    snippet: info.snippet, model: info.model, lastModified: mtime)
             // 这里没有昵称 —— 用它接到的任务做标签
             kid.nickname = info.prompt.isEmpty ? "subagent" : String(info.prompt.prefix(40))
+            kid.transcript = info.transcript
             // 子代理共享父进程 —— 存活继承父会话，忙碌看写入
             kid.isLive = parentLive
             kid.lastActivity = info.activity
@@ -354,27 +370,39 @@ final class SessionScanner {
         return f
     }()
 
+    /// 展开区最多保留的条目数。倒序扫到这个数就停，因此长 transcript 反而
+    /// 比原来更早退出，128KB 窗口是上界而非每次都要读满。
+    static let maxTranscriptEntries = 40
+
     /// 读 jsonl transcript 末尾：最后一段可读文本 + 模型名 + 最后一条
-    /// 对话（user/assistant）条目的时间戳。
-    func tailInfo(of file: URL) -> (snippet: String, model: String, prompt: String, activity: Date?) {
-        guard let fh = try? FileHandle(forReadingFrom: file) else { return ("", "", "", nil) }
+    /// 对话（user/assistant）条目的时间戳，以及展开区滚动用的条目列表。
+    func tailInfo(of file: URL)
+        -> (snippet: String, model: String, prompt: String,
+            transcript: [TranscriptEntry], activity: Date?) {
+        let empty = ("", "", "", [TranscriptEntry](), Date?.none)
+        guard let fh = try? FileHandle(forReadingFrom: file) else { return empty }
         defer { try? fh.close() }
         let size = (try? fh.seekToEnd()) ?? 0
         let readLen: UInt64 = min(size, 131_072)
         try? fh.seek(toOffset: size - readLen)
         guard let data = try? fh.readToEnd(),
-              let text = String(data: data, encoding: .utf8) else { return ("", "", "", nil) }
+              let text = String(data: data, encoding: .utf8) else { return empty }
         var snippet = "", model = "", prompt = ""
+        var transcript: [TranscriptEntry] = []
         var activity: Date?
         for line in text.split(separator: "\n").reversed() {
             if model.isEmpty, let r = line.range(of: #""model":"([^"]+)""#, options: .regularExpression) {
                 model = String(line[r].dropFirst(9).dropLast(1))
                 model = model.replacingOccurrences(of: "claude-", with: "")
             }
-            if snippet.isEmpty || prompt.isEmpty || activity == nil,
+            if snippet.isEmpty || prompt.isEmpty || activity == nil
+                || transcript.count < Self.maxTranscriptEntries,
                let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any] {
                 if snippet.isEmpty, let s = extractText(obj) { snippet = s }
                 if prompt.isEmpty, let p = extractUserPrompt(obj) { prompt = p }
+                if transcript.count < Self.maxTranscriptEntries {
+                    transcript.insert(contentsOf: transcriptRows(obj), at: 0)
+                }
                 // "system" 条目（away_summary、压缩记录等）是内部维护，不算活动
                 if activity == nil, let ty = obj["type"] as? String,
                    ty == "user" || ty == "assistant",
@@ -382,7 +410,14 @@ final class SessionScanner {
                     activity = Self.isoParser.date(from: ts)
                 }
             }
-            if !snippet.isEmpty && !model.isEmpty && !prompt.isEmpty && activity != nil { break }
+            if !snippet.isEmpty && !model.isEmpty && !prompt.isEmpty && activity != nil
+                && transcript.count >= Self.maxTranscriptEntries { break }
+        }
+        transcript = Array(transcript.suffix(Self.maxTranscriptEntries))
+        // 滚动区靠 id 定位，同一条在两次 poll 之间必须拿到同一个 id
+        transcript = transcript.enumerated().map { i, e in
+            TranscriptEntry(id: "\(i)|\(e.role)|\(e.title)|\(e.text.prefix(24))",
+                            role: e.role, title: e.title, text: e.text)
         }
         if model.isEmpty, size > readLen {
             // 长 transcript 里模型名可能只出现在开头 —— 补查文件头
@@ -394,7 +429,7 @@ final class SessionScanner {
                     .replacingOccurrences(of: "claude-", with: "")
             }
         }
-        return (snippet, model, prompt, activity)
+        return (snippet, model, prompt, transcript, activity)
     }
 
     /// 若该行是用户消息则提取。
@@ -413,6 +448,91 @@ final class SessionScanner {
             }
         }
         return nil
+    }
+
+    /// 把一行 transcript 展开成滚动区里的若干行。一条 Claude assistant 条目
+    /// 可以同时含文本块和工具块，因此返回数组而不是单条。
+    /// id 留空，由 `tailInfo` 定位完最终顺序后统一编号。
+    private func transcriptRows(_ obj: [String: Any]) -> [TranscriptEntry] {
+        func row(_ role: TranscriptEntry.Role, _ title: String, _ text: String) -> TranscriptEntry {
+            TranscriptEntry(id: "", role: role, title: title, text: text)
+        }
+        // Codex 事件流
+        if let payload = obj["payload"] as? [String: Any],
+           let kind = payload["type"] as? String {
+            switch kind {
+            case "user_message":
+                if let m = payload["message"] as? String, let t = cleanLong(m) {
+                    return [row(.user, "", t)]
+                }
+            case "agent_message":
+                if let m = payload["message"] as? String, let t = cleanLong(m) {
+                    return [row(.assistant, "", t)]
+                }
+            case "custom_tool_call", "function_call":
+                // exec 的 input 是一段 JS，arguments 是 JSON；两者都只取开头当摘要
+                let name = (payload["name"] as? String) ?? "tool"
+                let raw = (payload["input"] as? String) ?? (payload["arguments"] as? String) ?? ""
+                return [row(.tool, name, oneLine(raw))]
+            default:
+                return []
+            }
+            return []
+        }
+        // Claude 条目
+        guard let ty = obj["type"] as? String, let msg = obj["message"] as? [String: Any] else {
+            return []
+        }
+        if ty == "user" {
+            if let c = msg["content"] as? String, let t = cleanLong(c) { return [row(.user, "", t)] }
+            // tool_result 是工具回填给模型的，不是用户说的话
+            if let arr = msg["content"] as? [[String: Any]] {
+                return arr.compactMap { part in
+                    guard part["type"] as? String == "text",
+                          let s = part["text"] as? String, let t = cleanLong(s) else { return nil }
+                    return row(.user, "", t)
+                }
+            }
+            return []
+        }
+        guard ty == "assistant" else { return [] }
+        if let c = msg["content"] as? String, let t = cleanLong(c) { return [row(.assistant, "", t)] }
+        guard let arr = msg["content"] as? [[String: Any]] else { return [] }
+        // thinking 块不进滚动区：它是内部推理，且长到会淹没真正的输出
+        return arr.compactMap { part in
+            switch part["type"] as? String {
+            case "text":
+                guard let s = part["text"] as? String, let t = cleanLong(s) else { return nil }
+                return row(.assistant, "", t)
+            case "tool_use":
+                let name = (part["name"] as? String) ?? "tool"
+                return row(.tool, name, toolSummary(part["input"] as? [String: Any] ?? [:]))
+            default:
+                return nil
+            }
+        }
+    }
+
+    /// 工具行只有一行宽度，挑参数里最有信息量的那个。未知工具退回第一个字符串参数，
+    /// 这样新增工具不会显示成空白行。
+    private func toolSummary(_ input: [String: Any]) -> String {
+        if let p = input["file_path"] as? String, !p.isEmpty {
+            return (p as NSString).lastPathComponent
+        }
+        for key in ["description", "pattern", "command", "path", "query", "url", "prompt"] {
+            if let v = input[key] as? String, !v.isEmpty { return oneLine(v) }
+        }
+        for key in input.keys.sorted() {
+            if let v = input[key] as? String, !v.isEmpty { return oneLine(v) }
+        }
+        return ""
+    }
+
+    private func oneLine(_ s: String) -> String {
+        var t = s.replacingOccurrences(of: "\n", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if t.count > 100 { t = String(t.prefix(100)) + "…" }
+        return t
     }
 
     private func extractText(_ obj: [String: Any]) -> String? {
@@ -437,6 +557,15 @@ final class SessionScanner {
         if t.isEmpty || t.hasPrefix("<") || t.hasPrefix("{") { return nil }  // 跳过 system-reminder / 工具 json
         t = t.replacingOccurrences(of: "\n", with: " ")
         if t.count > 90 { t = String(t.prefix(90)) + "…" }
+        return t
+    }
+
+    /// 与 `clean` 同样跳过 system-reminder 与工具 JSON，但保留换行、放宽长度：
+    /// 展开视图是用来读正文的，压成 90 字符单行就等于没展开。
+    private func cleanLong(_ s: String) -> String? {
+        var t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        if t.isEmpty || t.hasPrefix("<") || t.hasPrefix("{") { return nil }
+        if t.count > 600 { t = String(t.prefix(600)) + "…" }
         return t
     }
 }

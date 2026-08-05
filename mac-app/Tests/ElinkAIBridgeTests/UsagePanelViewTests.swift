@@ -99,6 +99,39 @@ final class UsagePanelViewTests: XCTestCase {
         XCTAssertGreaterThan(height(initiallyExpanded: true), height())
     }
 
+    /// 展开输出必须真的撑出滚动区，否则箭头点了等于没反应。
+    @MainActor
+    func testAgentSessionOutputExpandsIntoScrollArea() {
+        var session = AgentSession(
+            id: "session-1",
+            kind: .claude,
+            title: "elink-ai",
+            snippet: "修复弹窗布局",
+            model: "claude-opus",
+            lastModified: Date()
+        )
+        session.prompt = "修复弹窗布局"
+        session.transcript = [
+            TranscriptEntry(id: "0", role: .user, title: "", text: "修复弹窗布局"),
+            TranscriptEntry(id: "1", role: .assistant, title: "", text: "先看看现有实现"),
+            TranscriptEntry(id: "2", role: .tool, title: "Read", text: "UsagePanelView.swift"),
+        ]
+
+        func height(openOutputs: Set<String>) -> CGFloat {
+            let host = NSHostingView(rootView: AgentSessionsCard(
+                sessions: [session],
+                theme: PanelTheme(.light),
+                initiallyExpanded: true,
+                initiallyOpenOutputs: openOutputs
+            ))
+            host.frame = NSRect(x: 0, y: 0, width: 408, height: 1)
+            host.layoutSubtreeIfNeeded()
+            return host.fittingSize.height
+        }
+
+        XCTAssertGreaterThan(height(openOutputs: ["session-1"]), height(openOutputs: []))
+    }
+
     @MainActor
     func testDashboardHeightIsCappedAndMainContentScrolls() {
         let path = NSTemporaryDirectory() + "elink-panel-\(UUID().uuidString).db"
