@@ -28,18 +28,11 @@ struct MeshLatencyChart: View {
 
     @State private var hoveredIndex: Int?
 
-    /// 延迟是数据序列，不是状态，因此不复用 statusHealthy 那套绿/黄/红；用面板本身的
-    /// 紫作为单序列色，与状态色天然分开。两种模式的取值都过了亮度带、色度、色觉障碍
-    /// 分离度与对比度校验。
-    private var seriesColor: Color {
-        theme.dark ? Color(red: 0.60, green: 0.49, blue: 0.91)
-                   : Color(red: 0.48, green: 0.32, blue: 0.85)
-    }
+    /// 延迟是数据序列，不是状态，因此不复用 statusHealthy 那套绿/黄/红；单序列色由
+    /// 主题给出，各套主题都保证它与三个状态色分得开。
+    private var seriesColor: Color { theme.seriesColor }
 
-    private var lossColor: Color {
-        theme.dark ? Color(red: 0.91, green: 0.37, blue: 0.47)
-                   : Color(red: 0.92, green: 0.35, blue: 0.44)
-    }
+    private var lossColor: Color { theme.statusCritical }
 
     /// 纵轴取这台节点自己的数据范围，不从零起。
     ///

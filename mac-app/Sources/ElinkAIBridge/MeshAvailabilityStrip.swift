@@ -67,8 +67,7 @@ struct MeshAvailabilityStrip: View {
         case .noData: return theme.textTertiary.opacity(theme.dark ? 0.20 : 0.16)
         case .ok: return theme.statusHealthy.opacity(theme.dark ? 0.75 : 0.65)
         case .partial: return theme.statusWarning
-        case .lost: return theme.dark ? Color(red: 0.91, green: 0.37, blue: 0.47)
-                                      : Color(red: 0.92, green: 0.35, blue: 0.44)
+        case .lost: return theme.statusCritical
         }
     }
 
