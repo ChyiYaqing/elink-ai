@@ -1478,7 +1478,7 @@ enum UsagePresentation {
     }
 }
 
-private struct ProviderCard: View {
+struct ProviderCard: View {
     let name: String
     let pet: [String]
     let accent: Color
@@ -1528,11 +1528,10 @@ private struct ProviderCard: View {
                         .font(.system(size: 9, weight: .medium))
                         .foregroundStyle(theme.textSecondary)
                 }
-                Text(UsagePresentation.missingPrimaryText(status))
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(theme.textTertiary)
-                    .lineLimit(2)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                // 没有活跃窗口时也要占住进度条那一格。两张卡并排，这一段短了
+                // 一条进度条的高度，下面的 7 天进度条就会左右错开——一眼看得出来。
+                UsageBar(percent: 0, theme: theme).hidden()
+                footnote(UsagePresentation.missingPrimaryText(status))
             }
             if let weekly = status.weekly.percent {
                 HStack {
@@ -1606,12 +1605,20 @@ private struct ProviderCard: View {
     }
 
     private func resetLine(_ minutes: Int?) -> some View {
+        footnote(minutes.map { tr("\(MenuBarController.formatMinutes($0)) 后重置", "resets in \(MenuBarController.formatMinutes($0))") } ?? tr("无活跃窗口", "No active window"))
+    }
+
+    /// 进度条底下那行小字。重置时间和「没有活跃窗口」都走这里：它们是同一类信息，
+    /// 也必须是同一个高度，否则两张卡的 7 天区块对不齐。
+    private func footnote(_ text: String) -> some View {
         HStack(spacing: 3) {
             Image(systemName: "clock.fill").font(.system(size: 7))
-            Text(minutes.map { tr("\(MenuBarController.formatMinutes($0)) 后重置", "resets in \(MenuBarController.formatMinutes($0))") } ?? tr("无活跃窗口", "No active window"))
+            Text(text)
                 .font(.system(size: 8, weight: .medium))
+                .lineLimit(2)
         }
         .foregroundStyle(theme.textTertiary)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var stateText: String {

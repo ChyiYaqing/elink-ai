@@ -394,6 +394,33 @@ final class UsagePanelViewTests: XCTestCase {
                        "只有被点击的节点会展开")
     }
 
+    /// Claude 和 Codex 并排，两张卡的 7 天进度条必须在同一水平线上。
+    ///
+    /// 它们之所以会错开，是因为上面那段 5 小时窗口有两个分支：有用量时画
+    /// 「大数字 + 进度条 + 重置时间」，没有活跃窗口时只画「大数字 + 一行说明」，
+    /// 少了一条进度条的高度。实测错开 10pt，两张卡摆在一起一眼就看得出来。
+    @MainActor
+    func testFiveHourBlockKeepsItsHeightWithoutAnActiveWindow() {
+        func cardHeight(primary: UsageWindow) -> CGFloat {
+            var status = AgentStatus()
+            status.state = "idle"
+            status.primary = primary
+            status.weekly = UsageWindow(percent: 36, resetMinutes: 4941)
+            let card = ProviderCard(name: "Codex", pet: PixelPet.codex,
+                                    accent: PanelTheme.codexColor(dark: false),
+                                    status: status, theme: PanelTheme(.light)) {}
+            let host = NSHostingView(rootView: card)
+            host.frame = NSRect(x: 0, y: 0, width: 215, height: 1)
+            host.layoutSubtreeIfNeeded()
+            return host.fittingSize.height
+        }
+
+        XCTAssertEqual(cardHeight(primary: UsageWindow(percent: 47, resetMinutes: 40)),
+                       cardHeight(primary: UsageWindow()),
+                       accuracy: 0.5,
+                       "有没有活跃的 5 小时窗口，这一段都要一样高")
+    }
+
     /// 这套颜色存在的理由就是「同一屏上分得开」。先试过按 nodeID 哈希取色，实测
     /// 四台机器里三台撞成同一个颜色——6 个色位下四台不撞的概率只有 28%。
     func testEveryClusterMemberGetsADistinctColor() {
