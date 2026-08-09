@@ -41,7 +41,7 @@ final class MeshDetailModel: ObservableObject {
 
     deinit { timer?.invalidate() }
 
-    /// 页面开着就自己重载。表头的年龄和状态点跟着 MeshMonitor 走，色带和折线却只在
+    /// 页面开着就自己重载。表头的年龄和状态点跟着 MeshMonitor 走，图却只在
     /// 打开那一刻取过一次——一张在动的表头配一张冻住的图，比整页都不动更容易看错。
     ///
     /// 节拍对齐探测的 30 秒：更密只是把同一份数据再读一遍，而每次重载都要读一遍库
@@ -102,6 +102,8 @@ struct MeshDetailView: View {
     @StateObject private var model = MeshDetailModel()
     @State private var hovered: [String: MeshBucketPoint] = [:]
     @State private var expanded: Set<String> = []
+    /// 哪几台展开了 lighthouse 视角的延迟折线。默认一台都没有。
+    @State private var lighthouseOpen: Set<String> = []
 
     /// 一台节点 + 它在这个窗口里的结论。
     private typealias Row = (host: MeshHostView, report: MeshHostReport)
@@ -128,8 +130,8 @@ struct MeshDetailView: View {
                 VStack(alignment: .leading, spacing: 10) {
                     settings
                     legend
-                    // 时间轴放在列表上方共享：折叠状态下每台只有两条色带，它们用的是
-                    // 同一个窗口，每台各印一遍刻度只是把同一根轴抄十遍。
+                    // 时间轴放在列表上方共享：每台用的都是同一个窗口，
+                    // 各印一遍刻度只是把同一根轴抄十遍。
                     axis
                     if mesh.hosts.isEmpty {
                         Text(tr("等待第一份名册…", "Waiting for the first roster…"))
@@ -247,21 +249,32 @@ struct MeshDetailView: View {
         .sectionCard(theme)
     }
 
+    /// 图里三种标记各是什么意思。画法与图一致——图例和图不一致比没有图例更糟。
     private var legend: some View {
-        let strip = MeshAvailabilityStrip(points: [], window: model.window, theme: theme)
-        return HStack(spacing: 10) {
-            ForEach([(MeshBucketStatus.ok, tr("全部探通", "all through")),
-                     (.partial, tr("有丢包", "some lost")),
-                     (.lost, tr("全部不通", "nothing through")),
-                     (.noData, tr("没有探测", "not probed"))], id: \.0) { status, text in
-                HStack(spacing: 4) {
-                    strip.swatch(status)
-                    Text(text)
-                        .font(.system(size: 8, weight: .medium))
-                        .foregroundStyle(theme.textTertiary)
-                }
+        HStack(spacing: 10) {
+            legendItem(tr("最快–最慢", "fastest–slowest"),
+                       color: theme.seriesColor.opacity(theme.dark ? 0.38 : 0.28), height: 11)
+            legendItem(tr("丢包", "some lost"), color: theme.statusWarning, height: 4)
+            legendItem(tr("全部不通", "nothing through"), color: theme.statusCritical, height: 8)
+            HStack(spacing: 4) {
+                Rectangle().fill(.clear).frame(width: 4, height: 11)
+                Text(tr("空白 = 没有探测", "blank = not probed"))
+                    .font(.system(size: 8, weight: .medium))
+                    .foregroundStyle(theme.textTertiary)
             }
             Spacer()
+        }
+    }
+
+    private func legendItem(_ text: String, color: Color, height: CGFloat) -> some View {
+        HStack(spacing: 4) {
+            // 竖条和丢包标记都是贴着基线量的，图例也贴着底对齐
+            Capsule().fill(color)
+                .frame(width: 4, height: height)
+                .frame(height: 11, alignment: .bottom)
+            Text(text)
+                .font(.system(size: 8, weight: .medium))
+                .foregroundStyle(theme.textTertiary)
         }
     }
 
@@ -273,8 +286,9 @@ struct MeshDetailView: View {
 
     // MARK: - 每台节点
 
-    /// 一台节点。默认折叠：两条色带就够回答「什么时候不通」，折线回答的是「快不快」，
-    /// 那是追问。十台节点各展开两张折线是 3000pt 的滚动，出事的那台大概率不在第一屏。
+    /// 一台节点。默认折叠：一张不带刻度的小图就够回答「在不在抖、丢没丢包」，
+    /// 具体多少毫秒是追问。十台节点各展开两张带刻度的图是 3000pt 的滚动，
+    /// 出事的那台大概率不在第一屏。
     private func hostBlock(_ row: Row) -> some View {
         let host = row.host
         let open = expanded.contains(host.name)
@@ -297,9 +311,21 @@ struct MeshDetailView: View {
                 series(key: "local:\(host.name)",
                        title: tr("本机 → \(host.name)", "this host → \(host.name)"),
                        points: local, missing: nil)
-                series(key: "lighthouse:\(host.name)",
-                       title: tr("lighthouse → \(host.name)", "lighthouse → \(host.name)"),
-                       points: lighthouse, missing: missing)
+                // lighthouse 的延迟默认不画。本机视角回答「我这里通不通、快不快」，
+                // 是排查时先问的那一个；对端的延迟是追问，而它占的高度和本机那张一样，
+                // 展开一台就要滚过两张图。对端断没断仍由表头那句「几点到几点不通」
+                // 兜住——MeshAnalysis.report 有 lighthouse 中断时优先用它。
+                if lighthouseOpen.contains(host.name) {
+                    series(key: "lighthouse:\(host.name)",
+                           title: tr("lighthouse → \(host.name)", "lighthouse → \(host.name)"),
+                           points: lighthouse, missing: missing)
+                } else {
+                    compactSeries(title: tr("lighthouse →", "from lighthouse"),
+                                  points: lighthouse, missing: missing)
+                }
+                if missing == nil {
+                    lighthouseToggle(host.name)
+                }
                 axis
             } else {
                 compactSeries(title: tr("本机 →", "from here"), points: local, missing: nil)
@@ -358,7 +384,10 @@ struct MeshDetailView: View {
         UsagePanelView.meshStateColor(host.state, theme: theme)
     }
 
-    /// 折叠时的一条链路：标题 + 色带。色带是这一页里信息密度最高的一段，只占 8pt。
+    /// 折叠时的一条链路：标题 + 一张不带刻度的图。
+    ///
+    /// 这一格要在不展开、不悬停的情况下答完「在不在抖、丢没丢包」。具体多少毫秒是
+    /// 追问，展开了才给——所以刻度标签在这里关掉，24pt 的高度也放不下它们。
     private func compactSeries(title: String, points: [MeshBucketPoint],
                                missing: String?) -> some View {
         VStack(alignment: .leading, spacing: 2) {
@@ -370,16 +399,37 @@ struct MeshDetailView: View {
                     .font(.system(size: 9, weight: .medium))
                     .foregroundStyle(theme.statusWarning)
             } else {
-                MeshAvailabilityStrip(points: points, window: model.window, theme: theme)
-                    .frame(height: 8)
+                MeshLatencyChart(points: points, window: model.window, theme: theme,
+                                 showsScale: false)
+                    .frame(height: 24)
             }
         }
     }
 
-    /// 一条链路的完整呈现：摘要 + 可达性色带 + 延迟折线。
+    private func lighthouseToggle(_ name: String) -> some View {
+        let open = lighthouseOpen.contains(name)
+        return Button {
+            Log.user("\(open ? "hide" : "show") lighthouse latency")
+            withAnimation(.easeOut(duration: 0.2)) {
+                if open { lighthouseOpen.remove(name) } else { lighthouseOpen.insert(name) }
+            }
+        } label: {
+            HStack(spacing: 3) {
+                Image(systemName: "chart.xyaxis.line").font(.system(size: 8, weight: .semibold))
+                Text(open ? tr("收起 lighthouse 侧的延迟", "Hide latency from the lighthouse")
+                          : tr("看 lighthouse 侧的延迟", "Show latency from the lighthouse"))
+                    .font(.system(size: 8, weight: .semibold))
+            }
+            .foregroundStyle(theme.textTertiary)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    /// 一条链路的完整呈现：摘要 + 带刻度的延迟图。
     ///
-    /// 色带在折线上方而不是下方：先答「通不通」，再答「快不快」。事故排查里前者是问题
-    /// 本身，后者只是旁证。
+    /// 「通不通」不再另起一条色带：丢包和中断已经画在图的基线上，两套画法说同一件事
+    /// 只会让人去比对它们哪个准。
     @ViewBuilder
     private func series(key: String, title: String, points: [MeshBucketPoint],
                         missing: String?) -> some View {
@@ -398,13 +448,11 @@ struct MeshDetailView: View {
                     .foregroundStyle(theme.statusWarning)
                     .frame(height: 20, alignment: .leading)
             } else {
-                MeshAvailabilityStrip(points: points, window: model.window, theme: theme)
-                    .frame(height: 10)
                 let chart = MeshLatencyChart(points: points, window: model.window,
                                              theme: theme) { point in
                     hovered[key] = point
                 }
-                chart.frame(height: chart.hasPlottableData ? 56 : 10)
+                chart.frame(height: chart.hasPlottableData ? 56 : 12)
             }
         }
     }
