@@ -9,7 +9,7 @@ struct AgentSessionsCard: View {
     @State private var expandedIDs = Set<String>()
     @State private var outputIDs = Set<String>()
 
-    private static let busyColor = Color(red: 0.32, green: 0.58, blue: 0.96)
+    private var busyColor: Color { theme.statusInfo }
 
     init(sessions: [AgentSession], theme: PanelTheme, initiallyExpanded: Bool = false,
          initiallyOpenOutputs: Set<String> = []) {
@@ -259,7 +259,7 @@ struct AgentSessionsCard: View {
     }
 
     private func tagColor(busy: Bool, live: Bool) -> Color {
-        if busy { return Self.busyColor }
+        if busy { return busyColor }
         if live { return theme.textTertiary }
         return theme.statusHealthy
     }

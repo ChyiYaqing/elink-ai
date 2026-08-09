@@ -140,16 +140,16 @@ enum UsageStats {
             .map(\.key)
     }
 
-    /// Token 分类的展示顺序、中文名与配色（参考 Input 蓝 / Output 绿 /
-    /// Cache Read 紫 / Cache Write 橙 / Reasoning 红的通用惯例）
+    /// Token 分类的展示顺序、中文名与配色。色相沿用 Input 蓝 / Output 绿 /
+    /// Cache Read 紫 / Cache Write 橙 / Reasoning 红的通用惯例，具体取值由主题给出。
     static var categoryOrder: [(key: String, label: String, color: Color)] {
-        [
-            ("input", tr("输入", "Input"), Color(red: 0.36, green: 0.62, blue: 0.98)),
-            ("output", tr("输出", "Output"), Color(red: 0.30, green: 0.76, blue: 0.55)),
-            ("cache_read", tr("缓存读取", "Cache Read"), Color(red: 0.78, green: 0.38, blue: 0.92)),
-            ("cache_write", tr("缓存写入", "Cache Write"), Color(red: 0.95, green: 0.60, blue: 0.25)),
-            ("reasoning", tr("推理", "Reasoning"), Color(red: 0.98, green: 0.38, blue: 0.45)),
-        ]
+        let colors = AppTheme.current.palette(dark: false).categoryPalette
+        return zip([("input", tr("输入", "Input")),
+                    ("output", tr("输出", "Output")),
+                    ("cache_read", tr("缓存读取", "Cache Read")),
+                    ("cache_write", tr("缓存写入", "Cache Write")),
+                    ("reasoning", tr("推理", "Reasoning"))], colors)
+            .map { (key: $0.0.0, label: $0.0.1, color: $0.1) }
     }
 
     /// 某个 day 键是否落在当前范围窗口内。
@@ -209,16 +209,9 @@ enum UsageStats {
         cost >= 100 ? String(format: "$%.0f", cost) : String(format: "$%.2f", cost)
     }
 
-    static let palette: [Color] = [
-        Color(red: 0.98, green: 0.55, blue: 0.45), // 珊瑚
-        Color(red: 0.30, green: 0.76, blue: 0.71), // 青绿
-        Color(red: 0.58, green: 0.46, blue: 0.96), // 紫
-        Color(red: 0.36, green: 0.62, blue: 0.98), // 蓝
-        Color(red: 0.95, green: 0.68, blue: 0.28), // 琥珀
-        Color(red: 0.90, green: 0.42, blue: 0.68), // 粉
-        Color(red: 0.45, green: 0.80, blue: 0.38), // 绿
-        Color(red: 0.62, green: 0.60, blue: 0.68), // 灰
-    ]
+    /// 堆叠条按模型着色的色位。数据序列色在明暗模式下取同一个值——同一个模型
+    /// 在浅色和深色面板里必须是同一个颜色，否则跨屏对照就断了。
+    static var palette: [Color] { AppTheme.current.palette(dark: false).dataPalette }
 
     static func colors(for order: [String]) -> [String: Color] {
         Dictionary(uniqueKeysWithValues: order.enumerated().map {
@@ -228,14 +221,7 @@ enum UsageStats {
 
     /// 设备身份色。与模型配色分开：条形和图例点按模型着色，这一套只用在设备的图标
     /// 和占比徽章上，两者落在不同的视觉位置，不会互相冒充。
-    static let devicePalette: [Color] = [
-        Color(red: 0.35, green: 0.47, blue: 0.93), // 靛蓝
-        Color(red: 0.16, green: 0.68, blue: 0.60), // 松绿
-        Color(red: 0.86, green: 0.45, blue: 0.16), // 赭橙
-        Color(red: 0.72, green: 0.33, blue: 0.82), // 紫罗兰
-        Color(red: 0.22, green: 0.60, blue: 0.86), // 天蓝
-        Color(red: 0.83, green: 0.35, blue: 0.53), // 玫红
-    ]
+    static var devicePalette: [Color] { AppTheme.current.palette(dark: false).devicePalette }
 
     /// 设备占比区块的显示条件。
     ///

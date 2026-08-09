@@ -349,6 +349,42 @@ final class MeshTests: XCTestCase {
         XCTAssertEqual(MeshLatencyChart.segments(series), [[0, 1, 2, 3, 4]])
     }
 
+    /// 图里三种标记必须两两分得开。可达性色带删掉之后，「多慢 / 丢了多少 / 全不通」
+    /// 全靠这三个颜色区分，撞色就等于把一次中断说成一次抖动。
+    func testTheChartMarksStayDistinct() {
+        for dark in [false, true] {
+            let theme = PanelTheme(dark ? .dark : .light)
+            let marks = [theme.seriesColor.opacity(dark ? 0.38 : 0.28),
+                         theme.statusWarning,
+                         theme.statusCritical]
+            XCTAssertEqual(Set(marks).count, marks.count, "dark=\(dark) 三种标记不能同色")
+        }
+    }
+
+    /// 丢包标记的高度必须随比例走。
+    ///
+    /// 一律画满是这条路上踩过的坑：这张网上四台节点每五分钟都会丢一两个探测，
+    /// 满高度的标记会让这四台看着和真的断掉一样严重，而那正是要区分的两件事。
+    func testLossMarkGrowsWithTheLossFraction() {
+        func height(samples: Int, ok: Int) -> CGFloat {
+            MeshLatencyChart.lossMarkHeight(
+                MeshBucketPoint(bucketAt: base, samples: samples, okSamples: ok,
+                                rttMinUs: ok > 0 ? 9_000 : nil,
+                                rttMaxUs: ok > 0 ? 18_000 : nil,
+                                rttAvgUs: ok > 0 ? 12_000 : nil))
+        }
+
+        XCTAssertEqual(height(samples: 10, ok: 10), 0, "一个都没丢就不该有标记")
+        XCTAssertEqual(height(samples: 0, ok: 0), 0, "根本没探测不是丢包")
+
+        let occasional = height(samples: 16, ok: 15)
+        let heavy = height(samples: 16, ok: 8)
+        let outage = height(samples: 16, ok: 0)
+        XCTAssertGreaterThan(occasional, 0, "丢一个探测也要看得见")
+        XCTAssertLessThan(occasional, heavy, "零星丢包不能和大量丢包一样高")
+        XCTAssertLessThan(heavy, outage, "全丢必须是最高的那一档")
+    }
+
     // MARK: - 纵轴与空图
 
     /// 零基线把 199–221ms 压进图的顶部一成，波动整个消失——这是实测截图里看到的问题。
@@ -361,6 +397,35 @@ final class MeshTests: XCTestCase {
         XCTAssertGreaterThan(lower, 150_000, "下界不能退到零")
         XCTAssertLessThan(lower, 199_000, "下界要留出余量")
         XCTAssertGreaterThan(upper, 221_000, "上界要留出余量")
+    }
+
+    /// 一次尖峰不能把日常波动压平。
+    ///
+    /// 实测截图：本机 → 3B 的窗口是 8.88ms–481ms，日常在 10–35ms，481ms 是单次探测的
+    /// 尖峰。线性纵轴下这段日常波动只占图高的 5%，均值线成了一条贴着底边的平线，
+    /// 而「波动」正是这张图要回答的问题。
+    func testASingleSpikeDoesNotFlattenTheEverydayRange() {
+        var series = [point(0, min: 8_880, max: 12_000),
+                      point(300, min: 9_500, max: 35_000),
+                      point(600, min: 10_000, max: 28_000)]
+        series.append(point(900, min: 12_000, max: 481_000))  // 尖峰
+        let chart = MeshLatencyChart(points: series, window: axis(), theme: PanelTheme(.light))
+
+        let everyday = chart.plotRatio(35_000) - chart.plotRatio(10_000)
+        XCTAssertGreaterThan(everyday, 0.2,
+                             "10–35ms 这段日常波动至少要占图高的两成，否则读不出抖动")
+        XCTAssertLessThan(chart.plotRatio(481_000), 1.0001, "尖峰仍然画在图内，没有被砍掉")
+        XCTAssertGreaterThan(chart.plotRatio(481_000), everyday,
+                             "尖峰仍然是这张图的最高点")
+    }
+
+    /// 窄范围的序列不能因为换了刻度就退化：Bandwagon2 的 199–221ms 仍要铺开
+    func testANarrowRangeStillFillsTheChart() {
+        let series = [point(0, min: 199_000, max: 210_000),
+                      point(300, min: 205_000, max: 221_000)]
+        let chart = MeshLatencyChart(points: series, window: axis(), theme: PanelTheme(.light))
+        XCTAssertGreaterThan(chart.plotRatio(221_000) - chart.plotRatio(199_000), 0.7,
+                             "整段数据要占满图高的大部分")
     }
 
     /// 一条水平线也要能画出来，不能因为 span 为零而除零或贴边
@@ -414,50 +479,6 @@ final class MeshTests: XCTestCase {
                                                  in: window, width: 100), 0)
     }
 
-    // MARK: - 可达性色带
-
-    /// 「探了但全丢」是故障，「根本没探」只是没在看。两者同色，就等于把本机休眠
-    /// 报成一次中断，或者把一次中断报成休眠。
-    func testStatusSeparatesAnOutageFromNotWatching() {
-        XCTAssertEqual(MeshBucketStatus.of(point(0, min: 1_000, max: 1_200)), .ok)
-        XCTAssertEqual(
-            MeshBucketStatus.of(point(0, min: 1_000, max: 1_200, samples: 10, ok: 7)), .partial)
-        XCTAssertEqual(
-            MeshBucketStatus.of(point(0, min: nil, max: nil, samples: 10, ok: 0)), .lost)
-        XCTAssertEqual(
-            MeshBucketStatus.of(point(0, min: nil, max: nil, samples: 0, ok: 0)), .noData)
-    }
-
-    /// 七天窗口下一个桶不到一个像素。若按数据顺序绘制，后面的正常桶会把前面那次
-    /// 中断整个覆盖掉——一张在最需要它说实话时说「一切正常」的图。
-    func testWorseStatusIsDrawnLast() {
-        let series = [point(0, min: nil, max: nil, samples: 10, ok: 0),
-                      point(300, min: 1_000, max: 1_200),
-                      point(600, min: 1_000, max: 1_200, samples: 10, ok: 4)]
-        let marks = MeshAvailabilityStrip.marks(points: series, window: axis(), width: 600)
-        XCTAssertEqual(marks.map(\.status), [.ok, .partial, .lost],
-                       "越坏越后画，才不会被好桶盖住")
-    }
-
-    /// 5 分钟占七天的 0.05%，不设下限就是 0.4pt——等于没画
-    func testAShortOutageStaysVisibleInAWideWindow() {
-        let week = base...base.addingTimeInterval(7 * 24 * 3_600)
-        let marks = MeshAvailabilityStrip.marks(
-            points: [point(0, min: nil, max: nil, samples: 10, ok: 0)],
-            window: week, width: 800)
-        XCTAssertEqual(marks.count, 1)
-        XCTAssertGreaterThanOrEqual(marks[0].width, MeshAvailabilityStrip.minimumMarkWidth)
-    }
-
-    /// 撑宽后不能越出右边缘，否则窗口末尾那格会被裁掉一半
-    func testTheLastMarkStaysInsideTheStrip() {
-        let window = base...base.addingTimeInterval(7 * 24 * 3_600)
-        let marks = MeshAvailabilityStrip.marks(
-            points: [point(7 * 24 * 3_600 - 300, min: nil, max: nil, samples: 10, ok: 0)],
-            window: window, width: 800)
-        XCTAssertLessThanOrEqual(marks[0].x + marks[0].width, 800)
-    }
-
     // MARK: - lighthouse 历史
 
     /// 本机视角测不到 lighthouse 到 DS925 那条隧道，昨晚断的恰恰是它。
@@ -479,8 +500,6 @@ final class MeshTests: XCTestCase {
         XCTAssertTrue(points[1].fullyLost)
         XCTAssertNil(points[1].rttAvgUs, "全丢的桶不能有延迟值，否则画成 0ms")
         XCTAssertEqual(points[2].lostSamples, 4)
-        XCTAssertEqual(MeshBucketStatus.of(points[1]), .lost)
-        XCTAssertEqual(MeshBucketStatus.of(points[2]), .partial)
     }
 
     /// 老版本 lighthouse 对任何路径都回名册，两份文档都有 hosts 键。当成空历史会把

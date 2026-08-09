@@ -46,7 +46,7 @@ struct PixelPetView: View {
                     let rect = CGRect(x: xOffset + CGFloat(x) * cell,
                                       y: yOffset + CGFloat(y) * cell,
                                       width: cell + 0.4, height: cell + 0.4)
-                    let fill = char == "E" ? Color(red: 0.08, green: 0.08, blue: 0.10) : color
+                    let fill = char == "E" ? Color(red: 0.07, green: 0.07, blue: 0.065) : color
                     context.fill(Path(rect), with: .color(fill))
                 }
             }

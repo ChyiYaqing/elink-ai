@@ -28,6 +28,7 @@ final class PanelModel: ObservableObject {
     @Published var agentSessions: [AgentSession] = []
     @Published var agentSessionsEnabled = true
     @Published var language: AppLanguage = AppLanguage.current
+    @Published var theme: AppTheme = AppTheme.current
     @Published var panelMaxHeight: CGFloat = 700
 
     var onSetMode: ((String) -> Void)?
@@ -73,7 +74,7 @@ struct UsagePanelView: View {
     }
 
     var body: some View {
-        let theme = PanelTheme(scheme)
+        let theme = PanelTheme(scheme, model.theme)
         VStack(spacing: 12) {
             header(theme)
             // 设置页作为覆盖层，保持面板尺寸稳定，避免弹窗因高度突变而跳位
@@ -210,6 +211,7 @@ struct UsagePanelView: View {
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
+                .tint(theme.controlAccent)
                 .frame(width: 180)
                 Spacer()
                 PillButton(title: tr("智能刷新", "Smart Refresh"), icon: "wand.and.stars", theme: theme) {
@@ -277,6 +279,7 @@ struct UsagePanelView: View {
                     deviceSettings(theme)
                     launchSettings(theme)
                     languageSettings(theme)
+                    themeSettings(theme)
                     agentSessionsSettings(theme)
                     clusterSettings(theme)
                     logSettings(theme)
@@ -306,7 +309,7 @@ struct UsagePanelView: View {
                     settingsHeader(
                         theme,
                         icon: "display",
-                        color: Color(red: 0.35, green: 0.60, blue: 0.95),
+                        color: theme.statusInfo,
                         title: tr("屏幕连接", "Screen Connection"),
                         subtitle: model.deviceConnectionEnabled
                             ? tr("树莓派电子纸的地址与配对", "Raspberry Pi e-paper address and pairing")
@@ -407,7 +410,7 @@ struct UsagePanelView: View {
     private func languageSettings(_ theme: PanelTheme) -> some View {
         HStack(spacing: 8) {
             settingsHeader(theme, icon: "globe",
-                           color: Color(red: 0.28, green: 0.66, blue: 0.62),
+                           color: PanelTheme.codexColor(dark: theme.dark),
                            title: tr("语言", "Language"),
                            subtitle: tr("界面显示语言", "Interface display language"))
             Picker("", selection: Binding(
@@ -422,6 +425,35 @@ struct UsagePanelView: View {
             }
             .pickerStyle(.segmented)
             .labelsHidden()
+            .tint(theme.controlAccent)
+            .frame(width: 140)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .glassCard(theme)
+    }
+
+    private func themeSettings(_ theme: PanelTheme) -> some View {
+        HStack(spacing: 8) {
+            settingsHeader(theme, icon: "paintpalette.fill",
+                           color: PanelTheme.claudeColor(dark: theme.dark),
+                           title: tr("主题", "Theme"),
+                           subtitle: tr("面板配色", "Panel color scheme"))
+            Picker("", selection: Binding(
+                get: { model.theme },
+                set: { value in
+                    Log.user("switch theme to \(value.rawValue)")
+                    AppTheme.current = value
+                    model.theme = value
+                }
+            )) {
+                ForEach(AppTheme.allCases, id: \.self) { option in
+                    Text(option.label).tag(option)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .tint(theme.controlAccent)
             .frame(width: 140)
         }
         .padding(12)
@@ -432,7 +464,7 @@ struct UsagePanelView: View {
     private func agentSessionsSettings(_ theme: PanelTheme) -> some View {
         HStack(spacing: 8) {
             settingsHeader(theme, icon: "terminal.fill",
-                           color: Color(red: 0.55, green: 0.40, blue: 0.90),
+                           color: theme.textSecondary,
                            title: tr("Agent 会话", "Agent Sessions"),
                            subtitle: tr("在面板显示运行中的 Claude Code / Codex 会话",
                                         "Show running Claude Code / Codex sessions in the panel"))
@@ -461,7 +493,7 @@ struct UsagePanelView: View {
                 settingsHeader(
                     theme,
                     icon: "macbook.and.iphone",
-                    color: Color(red: 0.32, green: 0.58, blue: 0.96),
+                    color: theme.statusInfo,
                     title: tr("多机同步", "Multi-Host Sync"),
                     subtitle: cluster.enabled
                         ? tr("\(max(1, cluster.nodes.filter { $0.isOnline() }.count))/\(max(1, cluster.nodes.count)) 台在线",
@@ -488,9 +520,9 @@ struct UsagePanelView: View {
                             HStack(spacing: 8) {
                                 Image(systemName: "link.badge.plus")
                                     .font(.system(size: 11, weight: .semibold))
-                                    .foregroundStyle(Color(red: 0.32, green: 0.58, blue: 0.96))
+                                    .foregroundStyle(theme.statusInfo)
                                     .frame(width: 24, height: 24)
-                                    .background(Circle().fill(Color.blue.opacity(theme.dark ? 0.18 : 0.09)))
+                                    .background(Circle().fill(theme.statusInfo.opacity(theme.dark ? 0.18 : 0.09)))
                                 VStack(alignment: .leading, spacing: 1) {
                                     Text(tr("在另一台主机输入配对码", "Enter the pairing code on another host"))
                                         .font(.system(size: 9, weight: .semibold, design: .rounded))
@@ -515,8 +547,8 @@ struct UsagePanelView: View {
                                     Image(systemName: pairingCodeCopied ? "checkmark" : "doc.on.doc")
                                         .font(.system(size: 11, weight: .semibold))
                                         .foregroundStyle(pairingCodeCopied
-                                            ? Color.green
-                                            : Color(red: 0.32, green: 0.58, blue: 0.96))
+                                            ? theme.statusHealthy
+                                            : theme.statusInfo)
                                         .frame(width: 20, height: 20)
                                         .contentShape(Rectangle())
                                 }
@@ -529,7 +561,7 @@ struct UsagePanelView: View {
                             .padding(8)
                             .background(
                                 RoundedRectangle(cornerRadius: 9)
-                                    .fill(Color.blue.opacity(theme.dark ? 0.10 : 0.05))
+                                    .fill(theme.statusInfo.opacity(theme.dark ? 0.10 : 0.05))
                             )
                         }
 
@@ -563,7 +595,7 @@ struct UsagePanelView: View {
                             HStack(spacing: 8) {
                                 Image(systemName: "link.badge.plus")
                                     .font(.system(size: 10, weight: .semibold))
-                                    .foregroundStyle(Color(red: 0.32, green: 0.58, blue: 0.96))
+                                    .foregroundStyle(theme.statusInfo)
                                 VStack(alignment: .leading, spacing: 1) {
                                     Text(tr("加入已有同步集群", "Join an existing sync cluster"))
                                         .font(.system(size: 9, weight: .semibold, design: .rounded))
@@ -745,11 +777,11 @@ struct UsagePanelView: View {
         HStack(spacing: 8) {
             Image(systemName: local ? "laptopcomputer" : "desktopcomputer")
                 .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(online ? Color(red: 0.32, green: 0.58, blue: 0.96) : theme.textTertiary)
+                .foregroundStyle(online ? theme.statusInfo : theme.textTertiary)
                 .frame(width: 26, height: 26)
                 .background(
                     RoundedRectangle(cornerRadius: 7)
-                        .fill((online ? Color.blue : theme.textTertiary).opacity(theme.dark ? 0.16 : 0.08))
+                        .fill((online ? theme.statusInfo : theme.textTertiary).opacity(theme.dark ? 0.16 : 0.08))
                 )
             VStack(alignment: .leading, spacing: 1) {
                 HStack(spacing: 5) {
@@ -1019,7 +1051,7 @@ struct UsagePanelView: View {
         let working = message.contains("正在") || message.hasSuffix("…")
         let color = failed
             ? theme.statusCritical
-            : working ? Color(red: 0.32, green: 0.58, blue: 0.96) : theme.statusHealthy
+            : working ? theme.statusInfo : theme.statusHealthy
         let icon = failed ? "exclamationmark.circle.fill"
             : working ? "arrow.triangle.2.circlepath" : "checkmark.circle.fill"
         return HStack(spacing: 6) {
@@ -1132,7 +1164,7 @@ struct UsagePanelView: View {
 
     private func logSettings(_ theme: PanelTheme) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            settingsHeader(theme, icon: "doc.text.fill", color: Color(red: 0.55, green: 0.52, blue: 0.62),
+            settingsHeader(theme, icon: "doc.text.fill", color: theme.textTertiary,
                            title: tr("日志", "Logs"), subtitle: tr("查看桥接应用运行日志", "View the bridge app's runtime logs"))
             WideButton(title: tr("打开日志文件", "Open Log File"), icon: "doc.text", theme: theme) {
                 let url = Log.fileURL()
@@ -1361,7 +1393,7 @@ private struct CircleIconButton: View {
         Button(action: action) {
             Image(systemName: icon)
                 .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(hovering ? Color.white : theme.textSecondary)
+                .foregroundStyle(hovering ? theme.accentForeground : theme.textSecondary)
                 .frame(width: 28, height: 28)
                 .background(
                     Circle().fill(hovering ? AnyShapeStyle(theme.accentGradient)
@@ -1446,7 +1478,7 @@ enum UsagePresentation {
     }
 }
 
-private struct ProviderCard: View {
+struct ProviderCard: View {
     let name: String
     let pet: [String]
     let accent: Color
@@ -1496,11 +1528,10 @@ private struct ProviderCard: View {
                         .font(.system(size: 9, weight: .medium))
                         .foregroundStyle(theme.textSecondary)
                 }
-                Text(UsagePresentation.missingPrimaryText(status))
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(theme.textTertiary)
-                    .lineLimit(2)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                // 没有活跃窗口时也要占住进度条那一格。两张卡并排，这一段短了
+                // 一条进度条的高度，下面的 7 天进度条就会左右错开——一眼看得出来。
+                UsageBar(percent: 0, theme: theme).hidden()
+                footnote(UsagePresentation.missingPrimaryText(status))
             }
             if let weekly = status.weekly.percent {
                 HStack {
@@ -1574,12 +1605,20 @@ private struct ProviderCard: View {
     }
 
     private func resetLine(_ minutes: Int?) -> some View {
+        footnote(minutes.map { tr("\(MenuBarController.formatMinutes($0)) 后重置", "resets in \(MenuBarController.formatMinutes($0))") } ?? tr("无活跃窗口", "No active window"))
+    }
+
+    /// 进度条底下那行小字。重置时间和「没有活跃窗口」都走这里：它们是同一类信息，
+    /// 也必须是同一个高度，否则两张卡的 7 天区块对不齐。
+    private func footnote(_ text: String) -> some View {
         HStack(spacing: 3) {
             Image(systemName: "clock.fill").font(.system(size: 7))
-            Text(minutes.map { tr("\(MenuBarController.formatMinutes($0)) 后重置", "resets in \(MenuBarController.formatMinutes($0))") } ?? tr("无活跃窗口", "No active window"))
+            Text(text)
                 .font(.system(size: 8, weight: .medium))
+                .lineLimit(2)
         }
         .foregroundStyle(theme.textTertiary)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var stateText: String {
@@ -1651,7 +1690,7 @@ struct PillButton: View {
                 Image(systemName: icon).font(.system(size: 9, weight: .semibold))
                 Text(title).font(.system(size: 10, weight: .semibold, design: .rounded))
             }
-            .foregroundStyle(hovering ? Color.white : theme.textSecondary)
+            .foregroundStyle(hovering ? theme.accentForeground : theme.textSecondary)
             .padding(.horizontal, 10)
             .padding(.vertical, 5)
             .background(
@@ -1679,7 +1718,7 @@ private struct WideButton: View {
                 Image(systemName: icon).font(.system(size: 10, weight: .semibold))
                 Text(title).font(.system(size: 11, weight: .semibold, design: .rounded))
             }
-            .foregroundStyle(hovering ? Color.white : theme.textSecondary)
+            .foregroundStyle(hovering ? theme.accentForeground : theme.textSecondary)
             .frame(maxWidth: .infinity)
             .padding(.vertical, 7)
             .background(
@@ -1709,7 +1748,7 @@ private struct DestructiveButton: View {
                 Text(title)
                     .font(.system(size: 10, weight: .semibold, design: .rounded))
             }
-            .foregroundStyle(hovering ? Color.white : theme.statusCritical)
+            .foregroundStyle(hovering ? theme.accentForeground : theme.statusCritical)
             .frame(maxWidth: .infinity)
             .padding(.vertical, 7)
             .background(
