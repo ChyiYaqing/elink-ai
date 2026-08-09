@@ -148,7 +148,7 @@ final class UsagePanelViewTests: XCTestCase {
         model.panelMaxHeight = 320
         let view = UsagePanelView(
             model: model,
-            updater: UpdateChecker(currentVersion: "0.1.20"),
+            updater: UpdateChecker(currentVersion: "0.1.21-rc1"),
             cluster: cluster,
             mesh: MeshMonitor(store: store, lighthouseURL: nil)
         )
@@ -226,7 +226,7 @@ final class UsagePanelViewTests: XCTestCase {
         model.deviceConnectionEnabled = enabled
         let view = UsagePanelView(
             model: model,
-            updater: UpdateChecker(currentVersion: "0.1.20"),
+            updater: UpdateChecker(currentVersion: "0.1.21-rc1"),
             cluster: cluster,
             mesh: MeshMonitor(store: store, lighthouseURL: nil),
             initialDeviceSettingsExpanded: expanded
@@ -257,7 +257,7 @@ final class UsagePanelViewTests: XCTestCase {
         model.showMesh = true
         let view = UsagePanelView(
             model: model,
-            updater: UpdateChecker(currentVersion: "0.1.20"),
+            updater: UpdateChecker(currentVersion: "0.1.21-rc1"),
             cluster: cluster,
             mesh: MeshMonitor(store: store, lighthouseURL: nil)
         )
@@ -295,7 +295,7 @@ final class UsagePanelViewTests: XCTestCase {
         model.showSettings = true
         let view = UsagePanelView(
             model: model,
-            updater: UpdateChecker(currentVersion: "0.1.20"),
+            updater: UpdateChecker(currentVersion: "0.1.21-rc1"),
             cluster: cluster,
             mesh: MeshMonitor(store: store, lighthouseURL: nil),
             initialClusterExpanded: true
@@ -374,7 +374,7 @@ final class UsagePanelViewTests: XCTestCase {
             model.panelMaxHeight = 3000
             let view = UsagePanelView(
                 model: model,
-                updater: UpdateChecker(currentVersion: "0.1.20"),
+                updater: UpdateChecker(currentVersion: "0.1.21-rc1"),
                 cluster: cluster,
                 mesh: MeshMonitor(store: store, lighthouseURL: nil),
                 initialClusterExpanded: true,

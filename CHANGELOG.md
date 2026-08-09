@@ -6,6 +6,44 @@ and `Removed`.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## 0.1.21-rc1
+
+### Added
+
+- The panel now has a theme you can switch in settings. The new default,
+  `washi`, is a warm paper-and-ink palette; the previous purple scheme is kept
+  as `violet` and reproduces its old colours exactly. The choice is remembered
+  across restarts.
+
+### Changed
+
+- The mesh detail page draws latency and reachability as a single chart instead
+  of a strip above a line. Each five-minute bucket gets its own min–max bar, so
+  a one-off spike stays inside the five minutes it happened in instead of
+  smearing into a hill across neighbouring buckets.
+- The latency axis is logarithmic. A single 481ms spike used to squash the
+  everyday 10–35ms range into the bottom twentieth of the plot, which is
+  precisely where the jitter you are looking for lives.
+- Packet loss is drawn along the baseline at a height that follows how much was
+  lost, so a node that drops one probe every five minutes no longer looks as
+  serious as one that is genuinely down.
+- The lighthouse-side latency is collapsed by default behind a toggle. The
+  local view answers "can I reach it and how fast", which is the question you
+  ask first; the far side is a follow-up and used to cost a second full-height
+  chart per node.
+
+### Fixed
+
+- Warning and error colours in light mode sat at 2.2:1 against the panel
+  background, below any readable threshold. Every status colour now clears
+  4.2:1 in both light and dark mode.
+- Buttons drew white text on hover regardless of the hover fill, so a light
+  theme produced light-on-light text.
+- The segmented control kept the system blue and stayed visually detached from
+  the rest of the panel.
+- The 7-day progress bars on the Claude and Codex cards were misaligned by
+  10pt whenever one provider had no active 5-hour window.
+
 ## 0.1.20
 
 ### Changed
