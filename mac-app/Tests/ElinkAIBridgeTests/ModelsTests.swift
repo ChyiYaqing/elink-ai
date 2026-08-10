@@ -1183,6 +1183,40 @@ final class ModelsTests: XCTestCase {
         XCTAssertNil(UsageFetcher.claudeTokenFromShellOutput("no marker here"))
     }
 
+    func testClaudeCredentialTreatsExpiredTokenAsUnusable() {
+        let now = Date()
+        func credentials(expiresAt: Double?) -> Data {
+            var oauth: [String: Any] = ["accessToken": "sk-ant-oat01-abc123"]
+            if let expiresAt { oauth["expiresAt"] = expiresAt }
+            return try! JSONSerialization.data(withJSONObject: ["claudeAiOauth": oauth])
+        }
+
+        let fresh = UsageFetcher.claudeCredential(
+            credentials(expiresAt: (now.timeIntervalSince1970 + 3600) * 1000))
+        XCTAssertEqual(fresh?.token, "sk-ant-oat01-abc123")
+        XCTAssertEqual(fresh?.isValid(at: now), true)
+
+        let expired = UsageFetcher.claudeCredential(
+            credentials(expiresAt: (now.timeIntervalSince1970 - 60) * 1000))
+        XCTAssertEqual(expired?.isValid(at: now), false)
+
+        // 30 秒后过期：仍在 60 秒余量内，视为不可用。
+        let expiringSoon = UsageFetcher.claudeCredential(
+            credentials(expiresAt: (now.timeIntervalSince1970 + 30) * 1000))
+        XCTAssertEqual(expiringSoon?.isValid(at: now), false)
+
+        // 旧格式没有 expiresAt，不能因此丢弃。
+        let undated = UsageFetcher.claudeCredential(credentials(expiresAt: nil))
+        XCTAssertEqual(undated?.token, "sk-ant-oat01-abc123")
+        XCTAssertEqual(undated?.isValid(at: now), true)
+
+        // 解析失败与过期必须可区分，面板文案依赖它给出不同的处置建议。
+        XCTAssertNil(UsageFetcher.claudeCredential(Data("not json".utf8)))
+        let empty = try! JSONSerialization.data(
+            withJSONObject: ["claudeAiOauth": ["accessToken": ""]])
+        XCTAssertNil(UsageFetcher.claudeCredential(empty))
+    }
+
     func testUsageLevelThresholdsFollowRemainingPercent() {
         XCTAssertEqual(UsageLevel.level(usedPercent: 10), .healthy)
         XCTAssertEqual(UsageLevel.level(usedPercent: 50), .healthy)
