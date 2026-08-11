@@ -305,7 +305,7 @@ final class UsageFetcher {
         return codexWindows(converted)
     }
 
-    private enum CredentialError: LocalizedError {
+    enum CredentialError: LocalizedError, Equatable {
         case claudeKeychainUnavailable
         case claudeKeychain(Int32)
         case invalidClaudeCredentials
@@ -338,37 +338,68 @@ final class UsageFetcher {
     }
 
     private static func claudeToken() -> Result<String, CredentialError> {
-        if let token = ProcessInfo.processInfo.environment["CLAUDE_CODE_OAUTH_TOKEN"],
-           !token.isEmpty {
-            return .success(token)
-        }
+        let environmentToken = ProcessInfo.processInfo.environment["CLAUDE_CODE_OAUTH_TOKEN"]
         // ~/.claude/.credentials.json 可能是过期的遗留文件，而 Claude Code 在
         // macOS 上刷新的是 Keychain 条目。只有文件里的 token 仍然有效时才用它，
         // 否则继续回落到 Keychain，否则用量接口会一直 401 直到被限流。
         let file = ("~/.claude/.credentials.json" as NSString).expandingTildeInPath
-        if let credential = FileManager.default.contents(atPath: file)
-            .flatMap(Self.claudeCredential), credential.isValid() {
-            return .success(credential.token)
+        return claudeToken(
+            environmentToken: environmentToken,
+            fileData: FileManager.default.contents(atPath: file),
+            keychainData: claudeKeychainData,
+            shellToken: loginShellClaudeToken
+        )
+    }
+
+    static func claudeToken(
+        environmentToken: String?,
+        fileData: Data?,
+        keychainData: () -> Result<Data, CredentialError>,
+        shellToken: () -> String?
+    ) -> Result<String, CredentialError> {
+        if let environmentToken, !environmentToken.isEmpty {
+            return .success(environmentToken)
         }
+
+        var sawExpiredCredential = false
+        func usableToken(from data: Data?) -> String? {
+            guard let data, let credential = claudeCredential(data) else { return nil }
+            guard credential.isValid() else {
+                sawExpiredCredential = true
+                return nil
+            }
+            return credential.token
+        }
+
+        if let token = usableToken(from: fileData) { return .success(token) }
+
+        switch keychainData() {
+        case let .success(data):
+            if let token = usableToken(from: data) { return .success(token) }
+        case let .failure(error):
+            if let token = shellToken() { return .success(token) }
+            return .failure(sawExpiredCredential ? .expiredClaudeCredentials : error)
+        }
+
+        // 已知过期的 token 不值得再发一次请求：401 之后的重试会被限流，而 429
+        // 的退避最长能拖到一小时，面板只能一直显示 statusline 缓存。
+        if let token = shellToken() { return .success(token) }
+        return .failure(sawExpiredCredential ? .expiredClaudeCredentials : .invalidClaudeCredentials)
+    }
+
+    private static func claudeKeychainData() -> Result<Data, CredentialError> {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
         process.arguments = ["find-generic-password", "-s", "Claude Code-credentials", "-w"]
         let output = Pipe(); process.standardOutput = output; process.standardError = Pipe()
         guard (try? process.run()) != nil else {
-            if let token = loginShellClaudeToken() { return .success(token) }
             return .failure(.claudeKeychainUnavailable)
         }
         process.waitUntilExit()
         guard process.terminationStatus == 0 else {
-            if let token = loginShellClaudeToken() { return .success(token) }
             return .failure(.claudeKeychain(process.terminationStatus))
         }
-        let credential = Self.claudeCredential(output.fileHandleForReading.readDataToEndOfFile())
-        if let credential, credential.isValid() { return .success(credential.token) }
-        // 已知过期的 token 不值得再发一次请求：401 之后的重试会被限流，而 429
-        // 的退避最长能拖到一小时，面板只能一直显示 statusline 缓存。
-        if let token = loginShellClaudeToken() { return .success(token) }
-        return .failure(credential == nil ? .invalidClaudeCredentials : .expiredClaudeCredentials)
+        return .success(output.fileHandleForReading.readDataToEndOfFile())
     }
 
     struct ClaudeCredential {
@@ -388,8 +419,12 @@ final class UsageFetcher {
               let oauth = json["claudeAiOauth"] as? [String: Any],
               let token = oauth["accessToken"] as? String,
               !token.isEmpty else { return nil }
-        let expiresAt = (oauth["expiresAt"] as? NSNumber).map {
-            Date(timeIntervalSince1970: $0.doubleValue / 1000)
+        let expiresAt: Date?
+        if let rawExpiresAt = oauth["expiresAt"] {
+            guard let milliseconds = rawExpiresAt as? NSNumber else { return nil }
+            expiresAt = Date(timeIntervalSince1970: milliseconds.doubleValue / 1000)
+        } else {
+            expiresAt = nil
         }
         return ClaudeCredential(token: token, expiresAt: expiresAt)
     }

@@ -1215,6 +1215,61 @@ final class ModelsTests: XCTestCase {
         let empty = try! JSONSerialization.data(
             withJSONObject: ["claudeAiOauth": ["accessToken": ""]])
         XCTAssertNil(UsageFetcher.claudeCredential(empty))
+
+        let malformedExpiry = try! JSONSerialization.data(withJSONObject: [
+            "claudeAiOauth": [
+                "accessToken": "sk-ant-oat01-abc123",
+                "expiresAt": "not-a-timestamp",
+            ],
+        ])
+        XCTAssertNil(UsageFetcher.claudeCredential(malformedExpiry))
+    }
+
+    func testClaudeTokenFallsThroughExpiredFileAndPreservesExpiryError() throws {
+        let now = Date()
+        func credentials(token: String, expiresAt: Date) -> Data {
+            try! JSONSerialization.data(withJSONObject: [
+                "claudeAiOauth": [
+                    "accessToken": token,
+                    "expiresAt": expiresAt.timeIntervalSince1970 * 1000,
+                ],
+            ])
+        }
+
+        let expiredFile = credentials(
+            token: "expired-file-token", expiresAt: now.addingTimeInterval(-60))
+        let validKeychain = credentials(
+            token: "valid-keychain-token", expiresAt: now.addingTimeInterval(3600))
+        var keychainReads = 0
+
+        let selected = UsageFetcher.claudeToken(
+            environmentToken: nil,
+            fileData: expiredFile,
+            keychainData: {
+                keychainReads += 1
+                return .success(validKeychain)
+            },
+            shellToken: { nil }
+        )
+
+        XCTAssertEqual(try selected.get(), "valid-keychain-token")
+        XCTAssertEqual(keychainReads, 1)
+
+        let shellFallback = UsageFetcher.claudeToken(
+            environmentToken: nil,
+            fileData: expiredFile,
+            keychainData: { .failure(.claudeKeychain(44)) },
+            shellToken: { "valid-shell-token" }
+        )
+        XCTAssertEqual(try shellFallback.get(), "valid-shell-token")
+
+        let exhausted = UsageFetcher.claudeToken(
+            environmentToken: nil,
+            fileData: expiredFile,
+            keychainData: { .failure(.claudeKeychain(44)) },
+            shellToken: { nil }
+        )
+        XCTAssertEqual(exhausted, .failure(.expiredClaudeCredentials))
     }
 
     func testUsageLevelThresholdsFollowRemainingPercent() {
