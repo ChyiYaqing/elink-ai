@@ -210,6 +210,50 @@ final class UsagePanelViewTests: XCTestCase {
     }
 
     @MainActor
+    func testClaudeCredentialSettingsUseSecureInputAndFitPanel() throws {
+        let cases: [(ClaudeCredentialState, String)] = [
+            (.automatic, "粘贴长期 token"),
+            (.configured, "粘贴新 token 以替换"),
+            (.invalid, "粘贴新 token 以修复"),
+        ]
+        for (state, placeholder) in cases {
+            let path = NSTemporaryDirectory() + "elink-panel-\(UUID().uuidString).db"
+            defer { try? FileManager.default.removeItem(atPath: path) }
+            let store = UsageStore(path: path)
+            let cluster = ClusterManager(store: store, credentials: ClusterCredentials(
+                nodeID: "local-node",
+                nodeName: "Local Mac",
+                clusterID: nil,
+                clusterSecret: nil,
+                timezone: nil
+            ))
+            let model = PanelModel()
+            model.showSettings = true
+            model.claudeCredentialState = state
+            let host = NSHostingView(rootView: UsagePanelView(
+                model: model,
+                updater: UpdateChecker(currentVersion: "0.1.21-rc3"),
+                cluster: cluster,
+                mesh: MeshMonitor(store: store, lighthouseURL: nil)
+            ))
+            host.frame = NSRect(x: 0, y: 0, width: 440, height: 900)
+            host.layoutSubtreeIfNeeded()
+
+            let field = try XCTUnwrap(host.descendants.compactMap { $0 as? NSSecureTextField }.first)
+            let frame = host.convert(field.bounds, from: field)
+            XCTAssertGreaterThanOrEqual(frame.minX, host.bounds.minX)
+            XCTAssertLessThanOrEqual(frame.maxX, host.bounds.maxX)
+            XCTAssertEqual(
+                field.placeholderString,
+                placeholder
+            )
+            if state == .invalid {
+                XCTAssertTrue(model.canRemoveClaudeCredential)
+            }
+        }
+    }
+
+    @MainActor
     private func deviceSettingsPlaceholders(enabled: Bool, expanded: Bool) -> [String] {
         let path = NSTemporaryDirectory() + "elink-panel-\(UUID().uuidString).db"
         defer { try? FileManager.default.removeItem(atPath: path) }

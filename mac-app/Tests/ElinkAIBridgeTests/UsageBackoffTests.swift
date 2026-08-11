@@ -64,4 +64,43 @@ final class UsageBackoffTests: XCTestCase {
         XCTAssertGreaterThan(backoff, observedRetryAfter)
         XCTAssertGreaterThan(backoff, oldEffectiveInterval)
     }
+
+    func testForcedRefreshDuringFetchRunsAgainBeforeCompleting() {
+        let firstRequestStarted = expectation(description: "first request started")
+        let firstCompletion = expectation(description: "first completion")
+        let forcedCompletion = expectation(description: "forced completion")
+        let releaseFirstRequest = DispatchSemaphore(value: 0)
+        let counterLock = NSLock()
+        var claudeRequests = 0
+
+        let validUsage = Data(#"{"five_hour":{"utilization":11,"resets_at":"2099-01-01T00:00:00Z"},"seven_day":{"utilization":22,"resets_at":"2099-01-02T00:00:00Z"}}"#.utf8)
+        let fetcher = UsageFetcher(
+            claudeTokenProvider: { .success("test-claude-token") },
+            requestHandler: { request in
+                guard request.url?.host == "api.anthropic.com" else {
+                    return UsageFetcher.HTTPOutcome(data: Data("{}".utf8), status: 401, retryAfter: nil)
+                }
+                let requestNumber = counterLock.holding { () -> Int in
+                    claudeRequests += 1
+                    return claudeRequests
+                }
+                if requestNumber == 1 {
+                    firstRequestStarted.fulfill()
+                    _ = releaseFirstRequest.wait(timeout: .now() + 3)
+                    return UsageFetcher.HTTPOutcome(data: Data(), status: 401, retryAfter: nil)
+                }
+                return UsageFetcher.HTTPOutcome(data: validUsage, status: 200, retryAfter: nil)
+            }
+        )
+
+        fetcher.refresh { firstCompletion.fulfill() }
+        wait(for: [firstRequestStarted], timeout: 2)
+        fetcher.refresh(force: true) { forcedCompletion.fulfill() }
+        releaseFirstRequest.signal()
+        wait(for: [firstCompletion, forcedCompletion], timeout: 5)
+
+        XCTAssertEqual(counterLock.holding { claudeRequests }, 2)
+        XCTAssertEqual(fetcher.claude.primary.percent, 11)
+        XCTAssertEqual(fetcher.claude.weekly.percent, 22)
+    }
 }

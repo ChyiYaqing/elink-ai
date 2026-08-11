@@ -6,6 +6,7 @@ final class UsageFetcher {
     private var storedClaude = ProviderUsage()
     private var storedCodex = ProviderUsage()
     private var fetching = false
+    private var pendingForcedRefresh = false
     private var nextAllowed = Date.distantPast
     private var lastLogSummary = ""
     private var timer: Timer?
@@ -13,13 +14,19 @@ final class UsageFetcher {
     /// 本轮 fetch 中服务端要求的最长等待。只在 refresh 的串行 async 块里写，
     /// 在同一块末尾读出并清空，因此不需要额外加锁。
     private var pendingRetryAfter: TimeInterval?
+    private let claudeTokenProvider: () -> Result<String, CredentialError>
+    private let requestHandler: (URLRequest) -> HTTPOutcome?
     var onUpdate: (() -> Void)?
 
     var claude: ProviderUsage { lock.holding { Self.discardingExpiredWindows(storedClaude) } }
     var codex: ProviderUsage { lock.holding { Self.discardingExpiredWindows(storedCodex) } }
 
-    init(cacheStore: UsageStore? = nil) {
+    init(cacheStore: UsageStore? = nil,
+         claudeTokenProvider: (() -> Result<String, CredentialError>)? = nil,
+         requestHandler: ((URLRequest) -> HTTPOutcome?)? = nil) {
         self.cacheStore = cacheStore
+        self.claudeTokenProvider = claudeTokenProvider ?? Self.claudeToken
+        self.requestHandler = requestHandler ?? Self.request
         storedClaude = cacheStore?.cachedUsage(provider: "claude") ?? ProviderUsage()
         storedCodex = cacheStore?.cachedUsage(provider: "codex") ?? ProviderUsage()
     }
@@ -34,6 +41,7 @@ final class UsageFetcher {
         let shouldStart = lock.holding { () -> Bool in
             if fetching {
                 if let completion { refreshCompletions.append(completion) }
+                if force { pendingForcedRefresh = true }
                 return false
             }
             guard force || Date() >= nextAllowed else {
@@ -48,6 +56,13 @@ final class UsageFetcher {
             DispatchQueue.main.async { completion?() }
         }
         guard shouldStart else { return }
+        performRefresh()
+    }
+
+    /// `force` 在请求进行中到达时不能只挂一个 completion：那一轮已经捕获了旧
+    /// 凭据。保持 fetching=true 串行补跑一轮，直到最后一次强制刷新之后再完成
+    /// 所有等待者，避免旧 token 的 401/429 冒充新 token 的结果。
+    private func performRefresh() {
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
             let claude = self.fetchClaude()
@@ -58,10 +73,9 @@ final class UsageFetcher {
             if codex.error == nil || codex.primary.percent != nil || codex.weekly.percent != nil {
                 self.cacheStore?.cacheUsage(provider: "codex", usage: codex)
             }
-            let completions = self.lock.holding { () -> [() -> Void] in
+            let result = self.lock.holding { () -> (completions: [() -> Void], refreshAgain: Bool) in
                 self.storedClaude = Self.keepLastGood(old: self.storedClaude, new: claude)
                 self.storedCodex = Self.keepLastGood(old: self.storedCodex, new: codex)
-                self.fetching = false
                 let rateLimited = claude.error?.contains("429") == true || codex.error?.contains("429") == true
                 self.nextAllowed = Date().addingTimeInterval(
                     Self.backoffInterval(retryAfter: self.pendingRetryAfter, rateLimited: rateLimited))
@@ -75,13 +89,22 @@ final class UsageFetcher {
                         Log.info(summary, category: "usage")
                     }
                 }
+                if self.pendingForcedRefresh {
+                    self.pendingForcedRefresh = false
+                    return ([], true)
+                }
+                self.fetching = false
                 let values = self.refreshCompletions
                 self.refreshCompletions.removeAll()
-                return values
+                return (values, false)
             }
             DispatchQueue.main.async {
                 self.onUpdate?()
-                completions.forEach { $0() }
+                if result.refreshAgain {
+                    self.performRefresh()
+                } else {
+                    result.completions.forEach { $0() }
+                }
             }
         }
     }
@@ -146,7 +169,7 @@ final class UsageFetcher {
 
     private func fetchClaude() -> ProviderUsage {
         let token: String
-        switch Self.claudeToken() {
+        switch claudeTokenProvider() {
         case let .success(value):
             token = value
         case let .failure(error):
@@ -162,7 +185,7 @@ final class UsageFetcher {
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
-        guard let outcome = Self.request(request) else {
+        guard let outcome = requestHandler(request) else {
             return Self.claudeFallback(error: tr("Claude 用量请求失败", "Claude usage request failed"))
         }
         guard outcome.status == 200 else {
@@ -176,6 +199,74 @@ final class UsageFetcher {
         let primary = Self.isoWindow(json["five_hour"])
         let weekly = Self.isoWindow(json["seven_day"])
         return ProviderUsage(primary: primary, weekly: weekly, fetchedAt: Date())
+    }
+
+    enum ClaudeTokenValidationError: LocalizedError, Equatable {
+        case rejected
+        case temporarilyLimited
+        case requestFailed
+        case invalidResponse
+        case http(Int)
+
+        var errorDescription: String? {
+            switch self {
+            case .rejected:
+                return tr("Claude 拒绝了这个 token，请重新运行 claude setup-token",
+                          "Claude rejected this token; run claude setup-token again")
+            case .temporarilyLimited:
+                return tr("Claude 用量接口暂时受限，请稍后重试",
+                          "Claude usage is temporarily limited; try again later")
+            case .requestFailed:
+                return tr("无法连接 Claude 验证 token", "Could not reach Claude to validate the token")
+            case .invalidResponse:
+                return tr("Claude 验证响应格式无效", "Claude returned an invalid validation response")
+            case let .http(status):
+                return tr("Claude token 验证 HTTP \(status)", "Claude token validation HTTP \(status)")
+            }
+        }
+    }
+
+    /// 保存前先用候选 token 请求一次用量。只有服务端明确返回成功才允许覆盖
+    /// Keychain 里的旧值；网络错误、限流和 401/403 都保留旧凭据。
+    static func validateClaudeToken(_ token: String) -> Result<ProviderUsage, ClaudeTokenValidationError> {
+        var request = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
+        request.timeoutInterval = 20
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        return claudeTokenValidation(outcome: Self.request(request))
+    }
+
+    static func claudeTokenValidation(
+        outcome: HTTPOutcome?, now: Date = Date()
+    ) -> Result<ProviderUsage, ClaudeTokenValidationError> {
+        guard let outcome else { return .failure(.requestFailed) }
+        if outcome.status == 401 || outcome.status == 403 { return .failure(.rejected) }
+        if outcome.status == 429 { return .failure(.temporarilyLimited) }
+        guard outcome.status == 200 else { return .failure(.http(outcome.status)) }
+        guard let json = try? JSONSerialization.jsonObject(with: outcome.data) as? [String: Any] else {
+            return .failure(.invalidResponse)
+        }
+        return .success(ProviderUsage(
+            primary: isoWindow(json["five_hour"]),
+            weekly: isoWindow(json["seven_day"]),
+            fetchedAt: now
+        ))
+    }
+
+    func acceptValidatedClaudeUsage(_ usage: ProviderUsage) {
+        cacheStore?.cacheUsage(provider: "claude", usage: usage)
+        lock.holding {
+            storedClaude = usage
+            // 验证请求与周期刷新可能并发。旧凭据请求若仍在飞行，必须在它落地后
+            // 再补一轮新凭据请求，否则旧 401/429 会覆盖刚验证成功的状态。
+            if fetching { pendingForcedRefresh = true }
+        }
+        if Thread.isMainThread {
+            onUpdate?()
+        } else {
+            DispatchQueue.main.async { [weak self] in self?.onUpdate?() }
+        }
     }
 
     private static func claudeFallback(error: String) -> ProviderUsage {
@@ -241,7 +332,7 @@ final class UsageFetcher {
         request.setValue("Bearer \(credentials.token)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         if let account = credentials.account { request.setValue(account, forHTTPHeaderField: "ChatGPT-Account-Id") }
-        guard let outcome = Self.request(request) else {
+        guard let outcome = requestHandler(request) else {
             return ProviderUsage(error: tr("Codex 用量请求失败", "Codex usage request failed"))
         }
         let data = outcome.data
@@ -305,15 +396,20 @@ final class UsageFetcher {
         return codexWindows(converted)
     }
 
-    private enum CredentialError: LocalizedError {
+    enum CredentialError: LocalizedError, Equatable {
+        case elinkClaudeCredential(String)
         case claudeKeychainUnavailable
         case claudeKeychain(Int32)
         case invalidClaudeCredentials
+        case expiredClaudeCredentials
         case missingCodexFile
         case invalidCodexCredentials
 
         var errorDescription: String? {
             switch self {
+            case let .elinkClaudeCredential(message):
+                return tr("Elink Claude 凭据不可用：\(message)",
+                          "Elink Claude credential unavailable: \(message)")
             case .claudeKeychainUnavailable:
                 return tr("无法调用 macOS Keychain 读取 Claude 凭据",
                           "Cannot access macOS Keychain to read Claude credentials")
@@ -323,6 +419,9 @@ final class UsageFetcher {
             case .invalidClaudeCredentials:
                 return tr("Claude 凭据格式无效，请运行 claude 重新登录",
                           "Invalid Claude credentials — run claude to sign in again")
+            case .expiredClaudeCredentials:
+                return tr("Claude 凭据已过期，请运行 claude 重新登录",
+                          "Claude credentials expired — run claude to sign in again")
             case .missingCodexFile:
                 return tr("未找到 ~/.codex/auth.json，请运行 codex 重新登录",
                           "~/.codex/auth.json not found — run codex to sign in again")
@@ -334,34 +433,106 @@ final class UsageFetcher {
     }
 
     private static func claudeToken() -> Result<String, CredentialError> {
-        if let token = ProcessInfo.processInfo.environment["CLAUDE_CODE_OAUTH_TOKEN"],
-           !token.isEmpty {
-            return .success(token)
+        let elinkToken: String?
+        do {
+            elinkToken = try ElinkClaudeTokenStore.shared.token()
+        } catch {
+            return .failure(.elinkClaudeCredential(error.localizedDescription))
         }
+        let environmentToken = ProcessInfo.processInfo.environment["CLAUDE_CODE_OAUTH_TOKEN"]
+        // ~/.claude/.credentials.json 可能是过期的遗留文件，而 Claude Code 在
+        // macOS 上刷新的是 Keychain 条目。只有文件里的 token 仍然有效时才用它，
+        // 否则继续回落到 Keychain，否则用量接口会一直 401 直到被限流。
         let file = ("~/.claude/.credentials.json" as NSString).expandingTildeInPath
-        var data = FileManager.default.contents(atPath: file)
-        if data == nil {
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-            process.arguments = ["find-generic-password", "-s", "Claude Code-credentials", "-w"]
-            let output = Pipe(); process.standardOutput = output; process.standardError = Pipe()
-            guard (try? process.run()) != nil else {
-                if let token = loginShellClaudeToken() { return .success(token) }
-                return .failure(.claudeKeychainUnavailable)
-            }
-            process.waitUntilExit()
-            guard process.terminationStatus == 0 else {
-                if let token = loginShellClaudeToken() { return .success(token) }
-                return .failure(.claudeKeychain(process.terminationStatus))
-            }
-            data = output.fileHandleForReading.readDataToEndOfFile()
+        return claudeToken(
+            elinkToken: elinkToken,
+            environmentToken: environmentToken,
+            fileData: FileManager.default.contents(atPath: file),
+            keychainData: claudeKeychainData,
+            shellToken: loginShellClaudeToken
+        )
+    }
+
+    static func claudeToken(
+        elinkToken: String? = nil,
+        environmentToken: String?,
+        fileData: Data?,
+        keychainData: () -> Result<Data, CredentialError>,
+        shellToken: () -> String?
+    ) -> Result<String, CredentialError> {
+        if let elinkToken, !elinkToken.isEmpty {
+            return .success(elinkToken)
         }
-        guard let data,
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        if let environmentToken, !environmentToken.isEmpty {
+            return .success(environmentToken)
+        }
+
+        var sawExpiredCredential = false
+        func usableToken(from data: Data?) -> String? {
+            guard let data, let credential = claudeCredential(data) else { return nil }
+            guard credential.isValid() else {
+                sawExpiredCredential = true
+                return nil
+            }
+            return credential.token
+        }
+
+        if let token = usableToken(from: fileData) { return .success(token) }
+
+        switch keychainData() {
+        case let .success(data):
+            if let token = usableToken(from: data) { return .success(token) }
+        case let .failure(error):
+            if let token = shellToken() { return .success(token) }
+            return .failure(sawExpiredCredential ? .expiredClaudeCredentials : error)
+        }
+
+        // 已知过期的 token 不值得再发一次请求：401 之后的重试会被限流，而 429
+        // 的退避最长能拖到一小时，面板只能一直显示 statusline 缓存。
+        if let token = shellToken() { return .success(token) }
+        return .failure(sawExpiredCredential ? .expiredClaudeCredentials : .invalidClaudeCredentials)
+    }
+
+    private static func claudeKeychainData() -> Result<Data, CredentialError> {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        process.arguments = ["find-generic-password", "-s", "Claude Code-credentials", "-w"]
+        let output = Pipe(); process.standardOutput = output; process.standardError = Pipe()
+        guard (try? process.run()) != nil else {
+            return .failure(.claudeKeychainUnavailable)
+        }
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            return .failure(.claudeKeychain(process.terminationStatus))
+        }
+        return .success(output.fileHandleForReading.readDataToEndOfFile())
+    }
+
+    struct ClaudeCredential {
+        let token: String
+        let expiresAt: Date?
+
+        /// 缺少 `expiresAt` 时视为有效——旧格式没有该字段，不能因此丢弃唯一的
+        /// 凭据。预留 60 秒余量，避免卡在过期边界上白费一轮请求。
+        func isValid(at now: Date = Date()) -> Bool {
+            guard let expiresAt else { return true }
+            return expiresAt.timeIntervalSince(now) > 60
+        }
+    }
+
+    static func claudeCredential(_ data: Data) -> ClaudeCredential? {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let oauth = json["claudeAiOauth"] as? [String: Any],
               let token = oauth["accessToken"] as? String,
-              !token.isEmpty else { return .failure(.invalidClaudeCredentials) }
-        return .success(token)
+              !token.isEmpty else { return nil }
+        let expiresAt: Date?
+        if let rawExpiresAt = oauth["expiresAt"] {
+            guard let milliseconds = rawExpiresAt as? NSNumber else { return nil }
+            expiresAt = Date(timeIntervalSince1970: milliseconds.doubleValue / 1000)
+        } else {
+            expiresAt = nil
+        }
+        return ClaudeCredential(token: token, expiresAt: expiresAt)
     }
 
     // The menu-bar app launched via LaunchAgent does not inherit shell

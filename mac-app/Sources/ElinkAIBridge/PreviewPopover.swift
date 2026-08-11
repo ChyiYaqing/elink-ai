@@ -142,6 +142,67 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
                 self.model.agentSessions = []
             }
         }
+        model.onSaveClaudeToken = { [weak self] value, completion in
+            guard let self else { completion(false); return }
+            guard let token = ElinkClaudeTokenStore.normalizedToken(value) else {
+                self.model.settingsMessage = tr("Claude token 格式无效",
+                                                "Invalid Claude token")
+                completion(false)
+                return
+            }
+            self.model.claudeCredentialValidating = true
+            self.model.settingsMessage = tr("正在向 Claude 验证 token…",
+                                            "Validating token with Claude…")
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                let validation = UsageFetcher.validateClaudeToken(token)
+                DispatchQueue.main.async {
+                    guard let self else { completion(false); return }
+                    self.model.claudeCredentialValidating = false
+                    switch validation {
+                    case let .success(usage):
+                        do {
+                            try ElinkClaudeTokenStore.shared.save(token)
+                            self.model.claudeCredentialState = .configured
+                            self.model.settingsMessage = tr("Claude 长期 token 已验证并保存到 Elink Keychain",
+                                                            "Claude long-lived token validated and saved to the Elink Keychain")
+                            Log.user("save validated Elink Claude credential")
+                            self.usage.acceptValidatedClaudeUsage(usage)
+                            self.reload()
+                            completion(true)
+                        } catch {
+                            self.model.settingsMessage = tr("保存 Claude token 失败：\(error.localizedDescription)",
+                                                            "Could not save Claude token: \(error.localizedDescription)")
+                            Log.warning("save Elink Claude credential failed: \(error.localizedDescription)",
+                                        category: "user")
+                            completion(false)
+                        }
+                    case let .failure(error):
+                        self.model.settingsMessage = error.localizedDescription
+                        Log.warning("validate Elink Claude credential failed: \(error.localizedDescription)",
+                                    category: "user")
+                        completion(false)
+                    }
+                }
+            }
+        }
+        model.onRemoveClaudeToken = { [weak self] in
+            guard let self else { return false }
+            do {
+                try ElinkClaudeTokenStore.shared.remove()
+                self.model.claudeCredentialState = .automatic
+                self.model.settingsMessage = tr("已移除 Elink token，恢复自动发现 Claude 凭据",
+                                                "Elink token removed; using automatic Claude credential discovery")
+                Log.user("remove Elink Claude credential")
+                self.refreshAfterClaudeCredentialChange()
+                return true
+            } catch {
+                self.model.settingsMessage = tr("移除 Claude token 失败：\(error.localizedDescription)",
+                                                "Could not remove Claude token: \(error.localizedDescription)")
+                Log.warning("remove Elink Claude credential failed: \(error.localizedDescription)",
+                            category: "user")
+                return false
+            }
+        }
         model.onOpenDeviceStatus = { [weak self] in
             guard let base = DeviceClient.baseURL else {
                 Log.warning("open device status failed: device address is not configured", category: "user")
@@ -181,6 +242,15 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
         model.settingsMessage = nil
         model.launchAtLogin = LaunchAtLogin.isEnabled()
         model.agentSessionsEnabled = AgentSessionMonitor.isEnabled
+        do {
+            model.claudeCredentialState = try ElinkClaudeTokenStore.shared.token() == nil
+                ? .automatic : .configured
+        } catch {
+            model.claudeCredentialState = error as? ElinkClaudeTokenStoreError == .invalidToken
+                ? .invalid : .unavailable
+            model.settingsMessage = tr("读取 Elink Claude token 失败：\(error.localizedDescription)",
+                                       "Could not read Elink's Claude token: \(error.localizedDescription)")
+        }
         let visibleHeight = button.window?.screen?.visibleFrame.height
             ?? NSScreen.main?.visibleFrame.height
             ?? 724
@@ -226,6 +296,15 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
         guard model.deviceConnectionEnabled else { return }
         reloadInfo()
         reloadPreview()
+    }
+
+    private func refreshAfterClaudeCredentialChange() {
+        model.refreshingUsage = true
+        usage.refresh(force: true) { [weak self] in
+            guard let self else { return }
+            self.model.refreshingUsage = false
+            self.reload()
+        }
     }
 
     private func reloadAgentSessions() {
