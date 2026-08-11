@@ -6,6 +6,15 @@ and `Removed`.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## 0.1.21-rc2
+
+### Fixed
+
+- The Claude usage card now skips expired or malformed file credentials and
+  falls through to the refreshed Keychain or login-shell token. If every
+  source is exhausted, it reports the confirmed expiry instead of hiding it
+  behind a Keychain error or repeatedly triggering API rate limits.
+
 ## 0.1.21-rc1
 
 ### Added
