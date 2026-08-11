@@ -1,5 +1,6 @@
 import XCTest
 import SQLite3
+import Security
 @testable import ElinkAIBridge
 
 final class ModelsTests: XCTestCase {
@@ -1270,6 +1271,99 @@ final class ModelsTests: XCTestCase {
             shellToken: { nil }
         )
         XCTAssertEqual(exhausted, .failure(.expiredClaudeCredentials))
+    }
+
+    func testClaudeTokenPrefersElinkKeychainCredential() throws {
+        var keychainReads = 0
+        var shellReads = 0
+        let selected = UsageFetcher.claudeToken(
+            elinkToken: "elink-long-lived-token",
+            environmentToken: "terminal-process-token",
+            fileData: Data("invalid".utf8),
+            keychainData: {
+                keychainReads += 1
+                return .failure(.claudeKeychain(44))
+            },
+            shellToken: {
+                shellReads += 1
+                return "login-shell-token"
+            }
+        )
+
+        XCTAssertEqual(try selected.get(), "elink-long-lived-token")
+        XCTAssertEqual(keychainReads, 0)
+        XCTAssertEqual(shellReads, 0)
+    }
+
+    func testElinkClaudeTokenNormalizationRejectsAccidentalInput() {
+        XCTAssertEqual(
+            ElinkClaudeTokenStore.normalizedToken("  sk-ant-oat01-long-lived-token  \n"),
+            "sk-ant-oat01-long-lived-token"
+        )
+        XCTAssertNil(ElinkClaudeTokenStore.normalizedToken("too-short"))
+        XCTAssertNil(ElinkClaudeTokenStore.normalizedToken("sk-ant-oat01-token with spaces"))
+        XCTAssertNil(ElinkClaudeTokenStore.normalizedToken(String(repeating: "a", count: 16 * 1024 + 1)))
+    }
+
+    func testElinkClaudeTokenStoreRoundTripsAndRemovesCredential() throws {
+        let store = ElinkClaudeTokenStore(
+            service: "ai.elink.tests.\(UUID().uuidString)",
+            account: "claude-token"
+        )
+        defer { try? store.remove() }
+
+        XCTAssertNil(try store.token())
+        try store.save("sk-ant-oat01-first-long-lived-token")
+        XCTAssertEqual(try store.token(), "sk-ant-oat01-first-long-lived-token")
+
+        try store.save("sk-ant-oat01-replacement-long-lived-token")
+        XCTAssertEqual(try store.token(), "sk-ant-oat01-replacement-long-lived-token")
+
+        try store.remove()
+        XCTAssertNil(try store.token())
+    }
+
+    func testElinkClaudeTokenStoreCanReplaceCorruptedItem() throws {
+        let service = "ai.elink.tests.\(UUID().uuidString)"
+        let account = "claude-token"
+        let store = ElinkClaudeTokenStore(service: service, account: account)
+        defer { try? store.remove() }
+        let corrupted: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecValueData as String: Data("broken".utf8),
+        ]
+        XCTAssertEqual(SecItemAdd(corrupted as CFDictionary, nil), errSecSuccess)
+        XCTAssertThrowsError(try store.token())
+
+        try store.save("sk-ant-oat01-recovered-long-lived-token")
+        XCTAssertEqual(try store.token(), "sk-ant-oat01-recovered-long-lived-token")
+    }
+
+    func testClaudeTokenValidationRequiresAuthenticatedUsageResponse() throws {
+        let data = Data(#"{"five_hour":{"utilization":17,"resets_at":"2099-01-01T00:00:00Z"},"seven_day":{"utilization":29,"resets_at":"2099-01-02T00:00:00Z"}}"#.utf8)
+        let validated = UsageFetcher.claudeTokenValidation(
+            outcome: UsageFetcher.HTTPOutcome(data: data, status: 200, retryAfter: nil),
+            now: Date(timeIntervalSince1970: 1_800_000_000)
+        )
+        let usage = try validated.get()
+        XCTAssertEqual(usage.primary.percent, 17)
+        XCTAssertEqual(usage.weekly.percent, 29)
+
+        XCTAssertEqual(
+            UsageFetcher.claudeTokenValidation(
+                outcome: UsageFetcher.HTTPOutcome(data: Data(), status: 401, retryAfter: nil)
+            ),
+            .failure(.rejected)
+        )
+        XCTAssertEqual(
+            UsageFetcher.claudeTokenValidation(
+                outcome: UsageFetcher.HTTPOutcome(data: Data(), status: 429, retryAfter: 60)
+            ),
+            .failure(.temporarilyLimited)
+        )
+        XCTAssertEqual(UsageFetcher.claudeTokenValidation(outcome: nil), .failure(.requestFailed))
     }
 
     func testUsageLevelThresholdsFollowRemainingPercent() {

@@ -121,6 +121,21 @@ Verify the bridge with:
 curl -s http://localhost:8765/v1/status | python3 -m json.tool
 ```
 
+### Keep Claude usage authentication independent of terminals
+
+Claude Code credentials stored in its own Keychain can rotate or expire, and a
+`CLAUDE_CODE_OAUTH_TOKEN` inherited by one terminal is not visible to the
+menu-bar app. For stable background usage updates, run:
+
+```bash
+claude setup-token
+```
+
+Then open Elink Settings → Claude Authentication and paste the generated
+long-lived token. Elink stores it only in the macOS login Keychain;
+it is never written to settings or logs. Removing it from Elink restores
+automatic Claude credential discovery and does not sign Claude Code out.
+
 ### Sync usage across hosts
 
 Open Settings → Multi-Host Sync on the first host and create a sync cluster.

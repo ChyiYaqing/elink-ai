@@ -1,6 +1,13 @@
 import AppKit
 import SwiftUI
 
+enum ClaudeCredentialState {
+    case automatic
+    case configured
+    case invalid
+    case unavailable
+}
+
 final class PanelModel: ObservableObject {
     @Published var claude = AgentStatus()
     @Published var codex = AgentStatus()
@@ -27,6 +34,8 @@ final class PanelModel: ObservableObject {
     @Published var settingsMessage: String?
     @Published var agentSessions: [AgentSession] = []
     @Published var agentSessionsEnabled = true
+    @Published var claudeCredentialState: ClaudeCredentialState = .automatic
+    @Published var claudeCredentialValidating = false
     @Published var language: AppLanguage = AppLanguage.current
     @Published var theme: AppTheme = AppTheme.current
     @Published var panelMaxHeight: CGFloat = 700
@@ -40,6 +49,12 @@ final class PanelModel: ObservableObject {
     var onPointHere: (() -> Void)?
     var onOpenDeviceStatus: (() -> Void)?
     var onSetAgentSessionsEnabled: ((Bool) -> Void)?
+    var onSaveClaudeToken: ((String, @escaping (Bool) -> Void) -> Void)?
+    var onRemoveClaudeToken: (() -> Bool)?
+
+    var canRemoveClaudeCredential: Bool {
+        claudeCredentialState == .configured || claudeCredentialState == .invalid
+    }
 }
 
 struct UsagePanelView: View {
@@ -57,6 +72,8 @@ struct UsagePanelView: View {
     @State private var pairingCodeCopied = false
     @State private var showClusterAdvanced = false
     @State private var showLeaveClusterConfirmation = false
+    @State private var claudeTokenInput = ""
+    @State private var showRemoveClaudeTokenConfirmation = false
     @State private var expandedNodeID: String?
 
     init(model: PanelModel, updater: UpdateChecker, cluster: ClusterManager,
@@ -281,6 +298,7 @@ struct UsagePanelView: View {
                     languageSettings(theme)
                     themeSettings(theme)
                     agentSessionsSettings(theme)
+                    claudeCredentialSettings(theme)
                     clusterSettings(theme)
                     logSettings(theme)
                     updateSettings(theme)
@@ -481,6 +499,128 @@ struct UsagePanelView: View {
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
         .glassCard(theme)
+    }
+
+    private func claudeCredentialSettings(_ theme: PanelTheme) -> some View {
+        let configured = model.claudeCredentialState == .configured
+        let invalid = model.claudeCredentialState == .invalid
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                settingsHeader(
+                    theme,
+                    icon: "key.fill",
+                    color: PanelTheme.claudeColor(dark: theme.dark),
+                    title: tr("Claude 认证", "Claude Authentication"),
+                    subtitle: claudeCredentialSubtitle
+                )
+                StateBadge(
+                    text: claudeCredentialBadge,
+                    color: model.claudeCredentialValidating ? theme.statusInfo
+                        : configured ? theme.statusHealthy
+                        : invalid || model.claudeCredentialState == .unavailable
+                            ? theme.statusWarning : theme.textTertiary
+                )
+            }
+
+            Text(tr("先运行 `claude setup-token`，再把生成的长期 token 粘贴到这里。Elink 不会将它写入配置或日志。",
+                    "Run `claude setup-token`, then paste the generated long-lived token here. Elink never writes it to settings or logs."))
+                .font(.system(size: 8, weight: .medium))
+                .foregroundStyle(theme.textTertiary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack(spacing: 8) {
+                SecureField(
+                    configured
+                        ? tr("粘贴新 token 以替换", "Paste a new token to replace")
+                        : invalid
+                            ? tr("粘贴新 token 以修复", "Paste a new token to repair")
+                            : tr("粘贴长期 token", "Paste long-lived token"),
+                    text: $claudeTokenInput
+                )
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 10, design: .monospaced))
+                .onSubmit { saveClaudeToken() }
+                .disabled(model.claudeCredentialValidating)
+                PillButton(
+                    title: model.claudeCredentialValidating
+                        ? tr("验证中", "Validating")
+                        : configured ? tr("替换", "Replace")
+                            : invalid ? tr("修复", "Repair") : tr("保存", "Save"),
+                    icon: model.claudeCredentialValidating ? "hourglass" : "checkmark.shield.fill",
+                    theme: theme
+                ) { saveClaudeToken() }
+                .disabled(model.claudeCredentialValidating
+                          || claudeTokenInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+
+            HStack(spacing: 8) {
+                WideButton(title: tr("复制生成命令", "Copy Setup Command"),
+                           icon: "doc.on.doc", theme: theme) {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString("claude setup-token", forType: .string)
+                    model.settingsMessage = tr("已复制：claude setup-token",
+                                               "Copied: claude setup-token")
+                }
+                if model.canRemoveClaudeCredential {
+                    DestructiveButton(title: invalid
+                                      ? tr("重置 Elink token", "Reset Elink Token")
+                                      : tr("移除 Elink token", "Remove Elink Token"),
+                                      icon: "trash", theme: theme,
+                                      hint: tr("删除 Elink 自己的 Keychain 条目并恢复自动凭据发现",
+                                               "Deletes Elink's Keychain item and restores automatic credential discovery")) {
+                        showRemoveClaudeTokenConfirmation = true
+                    }
+                    .disabled(model.claudeCredentialValidating)
+                }
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .glassCard(theme)
+        .alert(tr("移除 Elink 的 Claude token？", "Remove Elink's Claude token?"),
+               isPresented: $showRemoveClaudeTokenConfirmation) {
+            Button(tr("取消", "Cancel"), role: .cancel) {}
+            Button(tr("移除", "Remove"), role: .destructive) {
+                if model.onRemoveClaudeToken?() == true { claudeTokenInput = "" }
+            }
+        } message: {
+            Text(tr("只会删除 Elink 自己的 Keychain 条目；Claude Code 的登录不会改变。Elink 将恢复自动发现凭据。",
+                    "Only Elink's Keychain item is deleted. Claude Code stays signed in and Elink returns to automatic credential discovery."))
+        }
+    }
+
+    private var claudeCredentialSubtitle: String {
+        switch model.claudeCredentialState {
+        case .automatic:
+            return tr("独立于终端进程，避免短期凭据过期",
+                      "Independent of terminal processes and short-lived credentials")
+        case .configured:
+            return tr("长期 token 已安全存入本机 Keychain",
+                      "Long-lived token stored securely in this Mac's Keychain")
+        case .invalid:
+            return tr("Keychain 条目已损坏，请修复或重置",
+                      "The Keychain item is invalid; repair or reset it")
+        case .unavailable:
+            return tr("无法访问 Elink Keychain",
+                      "Elink's Keychain item is unavailable")
+        }
+    }
+
+    private var claudeCredentialBadge: String {
+        if model.claudeCredentialValidating { return tr("验证中", "Validating") }
+        switch model.claudeCredentialState {
+        case .automatic: return tr("自动", "Automatic")
+        case .configured: return tr("已配置", "Configured")
+        case .invalid: return tr("需重置", "Reset needed")
+        case .unavailable: return tr("不可用", "Unavailable")
+        }
+    }
+
+    private func saveClaudeToken() {
+        guard !model.claudeCredentialValidating else { return }
+        model.onSaveClaudeToken?(claudeTokenInput) { saved in
+            if saved { claudeTokenInput = "" }
+        }
     }
 
     private func clusterSettings(_ theme: PanelTheme) -> some View {
@@ -684,7 +824,9 @@ struct UsagePanelView: View {
                         DestructiveButton(
                             title: tr("离开同步集群", "Leave Sync Cluster"),
                             icon: "rectangle.portrait.and.arrow.right",
-                            theme: theme
+                            theme: theme,
+                            hint: tr("停止与其他主机同步，本机历史数据会保留",
+                                     "Stops syncing with other hosts; this host's history is kept")
                         ) { showLeaveClusterConfirmation = true }
                     } else {
                         WideButton(title: tr("创建同步集群", "Create Sync Cluster"), icon: "plus.circle", theme: theme) {
@@ -1737,6 +1879,7 @@ private struct DestructiveButton: View {
     let title: String
     let icon: String
     let theme: PanelTheme
+    let hint: String
     let action: () -> Void
     @State private var hovering = false
 
@@ -1761,8 +1904,8 @@ private struct DestructiveButton: View {
         .buttonStyle(.plain)
         .animation(.easeOut(duration: 0.15), value: hovering)
         .onHover { hovering = $0 }
-        .accessibilityHint(tr("停止与其他主机同步，本机历史数据会保留",
-                              "Stops syncing with other hosts; this host's history is kept"))
+        .accessibilityLabel(title)
+        .accessibilityHint(hint)
     }
 }
 
