@@ -11,6 +11,25 @@ zero. Each provider may also include `model_usage_today`, sorted by descending
 token count, as objects containing `model` and `tokens`. See
 `fixtures/status-v1.json` for the complete shape.
 
+Each provider may also carry five additive fields. `scoped_limits` lists limits
+that apply to a single model (`id`, `title`, `pct`, `reset_min`) — these sit
+*inside* the account-wide window rather than replacing it, so a model can be
+exhausted while the account total still has room. `extra_usage` describes the
+pay-as-you-go pool on top of the subscription (`used`, `limit`, `pct`, `unit`);
+it is `null` when the account has no such pool, which is different from a pool
+that is merely unused. `unit` is either an ISO currency code or the literal
+`credits`: Claude's pool is money, Codex's spend-control limit is counted in
+credits, and rendering credits with a currency symbol calls them money. Amounts
+are already converted — the producer does the minor-unit shift once so every
+client agrees on the decimal point. `credit_balance` is the credits still on the
+account; `null` means no credit pool at all, which is not the same as a balance
+of zero. `cost_today` and `unpriced_models` report today's usage priced at list API
+rates; this is not a bill, since the usage runs on a subscription, and clients
+must word it as a conversion. Models with no published price are named in
+`unpriced_models` rather than counted as zero, so a partial total is never read
+as the whole. Older producers omit all five, and clients must treat that as
+"no scoped limits", "no pool", "no credits", and "no cost figure" respectively.
+
 The optional additive `current_sessions` array contains at most three display
 summaries with `id`, `provider`, `project`, `model`, `state`, and `updated_at`.
 The optional `recent_events` array contains at most three state transitions

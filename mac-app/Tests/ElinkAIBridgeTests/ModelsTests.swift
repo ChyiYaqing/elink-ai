@@ -56,6 +56,32 @@ final class ModelsTests: XCTestCase {
         XCTAssertEqual(events.first?["kind"] as? String, "needs_input")
     }
 
+    /// 额外用量与作用域限额要过得了桥：树莓派和 TUI 都从这份 JSON 读。
+    /// 关掉的池子发 null，读者据此区分「没有额度池」和「额度池是零」。
+    func testSnapshotCarriesExtraUsageAndScopedLimits() throws {
+        var snapshot = BridgeSnapshot()
+        snapshot.claude.extraUsage = ExtraUsage(used: 10.3, limit: 100, percent: 10.3, unit: "USD")
+        snapshot.claude.scopedLimits = [ScopedLimit(
+            id: "claude-opus-5", title: "Opus",
+            window: UsageWindow(percent: 61, resetMinutes: 180,
+                                resetAt: Date(timeIntervalSince1970: 1_800_000_000))
+        )]
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: snapshot.jsonData()) as? [String: Any])
+        let claude = try XCTUnwrap(object["claude"] as? [String: Any])
+        let extra = try XCTUnwrap(claude["extra_usage"] as? [String: Any])
+        XCTAssertEqual(extra["used"] as? Double, 10.3)
+        XCTAssertEqual(extra["limit"] as? Double, 100)
+        XCTAssertEqual(extra["unit"] as? String, "USD")
+        let limits = try XCTUnwrap(claude["scoped_limits"] as? [[String: Any]])
+        XCTAssertEqual(limits.first?["title"] as? String, "Opus")
+        XCTAssertEqual(limits.first?["pct"] as? Double, 61)
+        XCTAssertEqual(limits.first?["reset_min"] as? Int, 180)
+
+        let codex = try XCTUnwrap(object["codex"] as? [String: Any])
+        XCTAssertTrue(codex["extra_usage"] is NSNull, "没有额度池就该是 null，不是空对象")
+        XCTAssertEqual((codex["scoped_limits"] as? [[String: Any]])?.isEmpty, true)
+    }
+
     func testSessionSummaryDoesNotExposePromptSnippetOrFullPath() throws {
         var session = AgentSession(
             id: "/Users/alice/secret-project/session-123.jsonl", kind: .claude,
@@ -1718,6 +1744,263 @@ final class ModelsTests: XCTestCase {
         // 文件被截断重写时会整份重放：同一条消息喂两次不能翻倍
         incremental.add(lines: lines)
         XCTAssertEqual(incremental.dailyTotals(), whole.dailyTotals())
+    }
+
+    /// 真实响应的形状（2026-08 取自 /api/oauth/usage）：额外用量的金额是最小
+    /// 货币单位，`decimal_places` 说明缩几位。原样显示会把上限夸大一百倍。
+    func testExtraUsageAmountsAreScaledToMajorUnits() throws {
+        let extra = try XCTUnwrap(UsageFetcher.claudeExtraUsage([
+            "is_enabled": true,
+            "monthly_limit": 10_000,
+            "used_credits": 1_030.0,
+            "utilization": 10.3,
+            "currency": "USD",
+            "decimal_places": 2,
+        ]))
+        XCTAssertEqual(extra.limit, 100, accuracy: 0.001)
+        XCTAssertEqual(extra.used, 10.30, accuracy: 0.001)
+        XCTAssertEqual(extra.percent, 10.3, accuracy: 0.001)
+        XCTAssertEqual(extra.unit, "USD")
+
+        // 没给 utilization 就自己算，币种缺席按美元
+        let derived = try XCTUnwrap(UsageFetcher.claudeExtraUsage([
+            "is_enabled": true, "monthly_limit": 20_000, "used_credits": 5_000.0,
+        ]))
+        XCTAssertEqual(derived.percent, 25, accuracy: 0.001)
+        XCTAssertEqual(derived.unit, "USD")
+    }
+
+    /// 关掉的池子不展示：一条「$0 / $0」只是噪声。
+    func testExtraUsageIsAbsentWhenDisabledOrUnlimited() {
+        XCTAssertNil(UsageFetcher.claudeExtraUsage([
+            "is_enabled": false, "monthly_limit": 10_000, "used_credits": 0.0,
+        ]))
+        XCTAssertNil(UsageFetcher.claudeExtraUsage([
+            "is_enabled": true, "monthly_limit": 0, "used_credits": 0.0,
+        ]))
+        XCTAssertNil(UsageFetcher.claudeExtraUsage(nil))
+    }
+
+    /// 作用域周限额：新版在 `limits` 数组里，老账号是平铺的 seven_day_opus。
+    /// 两种同时出现时按模型名去重，同一个限额不能显示两遍。
+    func testScopedWeeklyLimitsComeFromLimitsArrayAndLegacyKeys() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let reset = ISO8601DateFormatter().string(from: now.addingTimeInterval(3 * 3_600))
+        let json: [String: Any] = [
+            "limits": [
+                // 账号总限额没有 scope，不该被当成模型限额
+                ["kind": "weekly_all", "group": "weekly", "percent": 39, "resets_at": reset,
+                 "scope": NSNull(), "is_active": true],
+                // is_active 报 false 的限额实测仍在生效，不能拿它当开关
+                ["kind": "weekly_scoped", "group": "weekly", "percent": 61, "resets_at": reset,
+                 "scope": ["model": ["id": "claude-opus-5", "display_name": "Opus"]],
+                 "is_active": false],
+            ],
+            "seven_day_opus": ["utilization": 12, "resets_at": reset],
+            "seven_day_sonnet": ["utilization": 7, "resets_at": reset],
+        ]
+        let limits = UsageFetcher.claudeScopedLimits(json, now: now)
+        XCTAssertEqual(limits.map(\.title), ["Opus", "Sonnet"])
+        XCTAssertEqual(limits[0].id, "claude-opus-5")
+        XCTAssertEqual(limits[0].window.percent, 61, "limits 数组优先，老字段不该覆盖它")
+        XCTAssertEqual(limits[0].window.resetMinutes, 180)
+        XCTAssertEqual(limits[1].window.percent, 7)
+
+        XCTAssertTrue(UsageFetcher.claudeScopedLimits([:], now: now).isEmpty)
+    }
+
+    /// 窗口已经过期的作用域限额不该留在列表里冒充现役额度。
+    func testExpiredScopedLimitsAreDropped() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let past = ISO8601DateFormatter().string(from: now.addingTimeInterval(-60))
+        let json: [String: Any] = ["seven_day_opus": ["utilization": 88, "resets_at": past]]
+        XCTAssertTrue(UsageFetcher.claudeScopedLimits(json, now: now).isEmpty)
+    }
+
+    /// 用量端点只认 Claude Code 自己的请求头；不带 UA 等于自报「不是 Claude Code」。
+    func testClaudeUsageRequestCarriesClaudeCodeHeaders() {
+        let request = UsageFetcher.claudeUsageRequest(token: "sk-ant-oat01-example")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "anthropic-beta"), "oauth-2025-04-20")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer sk-ant-oat01-example")
+        let agent = try? XCTUnwrap(request.value(forHTTPHeaderField: "User-Agent"))
+        XCTAssertEqual(agent?.hasPrefix("claude-code/"), true)
+    }
+
+    /// 原生安装器把可执行文件软链到 `.../versions/<版本号>`，顺着链接取回来。
+    func testClaudeCodeVersionComesFromTheResolvedExecutablePath() {
+        XCTAssertEqual(
+            UsageFetcher.claudeCodeVersion(candidates: ["~/.local/bin/claude"]) { path in
+                path.hasSuffix("/.local/bin/claude")
+                    ? "/Users/someone/.local/share/claude/versions/2.1.228" : nil
+            },
+            "2.1.228"
+        )
+        // 装法不同就找不到版本号，交给兜底值而不是编一个出来
+        XCTAssertNil(
+            UsageFetcher.claudeCodeVersion(candidates: ["/usr/local/bin/claude"]) { _ in
+                "/usr/local/lib/node_modules/@anthropic-ai/claude-code/cli.js"
+            }
+        )
+        XCTAssertNil(UsageFetcher.claudeCodeVersion(candidates: ["/nowhere/claude"]) { _ in nil })
+    }
+
+    /// statusline 缓存里没有额外用量，它顶上来时不该把上一轮真正取到的那份抹掉。
+    func testCachedFallbackKeepsTheLastKnownExtraUsage() {
+        let extra = ExtraUsage(used: 10.3, limit: 100, percent: 10.3, unit: "USD")
+        let old = ProviderUsage(
+            primary: UsageWindow(percent: 9, resetMinutes: 60,
+                                 resetAt: Date().addingTimeInterval(3_600)),
+            extraUsage: extra, fetchedAt: Date().addingTimeInterval(-600)
+        )
+        let cached = ProviderUsage(
+            primary: UsageWindow(percent: 6, resetMinutes: 30,
+                                 resetAt: Date().addingTimeInterval(1_800)),
+            error: "Claude 用量 HTTP 429", fetchedAt: Date(), isCached: true
+        )
+        XCTAssertEqual(UsageFetcher.keepLastGood(old: old, new: cached).extraUsage, extra)
+    }
+
+    /// Codex 的 access_token 是带 `exp` 的 JWT。已知过期的 token 不该再发出去：
+    /// 换回来的 401 会把「登录过期」说成「用量接口出错」，还白费一轮请求。
+    func testExpiredCodexAccessTokenIsRecognisedBeforeAnyRequest() throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        func auth(exp: Double?) -> Data {
+            var claims: [String: Any] = ["https://api.openai.com/auth": [
+                "chatgpt_account_id": "acct-123",
+            ]]
+            if let exp { claims["exp"] = exp }
+            let payload = try! JSONSerialization.data(withJSONObject: claims)
+                .base64EncodedString()
+                .replacingOccurrences(of: "+", with: "-")
+                .replacingOccurrences(of: "/", with: "_")
+                .replacingOccurrences(of: "=", with: "")
+            let jwt = "eyJhbGciOiJub25lIn0.\(payload).signature"
+            return try! JSONSerialization.data(
+                withJSONObject: ["tokens": ["access_token": jwt, "id_token": jwt]])
+        }
+
+        let live = try UsageFetcher.codexCredentials(
+            fileData: auth(exp: now.timeIntervalSince1970 + 3_600), now: now).get()
+        XCTAssertEqual(live.account, "acct-123", "account_id 缺席时从 id_token 的声明里取")
+
+        func failure(_ data: Data) -> UsageFetcher.CredentialError? {
+            guard case let .failure(error) = UsageFetcher.codexCredentials(fileData: data, now: now)
+            else { return nil }
+            return error
+        }
+        XCTAssertEqual(failure(auth(exp: now.timeIntervalSince1970 - 1)), .expiredCodexCredentials)
+        // 卡在过期边界上再发一轮也是白发，留 60 秒余量
+        XCTAssertEqual(failure(auth(exp: now.timeIntervalSince1970 + 30)), .expiredCodexCredentials)
+        // 没有 exp 的 token 视为有效：不能因为读不到字段就丢掉唯一的凭据
+        XCTAssertNoThrow(try UsageFetcher.codexCredentials(fileData: auth(exp: nil), now: now).get())
+        XCTAssertEqual(failure(Data("{}".utf8)), .invalidCodexCredentials)
+    }
+
+    /// 真实响应形状（2026-08 取自 wham/usage）：本机账号只有一个 604800 秒的
+    /// primary_window，按时长该归到「周」而不是「5 小时」。
+    func testCodexClassifiesWindowsByDurationNotByFieldName() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let json: [String: Any] = ["rate_limit": [
+            "primary_window": [
+                "used_percent": 88, "limit_window_seconds": 604_800,
+                "reset_at": now.timeIntervalSince1970 + 3_600,
+            ],
+            "secondary_window": NSNull(),
+        ]]
+        let usage = UsageFetcher.codexUsage(json, fetchedAt: now, now: now)
+        XCTAssertNil(usage.primary.percent, "七天的窗口不能冒充 5 小时窗口")
+        XCTAssertEqual(usage.weekly.percent, 88)
+        XCTAssertEqual(usage.weekly.resetMinutes, 60)
+    }
+
+    /// `additional_rate_limits` 是只对某个模型生效的限额，与 Claude 的作用域
+    /// 周限额落到同一个字段。一条限额的两个窗口各占一行。
+    func testCodexAdditionalRateLimitsBecomeScopedLimits() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let json: [String: Any] = ["additional_rate_limits": [
+            [
+                "limit_name": "Codex Spark",
+                "rate_limit": [
+                    "primary_window": ["used_percent": 12, "limit_window_seconds": 18_000,
+                                       "reset_at": now.timeIntervalSince1970 + 1_800],
+                    "secondary_window": ["used_percent": 45, "limit_window_seconds": 604_800,
+                                         "reset_at": now.timeIntervalSince1970 + 7_200],
+                ],
+            ],
+            // 没有名字的条目在界面上无从指代
+            ["rate_limit": ["primary_window": ["used_percent": 5]]],
+        ]]
+        let limits = UsageFetcher.codexScopedLimits(json, now: now)
+        XCTAssertEqual(limits.map(\.title), ["Codex Spark", "Codex Spark 周"])
+        XCTAssertEqual(limits[0].window.percent, 12)
+        XCTAssertEqual(limits[0].window.resetMinutes, 30)
+        XCTAssertEqual(limits[1].window.percent, 45)
+
+        XCTAssertTrue(UsageFetcher.codexScopedLimits([:], now: now).isEmpty)
+    }
+
+    /// Codex 的按量额度按**积分**计，不是货币。三处都可能放它，按
+    /// 根 → rate_limit → spend_control 的顺序取第一个能用的。
+    func testCodexSpendControlLimitIsReadInPrecedenceOrderAndCountedInCredits() throws {
+        func usage(_ json: [String: Any]) -> ExtraUsage? { UsageFetcher.codexExtraUsage(json) }
+
+        let root = try XCTUnwrap(usage([
+            "individual_limit": ["limit": 1_000, "used": 250],
+            "rate_limit": ["individual_limit": ["limit": 9_999, "used": 1]],
+        ]))
+        XCTAssertEqual(root.limit, 1_000)
+        XCTAssertEqual(root.used, 250)
+        XCTAssertEqual(root.percent, 25)
+        XCTAssertEqual(root.unit, ExtraUsage.creditsUnit, "积分不能带货币符号")
+
+        let nested = try XCTUnwrap(usage([
+            "rate_limit": ["individual_limit": ["limit": 500, "used": 100]],
+            "spend_control": ["individual_limit": ["limit": 9_999, "used": 1]],
+        ]))
+        XCTAssertEqual(nested.limit, 500)
+
+        // `used` 缺席时从剩余百分比反推，缺一个字段不该让整块消失
+        let derived = try XCTUnwrap(usage([
+            "spend_control": ["individual_limit": ["limit": 200, "remaining_percent": 90]],
+        ]))
+        XCTAssertEqual(derived.used, 20, accuracy: 0.000_001)
+        XCTAssertEqual(derived.percent, 10, accuracy: 0.000_001)
+
+        // 本机账号实测就是这一份：没有额度就不该凭空造一块出来
+        XCTAssertNil(usage(["spend_control": ["reached": false, "individual_limit": NSNull()]]))
+        XCTAssertNil(usage(["individual_limit": ["limit": 0, "used": 0]]))
+        XCTAssertNil(usage([:]))
+    }
+
+    /// `credits.balance` 实测是字符串 `"0"`，数字也见过，两种都要收。
+    /// 只有 `has_credits` 为真才显示——给每个 Plus 用户挂一行「余额 0」是噪声。
+    func testCodexCreditBalanceOnlyAppearsForAccountsThatHaveCredits() {
+        XCTAssertEqual(UsageFetcher.codexCreditBalance([
+            "credits": ["has_credits": true, "balance": "1250.5"],
+        ]), 1250.5)
+        XCTAssertEqual(UsageFetcher.codexCreditBalance([
+            "credits": ["has_credits": true, "balance": 42],
+        ]), 42)
+        // 本机账号：has_credits=false，整行不该出现
+        XCTAssertNil(UsageFetcher.codexCreditBalance([
+            "credits": ["has_credits": false, "unlimited": false, "balance": "0"],
+        ]))
+        XCTAssertNil(UsageFetcher.codexCreditBalance([:]))
+        // 解不出来就是 nil，而不是 0——凭空的 0 会被读成「额度用光了」
+        XCTAssertNil(UsageFetcher.codexCreditBalance([
+            "credits": ["has_credits": true, "balance": "unknown"],
+        ]))
+    }
+
+    /// 积分不是钱：不带货币符号，整数也不写小数点。
+    func testCreditsRenderWithoutACurrencySymbol() {
+        XCTAssertEqual(UsageFormat.credits(1_000), "1000")
+        XCTAssertEqual(UsageFormat.credits(12.5), "12.5")
+        XCTAssertEqual(UsageFormat.credits(0), "0")
+        XCTAssertEqual(UsageFormat.amount(1_000, unit: ExtraUsage.creditsUnit), "1000")
+        XCTAssertEqual(UsageFormat.amount(10.3, unit: "USD"), "$10.30")
+        XCTAssertEqual(UsageFormat.amountPair(250, 1_000, unit: ExtraUsage.creditsUnit),
+                       "250 / 1000")
     }
 
     /// 续读的起点：没有新字节就不该打开文件，文件变短则说明偏移量已经失效。

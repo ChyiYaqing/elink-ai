@@ -33,6 +33,50 @@ pub struct ProviderStatus {
     /// a partial total is never mistaken for the whole.
     #[serde(default)]
     pub unpriced_models: Vec<String>,
+    /// Weekly limits scoped to a single model (Claude only). Empty on bridges
+    /// that predate the field, which reads the same as "no scoped limits".
+    #[serde(default)]
+    pub scoped_limits: Vec<ScopedLimitStatus>,
+    /// Pay-as-you-go pool on top of the subscription. `None` means the account
+    /// has no such pool — distinct from a pool that is merely unused.
+    #[serde(default)]
+    pub extra_usage: Option<ExtraUsageStatus>,
+    /// Credits still on the account (Codex). `None` when the account has no
+    /// credit pool at all, which is not the same as a balance of zero.
+    #[serde(default)]
+    pub credit_balance: Option<f64>,
+}
+
+/// One model-scoped weekly limit as it crosses the bridge.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct ScopedLimitStatus {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub pct: Option<f64>,
+    #[serde(default)]
+    pub reset_min: Option<i64>,
+}
+
+/// Extra-usage pool as it crosses the bridge. Amounts are converted already;
+/// the producer does the minor-unit shift so every reader agrees.
+///
+/// `unit` is either an ISO currency code or `credits` — Codex counts its limit
+/// in credits, so the unit has to travel with the numbers.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct ExtraUsageStatus {
+    #[serde(default)]
+    pub used: f64,
+    #[serde(default)]
+    pub limit: f64,
+    #[serde(default)]
+    pub pct: f64,
+    #[serde(default = "default_unit", alias = "currency")]
+    pub unit: String,
+}
+
+fn default_unit() -> String {
+    "USD".to_string()
 }
 
 impl Default for ProviderStatus {
@@ -51,6 +95,9 @@ impl Default for ProviderStatus {
             provider_usage_cached: false,
             cost_today: None,
             unpriced_models: Vec::new(),
+            scoped_limits: Vec::new(),
+            extra_usage: None,
+            credit_balance: None,
         }
     }
 }
@@ -104,6 +151,11 @@ struct ProviderWire<'a> {
     error: &'a Option<String>,
     provider_usage_fetched_at: Option<i64>,
     provider_usage_cached: bool,
+    cost_today: Option<f64>,
+    unpriced_models: &'a [String],
+    scoped_limits: &'a [ScopedLimitStatus],
+    extra_usage: &'a Option<ExtraUsageStatus>,
+    credit_balance: Option<f64>,
 }
 
 impl<'a> From<&'a ProviderStatus> for ProviderWire<'a> {
@@ -116,6 +168,11 @@ impl<'a> From<&'a ProviderStatus> for ProviderWire<'a> {
             error: &value.error,
             provider_usage_fetched_at: value.provider_usage_fetched_at,
             provider_usage_cached: value.provider_usage_cached,
+            cost_today: value.cost_today,
+            unpriced_models: &value.unpriced_models,
+            scoped_limits: &value.scoped_limits,
+            extra_usage: &value.extra_usage,
+            credit_balance: value.credit_balance,
         }
     }
 }

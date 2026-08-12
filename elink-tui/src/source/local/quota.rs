@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
 
 use serde_json::Value;
@@ -9,6 +9,9 @@ use crate::util::epoch_now;
 
 const WEEKLY_WINDOW_SECONDS: i64 = 6 * 24 * 60 * 60;
 const STATUSLINE_MAX_AGE_SECONDS: i64 = 6 * 60 * 60;
+/// Fallback when the installed Claude Code version cannot be resolved: a
+/// slightly stale version is harmless, a missing User-Agent is not.
+const FALLBACK_CLAUDE_CODE_VERSION: &str = "2.1.0";
 
 /// One quota window. `reset_at` survives expiry so keep-last-good can compare
 /// freshness, but `percent` is cleared once `reset_at <= now` — the UI renders
@@ -36,10 +39,81 @@ impl UsageWindow {
     }
 }
 
+/// Pay-as-you-go pool on top of the subscription (Claude's `extra_usage`,
+/// Codex's spend-control limit).
+///
+/// Claude reports minor units and says how far to shift via `decimal_places`;
+/// the amounts here are already converted, and rendering the raw
+/// `monthly_limit` would overstate the cap a hundredfold.
+///
+/// `unit` is either an ISO currency code or `credits` — Codex counts its limit
+/// in credits, and putting a `$` in front of those calls credits dollars. The
+/// unit therefore travels with the number.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ExtraUsage {
+    pub used: f64,
+    pub limit: f64,
+    pub percent: f64,
+    pub unit: Unit,
+}
+
+pub const CREDITS_UNIT: &str = "credits";
+
+/// What an extra-usage figure is counted in. Only the rendering differs, so the
+/// code is kept inline rather than pulling in a currency crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unit {
+    Currency([u8; 3]),
+    Credits,
+}
+
+impl Unit {
+    pub const USD: Self = Self::Currency(*b"USD");
+
+    pub fn parse(value: &str) -> Self {
+        let trimmed = value.trim();
+        if trimmed.eq_ignore_ascii_case(CREDITS_UNIT) {
+            return Self::Credits;
+        }
+        let bytes = trimmed.as_bytes();
+        match bytes.len() {
+            3 => Self::Currency([
+                bytes[0].to_ascii_uppercase(),
+                bytes[1].to_ascii_uppercase(),
+                bytes[2].to_ascii_uppercase(),
+            ]),
+            _ => Self::USD,
+        }
+    }
+
+    pub fn code(&self) -> &str {
+        match self {
+            Self::Currency(code) => std::str::from_utf8(code).unwrap_or("USD"),
+            Self::Credits => CREDITS_UNIT,
+        }
+    }
+}
+
+/// A weekly limit scoped to one model, e.g. the separate Opus allowance on Max
+/// plans. Kept apart from `weekly`: that is the account-wide total, and folding
+/// them together would hide "plenty left overall but Opus is exhausted".
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScopedLimit {
+    pub id: String,
+    pub title: String,
+    pub window: UsageWindow,
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ProviderUsage {
     pub primary: UsageWindow,
     pub weekly: UsageWindow,
+    pub scoped_limits: Vec<ScopedLimit>,
+    pub extra_usage: Option<ExtraUsage>,
+    /// Credits still on the account (Codex's `credits.balance`). Only set when
+    /// the API says the account actually has a credit pool — hanging a
+    /// "balance 0" row on every Plus user is noise.
+    pub credit_balance: Option<f64>,
     pub error: Option<String>,
     pub fetched_at: Option<i64>,
     pub is_cached: bool,
@@ -57,8 +131,234 @@ impl ProviderUsage {
         let mut value = self.clone();
         value.primary = value.primary.discard_if_expired(now);
         value.weekly = value.weekly.discard_if_expired(now);
+        value.scoped_limits.retain_mut(|limit| {
+            limit.window = limit.window.discard_if_expired(now);
+            limit.window.percent.is_some()
+        });
         value
     }
+}
+
+/// The wham usage payload, everything the panel shows in one place.
+pub fn codex_usage(json: &Value, fetched_at: i64, now: i64) -> ProviderUsage {
+    let (primary, weekly) = codex_windows(&json["rate_limit"], now);
+    ProviderUsage {
+        primary,
+        weekly,
+        scoped_limits: codex_scoped_limits(json, now),
+        extra_usage: codex_extra_usage(json),
+        credit_balance: codex_credit_balance(json),
+        fetched_at: Some(fetched_at),
+        ..ProviderUsage::default()
+    }
+}
+
+/// Codex's spend-control limit. Three places may carry it; take the first
+/// usable one in this order: response root, inside `rate_limit`, inside
+/// `spend_control`.
+///
+/// The unit is **credits**, not money — OpenAI's spend controls are counted in
+/// credits, so the figure is tagged `credits` and rendered without a symbol.
+pub fn codex_extra_usage(json: &Value) -> Option<ExtraUsage> {
+    let object = [
+        &json["individual_limit"],
+        &json["rate_limit"]["individual_limit"],
+        &json["spend_control"]["individual_limit"],
+    ]
+    .into_iter()
+    .find(|value| value.is_object())?;
+    let limit = flexible_f64(&object["limit"]).filter(|limit| *limit > 0.0)?;
+    // With `used` absent, derive it from the remaining percentage: the API has
+    // reported either shape, and one missing field should not hide the block.
+    let remaining = flexible_f64(&object["remaining_percent"])
+        .or_else(|| flexible_f64(&object["remainingPercent"]));
+    let used = flexible_f64(&object["used"])
+        .or_else(|| {
+            remaining.map(|value| limit * value.clamp(0.0, 100.0).mul_add(-1.0, 100.0) / 100.0)
+        })
+        .unwrap_or(0.0);
+    let percent = remaining.map_or(used / limit * 100.0, |value| 100.0 - value);
+    Some(ExtraUsage {
+        used,
+        limit,
+        percent: percent.clamp(0.0, 100.0),
+        unit: Unit::Credits,
+    })
+}
+
+/// Credit balance. Returned only when the API says the account has a credit
+/// pool. `balance` has been observed as the string `"0"` as well as a number,
+/// so both are accepted.
+pub fn codex_credit_balance(json: &Value) -> Option<f64> {
+    let credits = json["credits"].as_object()?;
+    if credits.get("has_credits").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    flexible_f64(credits.get("balance")?)
+}
+
+/// The same field has appeared as both a number and a string. Anything else
+/// yields `None` rather than 0 — a fabricated zero reads as "limit exhausted".
+fn flexible_f64(value: &Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_str().and_then(|text| text.trim().parse().ok()))
+}
+
+/// `additional_rate_limits` are limits that sit alongside primary/secondary but
+/// apply to a single model (e.g. Codex Spark). They land in the same
+/// `scoped_limits` field as Claude's: both answer the same question — the
+/// account total is fine, but how much of *this model's* share is left.
+///
+/// One entry may carry both a 5-hour and a weekly window; each gets its own
+/// row, and an entry with only one window yields only one.
+pub fn codex_scoped_limits(json: &Value, now: i64) -> Vec<ScopedLimit> {
+    let mut result: Vec<ScopedLimit> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    for entry in json["additional_rate_limits"]
+        .as_array()
+        .unwrap_or(&Vec::new())
+    {
+        let name = entry
+            .get("limit_name")
+            .or_else(|| entry.get("metered_feature"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        if name.is_empty() {
+            continue;
+        }
+        let (primary, weekly) = codex_windows(&entry["rate_limit"], now);
+        for (suffix, window) in [("", primary), (" weekly", weekly)] {
+            if window.percent.is_none() {
+                continue;
+            }
+            let title = format!("{name}{suffix}");
+            if seen.contains(&title.to_ascii_lowercase()) {
+                continue;
+            }
+            seen.push(title.to_ascii_lowercase());
+            result.push(ScopedLimit {
+                id: title.clone(),
+                title,
+                window,
+            });
+        }
+    }
+    result
+}
+
+/// Anthropic's OAuth usage payload, everything the panel shows in one place.
+pub fn claude_usage(json: &Value, fetched_at: i64, now: i64) -> ProviderUsage {
+    ProviderUsage {
+        primary: iso_window(&json["five_hour"], now),
+        weekly: iso_window(&json["seven_day"], now),
+        scoped_limits: claude_scoped_limits(json, now),
+        extra_usage: claude_extra_usage(&json["extra_usage"]),
+        credit_balance: None,
+        error: None,
+        fetched_at: Some(fetched_at),
+        is_cached: false,
+    }
+}
+
+/// `extra_usage` amounts are minor units; `decimal_places` says how far to
+/// shift. A disabled pool yields `None` — a "$0 / $0" row is just noise.
+pub fn claude_extra_usage(value: &Value) -> Option<ExtraUsage> {
+    let object = value.as_object()?;
+    if object.get("is_enabled").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let used = object.get("used_credits").and_then(Value::as_f64)?;
+    let limit = object.get("monthly_limit").and_then(Value::as_f64)?;
+    if limit <= 0.0 {
+        return None;
+    }
+    let places = object
+        .get("decimal_places")
+        .and_then(number_as_i64)
+        .unwrap_or(2)
+        .clamp(0, 6);
+    let scale = 10f64.powi(places as i32);
+    let percent = object
+        .get("utilization")
+        .and_then(Value::as_f64)
+        .unwrap_or(used / limit * 100.0);
+    Some(ExtraUsage {
+        used: used / scale,
+        limit: limit / scale,
+        percent: percent.clamp(0.0, 100.0),
+        unit: object
+            .get("currency")
+            .and_then(Value::as_str)
+            .map_or(Unit::USD, Unit::parse),
+    })
+}
+
+/// Model-scoped weekly limits. Newer payloads carry them in the `limits` array
+/// (entries with a `scope.model`); older accounts still report the flat
+/// `seven_day_opus` / `seven_day_sonnet` keys, so both are read.
+///
+/// `is_active` is deliberately not a filter: limits observed to be enforced
+/// still report false, and treating it as a switch hides them entirely.
+pub fn claude_scoped_limits(json: &Value, now: i64) -> Vec<ScopedLimit> {
+    let mut result: Vec<ScopedLimit> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    for entry in json["limits"].as_array().unwrap_or(&Vec::new()) {
+        let group = entry
+            .get("group")
+            .or_else(|| entry.get("kind"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !group.contains("weekly") {
+            continue;
+        }
+        let Some(model) = entry.pointer("/scope/model").and_then(Value::as_object) else {
+            continue;
+        };
+        let id = model.get("id").and_then(Value::as_str).unwrap_or_default();
+        let title = model
+            .get("display_name")
+            .and_then(Value::as_str)
+            .unwrap_or(id);
+        if title.is_empty() || seen.contains(&title.to_ascii_lowercase()) {
+            continue;
+        }
+        let window = UsageWindow {
+            percent: entry.get("percent").and_then(Value::as_f64),
+            reset_at: entry
+                .get("resets_at")
+                .and_then(Value::as_str)
+                .and_then(parse_iso_epoch),
+        }
+        .discard_if_expired(now);
+        if window.percent.is_none() {
+            continue;
+        }
+        seen.push(title.to_ascii_lowercase());
+        result.push(ScopedLimit {
+            id: if id.is_empty() { title } else { id }.to_string(),
+            title: title.to_string(),
+            window,
+        });
+    }
+    for (key, title) in [("seven_day_opus", "Opus"), ("seven_day_sonnet", "Sonnet")] {
+        if seen.contains(&title.to_ascii_lowercase()) {
+            continue;
+        }
+        let window = iso_window(&json[key], now);
+        if window.percent.is_none() {
+            continue;
+        }
+        seen.push(title.to_ascii_lowercase());
+        result.push(ScopedLimit {
+            id: key.to_string(),
+            title: title.to_string(),
+            window,
+        });
+    }
+    result
 }
 
 /// Anthropic `five_hour`/`seven_day` object: `utilization` + ISO8601 `resets_at`.
@@ -86,6 +386,75 @@ fn epoch_window(value: &Value, now: i64) -> UsageWindow {
         reset_at: object.get("reset_at").and_then(number_as_i64),
     }
     .discard_if_expired(now)
+}
+
+/// `claude-code/<version>`, resolved once. The native installer symlinks the
+/// executable to `.../versions/<version>`, so following the link is enough;
+/// other install layouts fall back to a constant rather than spawning
+/// `claude --version` for every request.
+pub fn claude_code_user_agent() -> &'static str {
+    static AGENT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    AGENT.get_or_init(|| {
+        let version = ["~/.local/bin/claude", "/usr/local/bin/claude"]
+            .into_iter()
+            .find_map(|candidate| {
+                let path = match candidate.strip_prefix("~/") {
+                    Some(rest) => dirs::home_dir()?.join(rest),
+                    None => PathBuf::from(candidate),
+                };
+                claude_version_in_path(&fs::canonicalize(path).ok()?)
+            })
+            .unwrap_or_else(|| FALLBACK_CLAUDE_CODE_VERSION.to_string());
+        format!("claude-code/{version}")
+    })
+}
+
+fn claude_version_in_path(path: &Path) -> Option<String> {
+    path.components()
+        .rev()
+        .filter_map(|component| component.as_os_str().to_str())
+        .find(|component| {
+            let parts: Vec<&str> = component.split('.').collect();
+            parts.len() >= 3
+                && parts[..3]
+                    .iter()
+                    .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+        })
+        .map(str::to_string)
+}
+
+/// RFC 7231 allows `Retry-After` to be seconds or an HTTP-date; accept both.
+/// An unparseable value yields `None` so the caller keeps its own backoff —
+/// never treat it as 0 and retry immediately.
+pub fn retry_after_seconds(value: Option<&str>, now: i64) -> Option<f64> {
+    let raw = value?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if let Ok(seconds) = raw.parse::<f64>() {
+        return (seconds > 0.0).then_some(seconds);
+    }
+    let date = chrono::DateTime::parse_from_rfc2822(raw).ok()?;
+    let delta = (date.timestamp() - now) as f64;
+    (delta > 0.0).then_some(delta)
+}
+
+/// Wait exactly as long as the server asked. This used to be a hard-coded
+/// 300 s while the observed header was `Retry-After: 414`, which combined with
+/// the 120 s timer into a 360 s retry that always landed back inside the
+/// window — and every failure pushed the window out again. 5 s of slack avoids
+/// the boundary; the 1 h ceiling keeps one absurd value from starving refresh.
+pub fn backoff_interval(retry_after: Option<f64>, rate_limited: bool) -> i64 {
+    match retry_after {
+        None => {
+            if rate_limited {
+                300
+            } else {
+                60
+            }
+        }
+        Some(seconds) => (seconds + 5.0).clamp(60.0, 3600.0) as i64,
+    }
 }
 
 pub fn parse_iso_epoch(value: &str) -> Option<i64> {
@@ -170,9 +539,9 @@ pub fn statusline_usage(json: &Value, fetched_at: i64, now: i64) -> Option<Provi
     Some(ProviderUsage {
         primary,
         weekly,
-        error: None,
         fetched_at: Some(fetched_at),
         is_cached: true,
+        ..ProviderUsage::default()
     })
 }
 
@@ -180,6 +549,21 @@ pub fn statusline_usage(json: &Value, fetched_at: i64, now: i64) -> Option<Provi
 /// overwrite fresher in-memory data (port of UsageFetcher.keepLastGood).
 pub fn keep_last_good(old: &ProviderUsage, new: ProviderUsage, now: i64) -> ProviderUsage {
     let mut current = new;
+    // The statusline cache carries neither the extra-usage pool nor the scoped
+    // limits; it landing must not erase what the last real fetch found. The
+    // card is already flagged as cached, so the values are not passed off as
+    // live — whereas the whole block vanishing reads as "the pool was closed".
+    if current.is_cached {
+        if current.extra_usage.is_none() {
+            current.extra_usage = old.extra_usage;
+        }
+        if current.credit_balance.is_none() {
+            current.credit_balance = old.credit_balance;
+        }
+        if current.scoped_limits.is_empty() {
+            current.scoped_limits = old.scoped_limits.clone();
+        }
+    }
     current.primary = current.primary.discard_if_expired(now);
     current.weekly = current.weekly.discard_if_expired(now);
     let previous_primary = old.primary.discard_if_expired(now);
@@ -188,6 +572,9 @@ pub fn keep_last_good(old: &ProviderUsage, new: ProviderUsage, now: i64) -> Prov
     let retain = |error: Option<String>| ProviderUsage {
         primary: previous_primary,
         weekly: previous_weekly,
+        scoped_limits: old.scoped_limits.clone(),
+        extra_usage: old.extra_usage,
+        credit_balance: old.credit_balance,
         error,
         fetched_at: old.fetched_at,
         is_cached: true,
@@ -211,6 +598,9 @@ struct QuotaState {
     stored_codex: ProviderUsage,
     last_timer: i64,
     next_allowed: i64,
+    /// Longest `Retry-After` the servers asked for this round; read and
+    /// cleared when the round's results land.
+    pending_retry_after: Option<f64>,
     /// Mirrors UsageFetcher's `fetching` flag: one refresh at a time.
     fetching: bool,
 }
@@ -307,7 +697,7 @@ impl QuotaFetcher {
         self.store.save("claude", &claude);
         self.store.save("codex", &codex);
         let mut state = self.state();
-        state.next_allowed = now + if rate_limited { 300 } else { 60 };
+        state.next_allowed = now + backoff_interval(state.pending_retry_after.take(), rate_limited);
         state.stored_claude = keep_last_good(&state.stored_claude, claude, now);
         state.stored_codex = keep_last_good(&state.stored_codex, codex, now);
         state.fetching = false;
@@ -330,6 +720,9 @@ impl QuotaFetcher {
             .set("Authorization", &format!("Bearer {token}"))
             .set("anthropic-beta", "oauth-2025-04-20")
             .set("Accept", "application/json")
+            // The usage endpoint is Claude Code's own; sending someone else's
+            // User-Agent announces "this is not Claude Code" for no gain.
+            .set("User-Agent", claude_code_user_agent())
             .call();
         let json: Value = match response {
             Ok(response) => match response.into_json() {
@@ -339,7 +732,8 @@ impl QuotaFetcher {
                     return self.claude_fallback(error.to_string(), error, now);
                 }
             },
-            Err(ureq::Error::Status(code, _)) => {
+            Err(ureq::Error::Status(code, response)) => {
+                self.note_retry_after(retry_after_seconds(response.header("Retry-After"), now));
                 let error = format!("claude usage HTTP {code}");
                 return self.claude_fallback(error.clone(), &error, now);
             }
@@ -348,13 +742,15 @@ impl QuotaFetcher {
                 return self.claude_fallback(error.to_string(), error, now);
             }
         };
-        ProviderUsage {
-            primary: iso_window(&json["five_hour"], now),
-            weekly: iso_window(&json["seven_day"], now),
-            error: None,
-            fetched_at: Some(now),
-            is_cached: false,
-        }
+        claude_usage(&json, now, now)
+    }
+
+    /// Both providers can be limited in the same round; the longer wait wins so
+    /// one provider's window is not trampled to accommodate the other.
+    fn note_retry_after(&self, seconds: Option<f64>) {
+        let Some(seconds) = seconds else { return };
+        let mut state = self.state();
+        state.pending_retry_after = Some(state.pending_retry_after.unwrap_or(0.0).max(seconds));
     }
 
     /// On failure, falls back to the statusline cache when it is usable;
@@ -421,17 +817,10 @@ impl QuotaFetcher {
                 return ProviderUsage::with_error("codex usage request failed")
             }
         };
-        let Some(limits) = json.get("rate_limit").filter(|value| value.is_object()) else {
+        if !json["rate_limit"].is_object() {
             return ProviderUsage::with_error("codex usage response parse failed");
-        };
-        let (primary, weekly) = codex_windows(limits, now);
-        ProviderUsage {
-            primary,
-            weekly,
-            error: None,
-            fetched_at: Some(now),
-            is_cached: false,
         }
+        codex_usage(&json, now, now)
     }
 }
 
@@ -519,6 +908,305 @@ mod tests {
         assert!(statusline_usage(&json!({}), NOW, NOW).is_none());
     }
 
+    /// Shape observed on the live endpoint (2026-08): extra-usage amounts are
+    /// minor units, `decimal_places` says how far to shift. Rendering the raw
+    /// `monthly_limit` would overstate the cap a hundredfold.
+    #[test]
+    fn extra_usage_amounts_are_scaled_to_major_units() {
+        let extra = claude_extra_usage(&json!({
+            "is_enabled": true,
+            "monthly_limit": 10000,
+            "used_credits": 1030.0,
+            "utilization": 10.3,
+            "currency": "USD",
+            "decimal_places": 2
+        }))
+        .expect("extra usage");
+        assert!((extra.limit - 100.0).abs() < 1e-9);
+        assert!((extra.used - 10.30).abs() < 1e-9);
+        assert!((extra.percent - 10.3).abs() < 1e-9);
+        assert_eq!(extra.unit, Unit::USD);
+
+        // No utilization reported: derive it. No currency: assume USD.
+        let derived = claude_extra_usage(&json!({
+            "is_enabled": true, "monthly_limit": 20000, "used_credits": 5000.0
+        }))
+        .expect("extra usage");
+        assert!((derived.percent - 25.0).abs() < 1e-9);
+        assert_eq!(derived.unit.code(), "USD");
+    }
+
+    /// A disabled or capless pool is not rendered: "$0 / $0" is only noise.
+    #[test]
+    fn extra_usage_absent_when_disabled_or_unlimited() {
+        assert!(claude_extra_usage(&json!({
+            "is_enabled": false, "monthly_limit": 10000, "used_credits": 0.0
+        }))
+        .is_none());
+        assert!(claude_extra_usage(&json!({
+            "is_enabled": true, "monthly_limit": 0, "used_credits": 0.0
+        }))
+        .is_none());
+        assert!(claude_extra_usage(&json!(null)).is_none());
+    }
+
+    /// Scoped weekly limits come from the `limits` array on newer payloads and
+    /// from the flat `seven_day_*` keys on older ones; the same model must not
+    /// be listed twice when both are present.
+    #[test]
+    fn scoped_weekly_limits_read_both_shapes_and_deduplicate() {
+        let now = parse_iso_epoch("2026-07-18T10:00:00Z").unwrap();
+        let json = json!({
+            "limits": [
+                // Account-wide weekly limit: no scope, so not a model limit
+                {"kind": "weekly_all", "group": "weekly", "percent": 39,
+                 "resets_at": "2026-07-18T13:00:00Z", "scope": null, "is_active": true},
+                // is_active reports false on limits observed to be enforced
+                {"kind": "weekly_scoped", "group": "weekly", "percent": 61,
+                 "resets_at": "2026-07-18T13:00:00Z", "is_active": false,
+                 "scope": {"model": {"id": "claude-opus-5", "display_name": "Opus"}}}
+            ],
+            "seven_day_opus": {"utilization": 12, "resets_at": "2026-07-18T13:00:00Z"},
+            "seven_day_sonnet": {"utilization": 7, "resets_at": "2026-07-18T13:00:00Z"}
+        });
+        let limits = claude_scoped_limits(&json, now);
+        assert_eq!(
+            limits
+                .iter()
+                .map(|limit| limit.title.as_str())
+                .collect::<Vec<_>>(),
+            ["Opus", "Sonnet"]
+        );
+        assert_eq!(limits[0].id, "claude-opus-5");
+        assert_eq!(
+            limits[0].window.percent,
+            Some(61.0),
+            "the limits array wins"
+        );
+        assert_eq!(limits[0].window.reset_minutes(now), Some(180));
+        assert_eq!(limits[1].window.percent, Some(7.0));
+        assert!(claude_scoped_limits(&json!({}), now).is_empty());
+    }
+
+    /// An expired scoped limit must not linger as if it were still in force.
+    #[test]
+    fn expired_scoped_limits_are_dropped() {
+        let now = parse_iso_epoch("2026-07-18T10:00:00Z").unwrap();
+        let json = json!({
+            "seven_day_opus": {"utilization": 88, "resets_at": "2026-07-18T09:00:00Z"}
+        });
+        assert!(claude_scoped_limits(&json, now).is_empty());
+    }
+
+    /// The statusline cache knows nothing about the pool; it landing must not
+    /// erase what the last real fetch found.
+    #[test]
+    fn cached_fallback_keeps_the_last_known_extra_usage() {
+        let extra = ExtraUsage {
+            used: 10.3,
+            limit: 100.0,
+            percent: 10.3,
+            unit: Unit::USD,
+        };
+        let old = ProviderUsage {
+            primary: UsageWindow {
+                percent: Some(9.0),
+                reset_at: Some(NOW + 600),
+            },
+            extra_usage: Some(extra),
+            fetched_at: Some(NOW - 600),
+            ..ProviderUsage::default()
+        };
+        let cached = ProviderUsage {
+            primary: UsageWindow {
+                percent: Some(6.0),
+                reset_at: Some(NOW + 1800),
+            },
+            error: Some("claude usage HTTP 429".to_string()),
+            fetched_at: Some(NOW),
+            is_cached: true,
+            ..ProviderUsage::default()
+        };
+        assert_eq!(keep_last_good(&old, cached, NOW).extra_usage, Some(extra));
+    }
+
+    /// Wait exactly as long as the server asked. Both header forms are legal,
+    /// and an unparseable value must fall back rather than retry immediately.
+    #[test]
+    fn retry_after_drives_the_backoff() {
+        assert_eq!(retry_after_seconds(Some("414"), NOW), Some(414.0));
+        assert_eq!(retry_after_seconds(Some("  "), NOW), None);
+        assert_eq!(retry_after_seconds(Some("soon"), NOW), None);
+        assert_eq!(retry_after_seconds(Some("0"), NOW), None);
+        assert_eq!(retry_after_seconds(None, NOW), None);
+        assert_eq!(
+            retry_after_seconds(Some("Wed, 21 Oct 2026 07:28:00 GMT"), 1_760_000_000),
+            Some(32_567_680.0)
+        );
+
+        assert_eq!(backoff_interval(Some(414.0), true), 419);
+        assert_eq!(
+            backoff_interval(Some(1.0), true),
+            60,
+            "never below the floor"
+        );
+        assert_eq!(
+            backoff_interval(Some(99_999.0), true),
+            3600,
+            "never starved"
+        );
+        assert_eq!(backoff_interval(None, true), 300);
+        assert_eq!(backoff_interval(None, false), 60);
+    }
+
+    /// The native installer symlinks the executable to `.../versions/<v>`.
+    #[test]
+    fn claude_version_is_read_from_the_resolved_path() {
+        assert_eq!(
+            claude_version_in_path(Path::new(
+                "/home/someone/.local/share/claude/versions/2.1.228"
+            )),
+            Some("2.1.228".to_string())
+        );
+        assert_eq!(
+            claude_version_in_path(Path::new(
+                "/usr/local/lib/node_modules/@anthropic-ai/claude-code/cli.js"
+            )),
+            None,
+            "other layouts fall back rather than invent a version"
+        );
+        assert!(claude_code_user_agent().starts_with("claude-code/"));
+    }
+
+    /// Shape observed on the live endpoint (2026-08): this account reports a
+    /// single 604800-second `primary_window`, which by duration is the weekly
+    /// window and must not be shown as the 5-hour one.
+    #[test]
+    fn codex_windows_are_classified_by_duration_not_field_name() {
+        let json = json!({
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 88, "limit_window_seconds": 604800,
+                    "reset_at": NOW + 3600
+                },
+                "secondary_window": null
+            }
+        });
+        let usage = codex_usage(&json, NOW, NOW);
+        assert_eq!(
+            usage.primary.percent, None,
+            "a 7-day window is not a 5h one"
+        );
+        assert_eq!(usage.weekly.percent, Some(88.0));
+        assert_eq!(usage.weekly.reset_minutes(NOW), Some(60));
+    }
+
+    /// `additional_rate_limits` are model-scoped limits and land in the same
+    /// field as Claude's scoped weekly limits; one entry's two windows each get
+    /// their own row.
+    #[test]
+    fn codex_additional_rate_limits_become_scoped_limits() {
+        let json = json!({
+            "additional_rate_limits": [
+                {
+                    "limit_name": "Codex Spark",
+                    "rate_limit": {
+                        "primary_window": {
+                            "used_percent": 12, "limit_window_seconds": 18000,
+                            "reset_at": NOW + 1800
+                        },
+                        "secondary_window": {
+                            "used_percent": 45, "limit_window_seconds": 604800,
+                            "reset_at": NOW + 7200
+                        }
+                    }
+                },
+                // An unnamed entry cannot be referred to on screen
+                {"rate_limit": {"primary_window": {"used_percent": 5}}}
+            ]
+        });
+        let limits = codex_scoped_limits(&json, NOW);
+        assert_eq!(
+            limits
+                .iter()
+                .map(|limit| limit.title.as_str())
+                .collect::<Vec<_>>(),
+            ["Codex Spark", "Codex Spark weekly"]
+        );
+        assert_eq!(limits[0].window.percent, Some(12.0));
+        assert_eq!(limits[0].window.reset_minutes(NOW), Some(30));
+        assert_eq!(limits[1].window.percent, Some(45.0));
+        assert!(codex_scoped_limits(&json!({}), NOW).is_empty());
+    }
+
+    /// Codex's spend-control limit is counted in **credits**, not money. Three
+    /// places may carry it; take the first usable one in root → rate_limit →
+    /// spend_control order.
+    #[test]
+    fn codex_spend_control_limit_is_read_in_precedence_order_and_counted_in_credits() {
+        let root = codex_extra_usage(&json!({
+            "individual_limit": {"limit": 1000, "used": 250},
+            "rate_limit": {"individual_limit": {"limit": 9999, "used": 1}}
+        }))
+        .expect("root limit");
+        assert_eq!(root.limit, 1000.0);
+        assert_eq!(root.used, 250.0);
+        assert_eq!(root.percent, 25.0);
+        assert_eq!(root.unit, Unit::Credits, "credits must not wear a $");
+
+        let nested = codex_extra_usage(&json!({
+            "rate_limit": {"individual_limit": {"limit": 500, "used": 100}},
+            "spend_control": {"individual_limit": {"limit": 9999, "used": 1}}
+        }))
+        .expect("rate_limit limit");
+        assert_eq!(nested.limit, 500.0);
+
+        // With `used` absent, derive it from the remaining percentage
+        let derived = codex_extra_usage(&json!({
+            "spend_control": {"individual_limit": {"limit": 200, "remaining_percent": 90}}
+        }))
+        .expect("spend_control limit");
+        assert!((derived.used - 20.0).abs() < 1e-9);
+        assert!((derived.percent - 10.0).abs() < 1e-9);
+
+        // Exactly what this machine's account reports: no limit to invent
+        assert!(codex_extra_usage(&json!({
+            "spend_control": {"reached": false, "individual_limit": null}
+        }))
+        .is_none());
+        assert!(codex_extra_usage(&json!({"individual_limit": {"limit": 0}})).is_none());
+        assert!(codex_extra_usage(&json!({})).is_none());
+    }
+
+    /// `credits.balance` has been observed as the string `"0"` and as a number.
+    /// Shown only when `has_credits` is true — a "balance 0" row on every Plus
+    /// account is noise.
+    #[test]
+    fn codex_credit_balance_only_appears_for_accounts_that_have_credits() {
+        assert_eq!(
+            codex_credit_balance(&json!({"credits": {"has_credits": true, "balance": "1250.5"}})),
+            Some(1250.5)
+        );
+        assert_eq!(
+            codex_credit_balance(&json!({"credits": {"has_credits": true, "balance": 42}})),
+            Some(42.0)
+        );
+        // This machine's account: has_credits=false, so no row at all
+        assert_eq!(
+            codex_credit_balance(&json!({
+                "credits": {"has_credits": false, "unlimited": false, "balance": "0"}
+            })),
+            None
+        );
+        assert_eq!(codex_credit_balance(&json!({})), None);
+        // Unparseable means unknown, never 0 — a fabricated zero reads as
+        // "the pool is exhausted".
+        assert_eq!(
+            codex_credit_balance(&json!({"credits": {"has_credits": true, "balance": "?"}})),
+            None
+        );
+    }
+
     #[test]
     fn keep_last_good_retains_previous_windows_on_failure() {
         let old = ProviderUsage {
@@ -530,9 +1218,8 @@ mod tests {
                 percent: Some(68.0),
                 reset_at: Some(NOW + 60000),
             },
-            error: None,
             fetched_at: Some(NOW - 120),
-            is_cached: false,
+            ..ProviderUsage::default()
         };
         let new = ProviderUsage::with_error("claude usage request failed");
         let kept = keep_last_good(&old, new, NOW);
@@ -552,6 +1239,7 @@ mod tests {
             error: None,
             fetched_at: Some(NOW - 60),
             is_cached: false,
+            ..ProviderUsage::default()
         };
         let stale_cache = ProviderUsage {
             primary: UsageWindow {
@@ -562,6 +1250,7 @@ mod tests {
             error: Some("claude usage HTTP 500".to_string()),
             fetched_at: Some(NOW - 3600),
             is_cached: true,
+            ..ProviderUsage::default()
         };
         let kept = keep_last_good(&old, stale_cache, NOW);
         assert_eq!(kept.primary.percent, Some(43.0));
@@ -580,6 +1269,7 @@ mod tests {
             error: None,
             fetched_at: Some(NOW - 7200),
             is_cached: false,
+            ..ProviderUsage::default()
         };
         let new = ProviderUsage::with_error("claude usage request failed");
         let kept = keep_last_good(&old, new, NOW);

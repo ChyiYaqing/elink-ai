@@ -11,6 +11,8 @@ enum ClaudeCredentialState {
 final class PanelModel: ObservableObject {
     @Published var claude = AgentStatus()
     @Published var codex = AgentStatus()
+    @Published var claudeCost: CostSummary?
+    @Published var codexCost: CostSummary?
     @Published var updatedText = tr("用量更新中…", "Updating usage…")
     @Published var previewImage: NSImage?
     @Published var deviceSummary = tr("正在连接设备…", "Connecting to device…")
@@ -102,13 +104,15 @@ struct UsagePanelView: View {
                         HStack(alignment: .top, spacing: 10) {
                             ProviderCard(name: "Claude", pet: PixelPet.claude,
                                          accent: PanelTheme.claudeColor(dark: theme.dark),
-                                         status: model.claude, theme: theme) {
+                                         status: model.claude, theme: theme,
+                                         cost: model.claudeCost) {
                                 Log.user("open Claude usage statistics")
                                 withAnimation(.easeOut(duration: 0.2)) { model.statsProvider = "claude" }
                             }
                             ProviderCard(name: "Codex", pet: PixelPet.codex,
                                          accent: PanelTheme.codexColor(dark: theme.dark),
-                                         status: model.codex, theme: theme) {
+                                         status: model.codex, theme: theme,
+                                         cost: model.codexCost) {
                                 Log.user("open Codex usage statistics")
                                 withAnimation(.easeOut(duration: 0.2)) { model.statsProvider = "codex" }
                             }
@@ -1626,6 +1630,7 @@ struct ProviderCard: View {
     let accent: Color
     let status: AgentStatus
     let theme: PanelTheme
+    var cost: CostSummary?
     let onOpenStats: () -> Void
     @State private var hovering = false
 
@@ -1689,6 +1694,28 @@ struct ProviderCard: View {
                 UsageBar(percent: weekly, theme: theme)
                 resetLine(status.weekly.resetMinutes)
             }
+            // 模型作用域的周限额挂在总周额度下面：它们是套在里面的子限额，
+            // 「总量还宽裕但 Opus 已经打满」必须能一眼看出来。
+            ForEach(status.scopedLimits, id: \.id) { limit in
+                if let percent = limit.window.percent {
+                    HStack {
+                        Text(limit.title)
+                            .font(.system(size: 9, weight: .medium))
+                            .foregroundStyle(theme.textSecondary)
+                            .lineLimit(1)
+                        Spacer()
+                        Text("\(Int(percent))%")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundStyle(theme.textPrimary)
+                            .contentTransition(.numericText())
+                    }
+                    UsageBar(percent: percent, theme: theme)
+                    resetLine(limit.window.resetMinutes)
+                }
+            }
+            if status.extraUsage != nil || status.creditBalance != nil {
+                extraUsageSection(status.extraUsage, balance: status.creditBalance)
+            }
             if let notice = UsagePresentation.notice(status) {
                 HStack(spacing: 3) {
                     Image(systemName: notice.kind == .limit
@@ -1713,7 +1740,9 @@ struct ProviderCard: View {
                 }
                 .foregroundStyle(status.usageCached ? theme.statusWarning : theme.textTertiary)
             }
-            if status.tokensToday > 0 {
+            if let cost, !cost.isEmpty {
+                costSection(cost)
+            } else if status.tokensToday > 0 {
                 HStack(spacing: 3) {
                     Image(systemName: "number.circle.fill")
                         .font(.system(size: 7))
@@ -1721,6 +1750,8 @@ struct ProviderCard: View {
                         .font(.system(size: 9, weight: .medium))
                 }
                 .foregroundStyle(theme.textSecondary)
+            }
+            if status.tokensToday > 0 {
                 ForEach(status.modelUsageToday, id: \.model) { usage in
                     HStack {
                         Text(usage.model)
@@ -1744,6 +1775,77 @@ struct ProviderCard: View {
         .onHover { hovering = $0 }
         .contentShape(RoundedRectangle(cornerRadius: 14))
         .onTapGesture(perform: onOpenStats)
+    }
+
+    /// 额外用量：订阅额度之外按量计费的池子，以及账号上还剩多少积分。
+    /// 数已经换算好、单位也跟着数走，这里只负责显示。
+    ///
+    /// 两者可以各自单独出现：有的账号只有积分余额没有月度上限，反过来也有。
+    private func extraUsageSection(_ extra: ExtraUsage?, balance: Double?) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Divider().opacity(0.3)
+            HStack {
+                Text(tr("额外用量", "Extra usage"))
+                    .font(.system(size: 9, weight: .semibold, design: .rounded))
+                    .foregroundStyle(theme.textPrimary)
+                Spacer()
+                if let extra {
+                    Text(tr("已用 \(Int(extra.percent))%", "\(Int(extra.percent))% used"))
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundStyle(theme.textSecondary)
+                }
+            }
+            if let extra {
+                UsageBar(percent: extra.percent, theme: theme)
+                let pair = UsageFormat.amountPair(extra.used, extra.limit, unit: extra.unit)
+                Text(tr("本月：\(pair)", "This month: \(pair)"))
+                    .font(.system(size: 8, weight: .medium))
+                    .foregroundStyle(theme.textTertiary)
+            }
+            if let balance {
+                Text(tr("积分余额：\(UsageFormat.credits(balance))",
+                        "Credit balance: \(UsageFormat.credits(balance))"))
+                    .font(.system(size: 8, weight: .medium))
+                    .foregroundStyle(theme.textTertiary)
+            }
+        }
+    }
+
+    /// 成本。是「同样的量走官方 API 要花多少」的折算，不是账单——订阅额度内
+    /// 并不按 token 收费，措辞必须守住这个口径。
+    private func costSection(_ cost: CostSummary) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Divider().opacity(0.3)
+            HStack(spacing: 3) {
+                Text(tr("成本", "Cost"))
+                    .font(.system(size: 9, weight: .semibold, design: .rounded))
+                    .foregroundStyle(theme.textPrimary)
+                Text(tr("API 等价", "API-equivalent"))
+                    .font(.system(size: 7, weight: .medium))
+                    .foregroundStyle(theme.textTertiary)
+                Spacer()
+                if cost.hasUnpriced {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 7))
+                        .foregroundStyle(theme.statusWarning)
+                        .help(tr("有模型没有定价，未计入金额", "Some models have no pricing and are not counted"))
+                }
+            }
+            costLine(tr("今日", "Today"), cost: cost.todayCost, tokens: cost.todayTokens)
+            costLine(tr("近 30 天", "Last 30 days"), cost: cost.monthCost, tokens: cost.monthTokens)
+        }
+    }
+
+    private func costLine(_ label: String, cost: Double, tokens: Int) -> some View {
+        HStack(spacing: 3) {
+            Text("\(label):")
+                .font(.system(size: 8, weight: .medium))
+                .foregroundStyle(theme.textTertiary)
+            Text("\(UsageStats.costText(cost)) · \(UsageFormat.tokens(tokens)) tokens")
+                .font(.system(size: 8, weight: .semibold))
+                .foregroundStyle(theme.textSecondary)
+            Spacer(minLength: 0)
+        }
     }
 
     private func resetLine(_ minutes: Int?) -> some View {

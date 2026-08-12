@@ -130,3 +130,63 @@ class TestProviderUsageStale:
 
     def test_no_error_is_never_stale(self):
         assert self._status(error=None).usage_is_stale is False
+
+
+class TestExtraUsageAndScopedLimits:
+    """额外用量与模型作用域周限额跨桥的解析。"""
+
+    def _status(self, **overrides):
+        obj = {"status": "working", "five_hour_pct": 9}
+        obj.update(overrides)
+        return ProviderStatus.from_dict(obj, provider="claude")
+
+    def test_parses_extra_usage_in_major_units(self):
+        status = self._status(extra_usage={
+            "used": 10.3, "limit": 100.0, "pct": 10.3, "unit": "usd",
+        })
+        assert status.extra_usage is not None
+        assert status.extra_usage.used == 10.3
+        assert status.extra_usage.limit == 100.0
+        assert status.extra_usage.pct == 10.3
+        assert status.extra_usage.unit == "USD"
+        assert status.extra_usage.is_credits is False
+
+    def test_derives_percentage_and_defaults_unit(self):
+        status = self._status(extra_usage={"used": 25.0, "limit": 100.0})
+        assert status.extra_usage.pct == 25.0
+        assert status.extra_usage.unit == "USD"
+
+    def test_codex_limits_are_counted_in_credits_not_currency(self):
+        status = self._status(extra_usage={
+            "used": 250.0, "limit": 1000.0, "pct": 25.0, "unit": "credits",
+        })
+        assert status.extra_usage.is_credits is True
+        assert status.extra_usage.unit == "credits"
+
+    def test_credit_balance_is_none_when_the_account_has_no_pool(self):
+        assert self._status().credit_balance is None
+        assert self._status(credit_balance=1250.5).credit_balance == 1250.5
+        assert self._status(credit_balance="lots").credit_balance is None
+
+    def test_missing_or_unusable_pool_is_none(self):
+        # 老 bridge 不发这个字段；上限为零则整块不成立
+        assert self._status().extra_usage is None
+        assert self._status(extra_usage=None).extra_usage is None
+        assert self._status(extra_usage={"used": 0, "limit": 0}).extra_usage is None
+        assert self._status(extra_usage={"used": 1}).extra_usage is None
+        assert self._status(extra_usage="10 dollars").extra_usage is None
+
+    def test_parses_scoped_limits(self):
+        status = self._status(scoped_limits=[
+            {"id": "claude-opus-5", "title": "Opus", "pct": 61, "reset_min": 180},
+            # 没有标题的条目在屏幕上无从指代，丢掉
+            {"id": "mystery", "pct": 4},
+        ])
+        assert [limit.title for limit in status.scoped_limits] == ["Opus"]
+        assert status.scoped_limits[0].id == "claude-opus-5"
+        assert status.scoped_limits[0].pct == 61
+        assert status.scoped_limits[0].reset_min == 180
+
+    def test_missing_scoped_limits_default_empty(self):
+        assert self._status().scoped_limits == []
+        assert self._status(scoped_limits="opus").scoped_limits == []

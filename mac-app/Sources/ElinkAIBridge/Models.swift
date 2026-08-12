@@ -14,9 +14,48 @@ struct UsageWindow: Codable, Equatable {
     }
 }
 
+/// 订阅额度之外、按量计费的那个池子（Claude 的 `extra_usage`、Codex 的
+/// spend control 额度）。
+///
+/// Claude 给的是最小货币单位，`decimal_places` 说明要缩几位：`monthly_limit:
+/// 10000` 配 `decimal_places: 2` 是 $100，直接显示原值会把上限夸大一百倍。
+/// 这里存的是换算好的数，显示端不再做任何缩放。
+///
+/// `unit` 要么是 ISO 货币代码，要么是 `credits`——Codex 的额度按积分计，给它
+/// 加个 `$` 就是把积分说成了美元。两种都可能出现，所以单位必须跟着数走。
+struct ExtraUsage: Codable, Equatable {
+    static let creditsUnit = "credits"
+
+    var used: Double
+    var limit: Double
+    var percent: Double
+    var unit: String
+}
+
+/// 只对某个模型生效的周额度，例如 Max 账号单独计的 Opus 周限额。
+///
+/// 与 `weekly` 分开：那是整个账号的总周限额，这些是套在它里面的子限额。合并成
+/// 一条会让「总量还很宽裕但 Opus 已经打满」这种真实状态无法表达。
+struct ScopedLimit: Codable, Equatable {
+    var id: String
+    var title: String
+    var window: UsageWindow
+
+    func discardingIfExpired(at now: Date = Date()) -> ScopedLimit {
+        var value = self
+        value.window = window.discardingIfExpired(at: now)
+        return value
+    }
+}
+
 struct ProviderUsage: Codable, Equatable {
     var primary = UsageWindow()
     var weekly = UsageWindow()
+    var scopedLimits: [ScopedLimit] = []
+    var extraUsage: ExtraUsage?
+    /// 账号上还剩多少积分（Codex 的 `credits.balance`）。只有接口说这个账号
+    /// 真的有积分池时才是非 nil——给每个 Plus 用户挂一行「余额 0」是噪声。
+    var creditBalance: Double?
     var error: String?
     var fetchedAt: Date?
     var isCached = false
@@ -49,6 +88,15 @@ struct AgentStatus: Codable, Equatable {
     var modelUsageToday: [ModelUsage] = []
     var primary = UsageWindow()
     var weekly = UsageWindow()
+    var scopedLimits: [ScopedLimit] = []
+    var extraUsage: ExtraUsage?
+    var creditBalance: Double?
+    /// 今日用量的 API 等价成本，nil 表示连一条分类明细都没有。
+    /// 这不是账单：订阅额度内不按 token 收费，读者必须照这个口径措辞。
+    var costToday: Double?
+    /// 没有定价、因而没计入 `costToday` 的模型。不显示出来，一个偏低的总额
+    /// 看不出偏低。
+    var unpricedModels: [String] = []
     var needsInput = false
     var error: String?
     var usageFetchedAt: Date?
@@ -93,6 +141,27 @@ struct BridgeSnapshot: Codable {
             result["\(primary)_reset_min"] = nullable(value.primary.resetMinutes)
             result["\(weekly)_pct"] = nullable(value.weekly.percent)
             result["\(weekly)_reset_min"] = nullable(value.weekly.resetMinutes)
+            // 额外用量和模型作用域周限额是后加的：老读者读不到这两个键，行为与
+            // 从前一致，不需要提 schema_version。
+            result["scoped_limits"] = value.scopedLimits.map {
+                [
+                    "id": $0.id,
+                    "title": $0.title,
+                    "pct": nullable($0.window.percent),
+                    "reset_min": nullable($0.window.resetMinutes),
+                ] as [String: Any]
+            }
+            result["cost_today"] = nullable(value.costToday)
+            result["unpriced_models"] = value.unpricedModels
+            result["extra_usage"] = value.extraUsage.map {
+                [
+                    "used": $0.used,
+                    "limit": $0.limit,
+                    "pct": $0.percent,
+                    "unit": $0.unit,
+                ] as [String: Any]
+            } ?? NSNull()
+            result["credit_balance"] = nullable(value.creditBalance)
             return result
         }
         let object: [String: Any] = [

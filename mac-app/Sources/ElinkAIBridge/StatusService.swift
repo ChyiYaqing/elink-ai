@@ -159,6 +159,9 @@ final class StatusService {
         var value = input
         value.primary = usage.primary.percent == nil ? value.primary : usage.primary
         value.weekly = usage.weekly.percent == nil ? value.weekly : usage.weekly
+        value.scopedLimits = usage.scopedLimits
+        value.extraUsage = usage.extraUsage
+        value.creditBalance = usage.creditBalance
         value.error = usage.error
         if usage.primary.percent != nil || usage.weekly.percent != nil {
             value.usageFetchedAt = usage.fetchedAt
@@ -175,15 +178,18 @@ final class StatusService {
 
     private func readLogs() -> BridgeSnapshot {
         let timeZone = Self.aggregationCalendar.timeZone
+        // 两家 provider 共用一次定价表读取：它要落一次盘，读两遍是白读的
+        let prices = Pricing.table()
         return BridgeSnapshot(
-            claude: readClaude(in: timeZone),
-            codex: readCodex(in: timeZone),
+            claude: readClaude(in: timeZone, prices: prices),
+            codex: readCodex(in: timeZone, prices: prices),
             generatedAt: Date(),
             usageFetchedAt: nil
         )
     }
 
-    private func readClaude(in timeZone: TimeZone) -> AgentStatus {
+    private func readClaude(in timeZone: TimeZone,
+                            prices: [String: ModelPricing]) -> AgentStatus {
         let files = Self.jsonlFiles(at: Self.claudeRoot) ?? []
         let latest = latestModification(files)
         var calendar = Calendar(identifier: .gregorian)
@@ -219,17 +225,39 @@ final class StatusService {
             categories: accumulator.dailyCategoryTotals(dayKey: dayKey)[today] ?? [:],
             expectedBucketTimeZone: timeZone.identifier
         )
+        let modelCategories = accumulator.dailyModelCategoryTotals(dayKey: dayKey)[today] ?? [:]
         store?.recordModelCategories(
             day: today, provider: "claude",
-            usage: accumulator.dailyModelCategoryTotals(dayKey: dayKey)[today] ?? [:],
+            usage: modelCategories,
             expectedBucketTimeZone: timeZone.identifier
         )
         let models = Self.sorted(totals)
+        let cost = Self.todayCost(modelCategories, prices: prices)
         return AgentStatus(
             state: state(latest),
             tokensToday: models.reduce(0) { $0 + $1.tokens },
-            modelUsageToday: models
+            modelUsageToday: models,
+            costToday: cost.cost,
+            unpricedModels: cost.unpriced
         )
+    }
+
+    /// 今日用量的 API 等价成本。取的是刚解析出来的 模型×分类 明细，与并排显示的
+    /// token 数出自同一次解析——当天还没落盘时两个数也已经对得上。
+    ///
+    /// 一条明细都没有时返回 nil 而不是 0：「今天没用」和「算不出来」在屏幕上
+    /// 必须长得不一样。
+    static func todayCost(_ usage: [String: [String: Int]],
+                          prices: [String: ModelPricing]) -> (cost: Double?, unpriced: [String]) {
+        guard !usage.isEmpty else { return (nil, []) }
+        let rows = usage.flatMap { model, categories in
+            categories.map {
+                ModelCategoryUsage(day: "", provider: "", model: model,
+                                   category: $0.key, tokens: $0.value)
+            }
+        }
+        let result = Pricing.total(rows: rows, table: prices)
+        return (result.cost, result.unpriced.sorted())
     }
 
     /// 只把上次之后追加的字节喂给累加器。
@@ -265,7 +293,8 @@ final class StatusService {
         claudeOffsets[path] = from + UInt64(data.distance(from: data.startIndex, to: lastBreak)) + 1
     }
 
-    private func readCodex(in timeZone: TimeZone) -> AgentStatus {
+    private func readCodex(in timeZone: TimeZone,
+                           prices: [String: ModelPricing]) -> AgentStatus {
         let files = Self.jsonlFiles(at: Self.codexRoot) ?? []
         let latest = latestModification(files)
         // 文件一个字节都没动过，重解析一遍必然得到同样的数字。唯独 state 要重算：
@@ -335,12 +364,15 @@ final class StatusService {
         let models = Self.sorted(totals)
         let windows = latestRateLimits.map(UsageFetcher.codexLogWindows)
         let rateLimitDate = Self.timestamp(latestRateLimitsTimestamp)
+        let cost = Self.todayCost(dailyModelCategories[today] ?? [:], prices: prices)
         let status = AgentStatus(
             state: state(latest),
             tokensToday: models.reduce(0) { $0 + $1.tokens },
             modelUsageToday: models,
             primary: windows?.primary ?? UsageWindow(),
             weekly: windows?.weekly ?? UsageWindow(),
+            costToday: cost.cost,
+            unpricedModels: cost.unpriced,
             usageFetchedAt: rateLimitDate,
             usageCached: windows != nil
         )

@@ -190,16 +190,55 @@ pub fn total(
 
 /// Small amounts keep cents; past $100 the cents stop carrying information.
 pub fn format_cost(cost: f64) -> String {
-    if cost >= 100.0 {
-        format!("${cost:.0}")
+    format_money(cost, "USD")
+}
+
+/// One figure rendered in its own unit. `unit` is either an ISO currency code
+/// or `credits`.
+///
+/// Money: cents matter for small amounts and stop mattering past 100.
+/// Hard-coding `$` would render a euro-denominated cap as dollars, so unknown
+/// codes are spelled out. Credits are not money and carry no symbol at all;
+/// whole numbers print without a decimal point, because `1000.00 credits`
+/// invites the reader to wonder whether it is currency after all.
+pub fn format_money(value: f64, unit: &str) -> String {
+    if unit == crate::source::local::quota::CREDITS_UNIT {
+        let rounded = (value * 100.0).round() / 100.0;
+        return if rounded.fract() == 0.0 {
+            format!("{rounded:.0}")
+        } else {
+            format!("{rounded}")
+        };
+    }
+    let amount = if value.abs() >= 100.0 {
+        format!("{value:.0}")
     } else {
-        format!("${cost:.2}")
+        format!("{value:.2}")
+    };
+    match unit {
+        "EUR" => format!("\u{20ac}{amount}"),
+        "GBP" => format!("\u{a3}{amount}"),
+        "JPY" | "CNY" => format!("\u{a5}{amount}"),
+        "USD" => format!("${amount}"),
+        other => format!("{amount} {other}"),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Credits are not money: no symbol, and whole numbers print without a
+    /// decimal point so nobody reads them as currency.
+    #[test]
+    fn credits_render_without_a_currency_symbol() {
+        assert_eq!(format_money(1000.0, "credits"), "1000");
+        assert_eq!(format_money(12.5, "credits"), "12.5");
+        assert_eq!(format_money(0.0, "credits"), "0");
+        assert_eq!(format_money(10.3, "USD"), "$10.30");
+        assert_eq!(format_money(2000.0, "USD"), "$2000");
+        assert_eq!(format_money(10.3, "SEK"), "10.30 SEK");
+    }
 
     fn categories(pairs: &[(&str, u64)]) -> BTreeMap<String, u64> {
         pairs

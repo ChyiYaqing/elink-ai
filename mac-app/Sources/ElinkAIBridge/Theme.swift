@@ -19,6 +19,42 @@ enum UsageFormat {
         if tokens >= 1_000 { return String(format: "%.1fK", Double(tokens) / 1_000) }
         return "\(tokens)"
     }
+
+    /// 金额。小额保留分位；超过 100 之后分位没有意义，取整更好读。
+    /// 币种照接口给的那个显示——账号可能不是按美元计费的，写死 `$` 会把
+    /// 一个欧元额度说成美元额度。
+    static func money(_ value: Double, currency: String = "USD",
+                      cents: Bool? = nil) -> String {
+        let symbol = ["USD": "$", "EUR": "€", "GBP": "£", "JPY": "¥", "CNY": "¥"][currency]
+        let amount = cents ?? (abs(value) < 100)
+            ? String(format: "%.2f", value)
+            : String(format: "%.0f", value)
+        return symbol.map { $0 + amount } ?? "\(amount) \(currency)"
+    }
+
+    /// 积分。它不是钱，所以不带任何货币符号；整数就不写小数点，
+    /// `1000.00 credits` 只会让人怀疑这到底是不是钱。
+    static func credits(_ value: Double) -> String {
+        let rounded = (value * 100).rounded() / 100
+        return rounded == rounded.rounded()
+            ? String(format: "%.0f", rounded)
+            : String(format: "%g", rounded)
+    }
+
+    /// 一个额度数，按它自己的单位渲染。`unit` 要么是 ISO 货币代码，要么是
+    /// `credits`——Codex 的额度按积分计，给它加个 `$` 就是把积分说成美元。
+    static func amount(_ value: Double, unit: String, cents: Bool? = nil) -> String {
+        unit == ExtraUsage.creditsUnit
+            ? credits(value)
+            : money(value, currency: unit, cents: cents)
+    }
+
+    /// 「已用 / 上限」这一对。两个数必须同精度，否则 `$10.30 / $100` 读起来像是
+    /// 哪一边算错了。金额一律保留分位：这是真金白银的扣款额，不是折算出来的
+    /// 估值，估值那边的取整规则不适用。
+    static func amountPair(_ used: Double, _ limit: Double, unit: String) -> String {
+        "\(amount(used, unit: unit, cents: true)) / \(amount(limit, unit: unit, cents: true))"
+    }
 }
 
 /// 一套主题在单一明暗模式下的全部颜色。
