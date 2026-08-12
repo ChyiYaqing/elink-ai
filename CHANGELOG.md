@@ -6,6 +6,44 @@ and `Removed`.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## 0.1.21-rc4
+
+### Packaging
+
+- The installer is built with `hdiutil create` instead of a makehybrid and
+  convert pair, and extended attributes are stripped before imaging. The
+  previous route produced a disk image whose signature no longer verified.
+
+### Added
+
+- The Claude and Codex cards show the pay-as-you-go pool that sits on top of
+  the subscription: a bar, the month's spend against the cap, and the percent
+  used. Codex spend limits are counted in credits and are never shown with a
+  currency symbol, and the Codex credit balance appears when the account has
+  one.
+- Limits that apply to a single model now get their own bar under the
+  account-wide weekly one — Claude's per-model weekly allowances and Codex's
+  additional rate limits such as Codex Spark. A model can be exhausted while
+  the account total still has room, and that is now visible at a glance.
+- Each card carries a cost line for today and the trailing 30 days. This is
+  what the same usage would have cost at list API rates, not a bill: the usage
+  runs on a subscription. Models with no published price are flagged rather
+  than counted as zero.
+- The bridge publishes the new figures, so the terminal dashboard and the
+  e-paper agent read the same numbers. All fields are additive and older
+  clients are unaffected.
+
+### Fixed
+
+- An expired Codex login is now recognised from the credential itself instead
+  of being spent on a request that can only fail. The card falls back to the
+  windows recorded in session logs and says the login expired, rather than
+  reporting a usage endpoint error every two minutes.
+- Claude usage requests identify themselves as Claude Code, which is the
+  client that endpoint serves.
+- Claude's extra-usage amounts are scaled by the precision the API reports.
+  Read verbatim, a $100 cap would have been displayed as $10000.
+
 ## 0.1.21-rc3
 
 ### Added
