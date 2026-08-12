@@ -127,6 +127,76 @@ final class UsageCostTests: XCTestCase {
         XCTAssertTrue(result.unpriced.isEmpty)
     }
 
+    /// 卡片上的两行成本：今日只数今天，近 30 天含今天、不含第 31 天。
+    func testCostSummaryCoversTodayAndTheTrailingThirtyDays() {
+        let today = StatusService.dayKey(now)
+        let calendar = StatusService.aggregationCalendar
+        let dayKey = { (offset: Int) in
+            StatusService.dayKey(calendar.date(byAdding: .day, value: offset, to: self.now)!)
+        }
+        let rows = [
+            row(day: today, model: "claude-opus-5", category: "input", tokens: 1_000_000),
+            row(day: dayKey(-29), model: "claude-opus-5", category: "input", tokens: 2_000_000),
+            row(day: dayKey(-30), model: "claude-opus-5", category: "input", tokens: 4_000_000),
+        ]
+        let summary = UsageStats.costSummary(rows: rows, now: now, table: Pricing.builtIn)
+        XCTAssertEqual(summary.todayCost, 5, accuracy: 0.000_001)
+        XCTAssertEqual(summary.todayTokens, 1_000_000)
+        XCTAssertEqual(summary.monthCost, 15, accuracy: 0.000_001)
+        XCTAssertEqual(summary.monthTokens, 3_000_000, "窗口外那 4M 不该混进来")
+        XCTAssertFalse(summary.hasUnpriced)
+    }
+
+    /// 没有定价的模型静静地不计入金额，总额就会偏低而毫无征兆——必须报出来。
+    func testCostSummaryFlagsUnpricedModels() {
+        let today = StatusService.dayKey(now)
+        let rows = [
+            row(day: today, model: "claude-opus-5", category: "input", tokens: 1_000_000),
+            row(day: today, model: "some-unreleased-model", category: "input", tokens: 9_000_000),
+        ]
+        let summary = UsageStats.costSummary(rows: rows, now: now, table: Pricing.builtIn)
+        XCTAssertEqual(summary.todayCost, 5, accuracy: 0.000_001)
+        XCTAssertEqual(summary.todayTokens, 10_000_000, "token 是数得出来的，只有金额算不出")
+        XCTAssertTrue(summary.hasUnpriced)
+    }
+
+    /// 一条用量都没有时卡片不该出现一整块「$0」。
+    func testEmptyCostSummaryIsRecognisable() {
+        XCTAssertTrue(UsageStats.costSummary(rows: [], now: now, table: Pricing.builtIn).isEmpty)
+    }
+
+    /// 额外用量的币种照接口给的显示：写死 $ 会把欧元额度说成美元额度。
+    func testMoneyFollowsTheReportedCurrency() {
+        XCTAssertEqual(UsageFormat.money(10.3), "$10.30")
+        XCTAssertEqual(UsageFormat.money(2_000, currency: "USD"), "$2000")
+        XCTAssertEqual(UsageFormat.money(10.3, currency: "EUR"), "€10.30")
+        XCTAssertEqual(UsageFormat.money(10.3, currency: "SEK"), "10.30 SEK")
+    }
+
+    /// 「已用 / 上限」必须同精度：`$10.30 / $100` 读起来像哪一边算错了。
+    /// 这一对是真实扣款额，不是折算估值，所以两边都保留分位。
+    func testMoneyPairKeepsBothSidesAtTheSamePrecision() {
+        XCTAssertEqual(UsageFormat.amountPair(10.3, 100, unit: "USD"), "$10.30 / $100.00")
+        XCTAssertEqual(UsageFormat.amountPair(0, 2_000, unit: "USD"), "$0.00 / $2000.00")
+    }
+
+    /// 桥接出去的今日成本：与并排的 token 数出自同一份分类明细，当天还没落盘
+    /// 时也对得上。一条明细都没有时是 nil 而不是 0 ——「今天没用」和「算不出来」
+    /// 在屏幕上必须长得不一样。
+    func testTodayCostTravelsWithTheTokensItWasDerivedFrom() {
+        let usage = [
+            "claude-opus-5": ["input": 1_000_000, "output": 200_000],
+            "some-unreleased-model": ["input": 5_000_000],
+        ]
+        let result = StatusService.todayCost(usage, prices: Pricing.builtIn)
+        XCTAssertEqual(try XCTUnwrap(result.cost), 10, accuracy: 0.000_001)
+        XCTAssertEqual(result.unpriced, ["some-unreleased-model"])
+
+        let empty = StatusService.todayCost([:], prices: Pricing.builtIn)
+        XCTAssertNil(empty.cost)
+        XCTAssertTrue(empty.unpriced.isEmpty)
+    }
+
     /// 小额要看得见分位，大额取整更好读
     func testCostTextKeepsCentsOnlyWhenTheyMatter() {
         XCTAssertEqual(UsageStats.costText(0.42), "$0.42")

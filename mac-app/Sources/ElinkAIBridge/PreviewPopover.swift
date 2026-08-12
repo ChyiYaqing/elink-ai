@@ -325,16 +325,35 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
         loadingSnapshot = true
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
+            // 快照先取：它顺带把当天的用量落库，成本汇总紧接着读的就是这一份
             let snapshot = self.status.snapshot()
+            let costs = Self.costSummaries()
             DispatchQueue.main.async {
                 self.loadingSnapshot = false
                 withAnimation(.easeOut(duration: 0.3)) {
                     self.model.claude = snapshot.claude
                     self.model.codex = snapshot.codex
+                    self.model.claudeCost = costs.claude
+                    self.model.codexCost = costs.codex
                 }
                 self.model.updatedText = Self.updatedText(snapshot.usageFetchedAt)
             }
         }
+    }
+
+    /// 两家 provider 的成本汇总。定价表只读一次：它要落一次盘，两张卡片各读一遍
+    /// 是白读的。
+    private static func costSummaries() -> (claude: CostSummary, codex: CostSummary) {
+        let now = Date()
+        let since = StatusService.dayKey(
+            StatusService.aggregationCalendar.date(byAdding: .day, value: -29, to: now) ?? now)
+        let table = Pricing.table()
+        func summary(_ provider: String) -> CostSummary {
+            UsageStats.costSummary(
+                rows: UsageStore.shared.modelCategoryUsage(provider: provider, since: since),
+                now: now, table: table)
+        }
+        return (summary("claude"), summary("codex"))
     }
 
     private func reloadPreview() {

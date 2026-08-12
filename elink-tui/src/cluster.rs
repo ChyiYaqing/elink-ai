@@ -2164,6 +2164,12 @@ impl ClusterAgentStatus {
             // than shipped over the wire, so a remote snapshot carries none.
             cost_today: None,
             unpriced_models: Vec::new(),
+            // Cluster snapshots carry aggregated token counts, not the
+            // account-level quota extras; those belong to whoever holds the
+            // credentials and are only meaningful for the local account.
+            scoped_limits: Vec::new(),
+            extra_usage: None,
+            credit_balance: None,
         }
     }
 }

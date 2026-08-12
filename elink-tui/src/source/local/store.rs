@@ -152,9 +152,9 @@ impl QuotaStore {
         Some(ProviderUsage {
             primary,
             weekly,
-            error: None,
             fetched_at: Some(fetched_at),
             is_cached: true,
+            ..ProviderUsage::default()
         })
     }
 
@@ -284,6 +284,7 @@ mod tests {
             error: None,
             fetched_at: Some(fetched_at),
             is_cached: false,
+            ..ProviderUsage::default()
         }
     }
 

@@ -465,6 +465,55 @@ final class UsagePanelViewTests: XCTestCase {
                        "有没有活跃的 5 小时窗口，这一段都要一样高")
     }
 
+    /// 额外用量和成本是两张卡并排时新增的整块内容：宽度只有 215pt，写不下就会
+    /// 挤出卡片。这里守住「渲染得出来、且不溢出」这条底线。
+    @MainActor
+    func testExtraUsageAndCostSectionsRenderInsideTheNarrowCard() {
+        var status = AgentStatus()
+        status.state = "idle"
+        status.primary = UsageWindow(percent: 9, resetMinutes: 40)
+        status.weekly = UsageWindow(percent: 39, resetMinutes: 2_600)
+        status.scopedLimits = [ScopedLimit(
+            id: "claude-opus-5", title: "Opus",
+            window: UsageWindow(percent: 61, resetMinutes: 2_600)
+        )]
+
+        func cardHeight(extra: ExtraUsage?, cost: CostSummary?) -> CGFloat {
+            var value = status
+            value.extraUsage = extra
+            let card = ProviderCard(name: "Claude", pet: PixelPet.claude,
+                                    accent: PanelTheme.claudeColor(dark: false),
+                                    status: value, theme: PanelTheme(.light), cost: cost) {}
+            let host = NSHostingView(rootView: card)
+            host.frame = NSRect(x: 0, y: 0, width: 215, height: 1)
+            host.frame.size.height = host.fittingSize.height
+            host.layoutSubtreeIfNeeded()
+            for view in host.descendants {
+                let frame = host.convert(view.bounds, from: view)
+                XCTAssertLessThanOrEqual(frame.maxX, host.bounds.maxX + 0.5, "内容溢出卡片右边界")
+            }
+            return host.fittingSize.height
+        }
+
+        // Codex 那半边：额度按积分计，还多一行积分余额，字串比金额那版更长
+        status.creditBalance = 1_250.5
+        let credits = cardHeight(
+            extra: ExtraUsage(used: 250, limit: 1_000, percent: 25,
+                              unit: ExtraUsage.creditsUnit), cost: nil)
+        XCTAssertGreaterThan(credits, 0)
+        status.creditBalance = nil
+
+        let bare = cardHeight(extra: nil, cost: nil)
+        let withExtra = cardHeight(
+            extra: ExtraUsage(used: 10.3, limit: 100, percent: 10.3, unit: "USD"), cost: nil)
+        let withBoth = cardHeight(
+            extra: ExtraUsage(used: 10.3, limit: 100, percent: 10.3, unit: "USD"),
+            cost: CostSummary(todayCost: 0.04, todayTokens: 15_000,
+                              monthCost: 254.24, monthTokens: 218_000_000))
+        XCTAssertGreaterThan(withExtra, bare, "额外用量应当占一块地方")
+        XCTAssertGreaterThan(withBoth, withExtra, "成本应当再占一块")
+    }
+
     /// 这套颜色存在的理由就是「同一屏上分得开」。先试过按 nodeID 哈希取色，实测
     /// 四台机器里三台撞成同一个颜色——6 个色位下四台不撞的概率只有 28%。
     func testEveryClusterMemberGetsADistinctColor() {

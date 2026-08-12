@@ -253,9 +253,12 @@ fn provider_lines(
     // Quota, error, and the separating blank line occupy the bottom; the
     // model list gets the rest. Reserve another row for the overflow marker
     // when the list does not fit.
-    let quota_lines = 4;
+    // Two rows per quota pair: the account 5h/weekly windows plus every
+    // model-scoped weekly limit, then the extra-usage block when there is one.
+    let quota_lines = 4 + provider.scoped_limits.len() * 2;
+    let extra_lines = provider.extra_usage.as_ref().map_or(0, |_| 2);
     let error_lines = usize::from(provider.error.is_some());
-    let reserved = lines.len() + 1 + quota_lines + error_lines;
+    let reserved = lines.len() + 1 + quota_lines + extra_lines + error_lines;
     let model_rows = (inner.height as usize)
         .saturating_sub(reserved)
         .min(provider.model_usage_today.len());
@@ -297,6 +300,33 @@ fn provider_lines(
         width,
         cached,
     ));
+    // Scoped limits sit under the account-wide weekly bar they live inside, so
+    // "plenty left overall but Opus is exhausted" is visible at a glance.
+    for limit in &provider.scoped_limits {
+        lines.extend(quota_pair(
+            &truncated(&limit.title, 6),
+            limit.pct,
+            limit.reset_min,
+            width,
+            cached,
+        ));
+    }
+    // The extra-usage pool has no reset countdown, so its second row states the
+    // month's spend against the cap instead.
+    if let Some(extra) = &provider.extra_usage {
+        lines.extend(quota_pair("Extra", Some(extra.pct), None, width, cached));
+        lines.pop();
+        lines.push(two_column(
+            "  this month",
+            &format!(
+                "{} / {}",
+                crate::pricing::format_money(extra.used, &extra.unit),
+                crate::pricing::format_money(extra.limit, &extra.unit)
+            ),
+            width,
+            Style::new().dim(),
+        ));
+    }
 
     if let Some(error) = &provider.error {
         lines.push(Line::styled(

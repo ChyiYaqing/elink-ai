@@ -125,6 +125,14 @@ final class UsageFetcher {
     static func keepLastGood(old: ProviderUsage, new: ProviderUsage) -> ProviderUsage {
         let now = Date()
         var current = new
+        // statusline 缓存里没有额外用量和作用域限额，它落地时不该把上一轮真正
+        // 取到的那份抹掉——卡片此时已经标了「缓存」，整块消失只会让人以为
+        // 额度池被关了。
+        if current.isCached {
+            if current.extraUsage == nil { current.extraUsage = old.extraUsage }
+            if current.creditBalance == nil { current.creditBalance = old.creditBalance }
+            if current.scopedLimits.isEmpty { current.scopedLimits = old.scopedLimits }
+        }
         current.primary = current.primary.discardingIfExpired(at: now)
         current.weekly = current.weekly.discardingIfExpired(at: now)
         let previousPrimary = old.primary.discardingIfExpired(at: now)
@@ -157,6 +165,9 @@ final class UsageFetcher {
         var value = usage
         value.primary = value.primary.discardingIfExpired(at: now)
         value.weekly = value.weekly.discardingIfExpired(at: now)
+        value.scopedLimits = value.scopedLimits
+            .map { $0.discardingIfExpired(at: now) }
+            .filter { $0.window.percent != nil }
         return value
     }
 
@@ -180,12 +191,7 @@ final class UsageFetcher {
             }
             return ProviderUsage(error: error.localizedDescription)
         }
-        var request = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
-        request.timeoutInterval = 20
-        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
-        guard let outcome = requestHandler(request) else {
+        guard let outcome = requestHandler(Self.claudeUsageRequest(token: token)) else {
             return Self.claudeFallback(error: tr("Claude 用量请求失败", "Claude usage request failed"))
         }
         guard outcome.status == 200 else {
@@ -196,9 +202,121 @@ final class UsageFetcher {
         guard let json = try? JSONSerialization.jsonObject(with: outcome.data) as? [String: Any] else {
             return Self.claudeFallback(error: tr("Claude 用量响应解析失败", "Failed to parse Claude usage response"))
         }
-        let primary = Self.isoWindow(json["five_hour"])
-        let weekly = Self.isoWindow(json["seven_day"])
-        return ProviderUsage(primary: primary, weekly: weekly, fetchedAt: Date())
+        return Self.claudeUsage(json, fetchedAt: Date())
+    }
+
+    /// 用量端点是 Claude Code 的私有接口，只认它自己的那套请求头。
+    ///
+    /// `anthropic-beta` 之外还要带 claude-code 的 User-Agent：不带等于主动告诉
+    /// 服务端「这不是 Claude Code」，而这个端点没有任何理由优待一个陌生客户端。
+    static func claudeUsageRequest(token: String) -> URLRequest {
+        var request = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
+        request.timeoutInterval = 20
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue(claudeCodeUserAgent, forHTTPHeaderField: "User-Agent")
+        return request
+    }
+
+    /// 取本机装的那份 Claude Code 版本号，取不到就兜一个已知能用的值。
+    /// 版本号旧一点无所谓，请求里没有 UA 才是问题。
+    static let claudeCodeUserAgent = "claude-code/\(claudeCodeVersion() ?? "2.1.0")"
+
+    /// 原生安装器把可执行文件软链到 `.../versions/<版本号>`，顺着链接找回版本号即可。
+    /// 其他安装方式找不到就返回 nil，交给上面的兜底值——为了一个请求头去跑
+    /// `claude --version`（每次都要起一个进程）不划算。
+    static func claudeCodeVersion(
+        candidates: [String] = ["~/.local/bin/claude", "/opt/homebrew/bin/claude", "/usr/local/bin/claude"],
+        resolve: (String) -> String? = { path in
+            guard FileManager.default.fileExists(atPath: path) else { return nil }
+            return URL(fileURLWithPath: path).resolvingSymlinksInPath().path
+        }
+    ) -> String? {
+        for candidate in candidates {
+            guard let resolved = resolve((candidate as NSString).expandingTildeInPath) else { continue }
+            if let version = URL(fileURLWithPath: resolved).pathComponents
+                .reversed().first(where: isVersionComponent) {
+                return version
+            }
+        }
+        return nil
+    }
+
+    private static func isVersionComponent(_ value: String) -> Bool {
+        let parts = value.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count >= 3 else { return false }
+        return parts.prefix(3).allSatisfy { !$0.isEmpty && $0.allSatisfy(\.isNumber) }
+    }
+
+    static func claudeUsage(_ json: [String: Any], fetchedAt: Date,
+                            now: Date = Date()) -> ProviderUsage {
+        ProviderUsage(
+            primary: isoWindow(json["five_hour"], now: now),
+            weekly: isoWindow(json["seven_day"], now: now),
+            scopedLimits: claudeScopedLimits(json, now: now),
+            extraUsage: claudeExtraUsage(json["extra_usage"]),
+            fetchedAt: fetchedAt
+        )
+    }
+
+    /// `extra_usage` 的金额是最小货币单位，`decimal_places` 说明缩几位。
+    /// 关掉的池子返回 nil：没有额度可用时展示一条「0 / 0」只是噪声。
+    static func claudeExtraUsage(_ value: Any?) -> ExtraUsage? {
+        guard let object = value as? [String: Any],
+              object["is_enabled"] as? Bool == true,
+              let used = (object["used_credits"] as? NSNumber)?.doubleValue,
+              let limit = (object["monthly_limit"] as? NSNumber)?.doubleValue,
+              limit > 0 else { return nil }
+        let places = (object["decimal_places"] as? NSNumber)?.intValue ?? 2
+        let scale = pow(10.0, Double(min(max(places, 0), 6)))
+        let percent = (object["utilization"] as? NSNumber)?.doubleValue ?? used / limit * 100
+        let currency = (object["currency"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return ExtraUsage(
+            used: used / scale,
+            limit: limit / scale,
+            percent: min(100, max(0, percent)),
+            unit: currency.isEmpty ? "USD" : currency
+        )
+    }
+
+    /// 模型作用域的周限额。新版接口放在 `limits` 数组里（条目带 `scope.model`），
+    /// 老账号仍然是平铺的 `seven_day_opus` / `seven_day_sonnet`，两种都读。
+    ///
+    /// 不按 `is_active` 过滤：实测正在生效的限额也会报 false，拿它当开关会把
+    /// 真实限额整条藏掉。
+    static func claudeScopedLimits(_ json: [String: Any], now: Date = Date()) -> [ScopedLimit] {
+        var result: [ScopedLimit] = []
+        var seen: Set<String> = []
+        for entry in json["limits"] as? [[String: Any]] ?? [] {
+            let group = ((entry["group"] as? String) ?? (entry["kind"] as? String) ?? "").lowercased()
+            guard group.contains("weekly"),
+                  let model = (entry["scope"] as? [String: Any])?["model"] as? [String: Any] else {
+                continue
+            }
+            let identifier = (model["id"] as? String) ?? ""
+            let title = (model["display_name"] as? String) ?? identifier
+            guard !title.isEmpty, seen.insert(title.lowercased()).inserted else { continue }
+            let resetAt = (entry["resets_at"] as? String).flatMap(isoDate)
+            let window = UsageWindow(
+                percent: (entry["percent"] as? NSNumber)?.doubleValue,
+                resetMinutes: resetAt.flatMap {
+                    remainingMinutes(untilEpoch: $0.timeIntervalSince1970, now: now)
+                },
+                resetAt: resetAt
+            ).discardingIfExpired(at: now)
+            guard window.percent != nil else { continue }
+            result.append(ScopedLimit(id: identifier.isEmpty ? title : identifier,
+                                      title: title, window: window))
+        }
+        for (key, title) in [("seven_day_opus", "Opus"), ("seven_day_sonnet", "Sonnet")] {
+            guard seen.insert(title.lowercased()).inserted else { continue }
+            let window = isoWindow(json[key], now: now)
+            guard window.percent != nil else { continue }
+            result.append(ScopedLimit(id: key, title: title, window: window))
+        }
+        return result
     }
 
     enum ClaudeTokenValidationError: LocalizedError, Equatable {
@@ -229,12 +347,7 @@ final class UsageFetcher {
     /// 保存前先用候选 token 请求一次用量。只有服务端明确返回成功才允许覆盖
     /// Keychain 里的旧值；网络错误、限流和 401/403 都保留旧凭据。
     static func validateClaudeToken(_ token: String) -> Result<ProviderUsage, ClaudeTokenValidationError> {
-        var request = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
-        request.timeoutInterval = 20
-        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
-        return claudeTokenValidation(outcome: Self.request(request))
+        claudeTokenValidation(outcome: Self.request(claudeUsageRequest(token: token)))
     }
 
     static func claudeTokenValidation(
@@ -247,11 +360,7 @@ final class UsageFetcher {
         guard let json = try? JSONSerialization.jsonObject(with: outcome.data) as? [String: Any] else {
             return .failure(.invalidResponse)
         }
-        return .success(ProviderUsage(
-            primary: isoWindow(json["five_hour"]),
-            weekly: isoWindow(json["seven_day"]),
-            fetchedAt: now
-        ))
+        return .success(claudeUsage(json, fetchedAt: now, now: now))
     }
 
     func acceptValidatedClaudeUsage(_ usage: ProviderUsage) {
@@ -348,25 +457,101 @@ final class UsageFetcher {
             return ProviderUsage(error: error)
         }
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let limits = json["rate_limit"] as? [String: Any] else {
+              json["rate_limit"] is [String: Any] else {
             return ProviderUsage(error: tr("Codex 用量响应解析失败", "Failed to parse Codex usage response"))
         }
-        let windows = Self.codexWindows(limits)
+        return Self.codexUsage(json, fetchedAt: Date())
+    }
+
+    static func codexUsage(_ json: [String: Any], fetchedAt: Date,
+                           now: Date = Date()) -> ProviderUsage {
+        let windows = codexWindows(json["rate_limit"] as? [String: Any] ?? [:], now: now)
         return ProviderUsage(
             primary: windows.primary,
             weekly: windows.weekly,
-            fetchedAt: Date()
+            scopedLimits: codexScopedLimits(json, now: now),
+            extraUsage: codexExtraUsage(json),
+            creditBalance: codexCreditBalance(json),
+            fetchedAt: fetchedAt
         )
     }
 
-    static func codexWindows(_ limits: [String: Any]) -> (primary: UsageWindow, weekly: UsageWindow) {
+    /// Codex 的按量额度（spend control）。三处都可能放它，按这个顺序取第一个
+    /// 能用的：响应根、`rate_limit` 里、`spend_control` 里。
+    ///
+    /// 单位是**积分**不是货币——OpenAI 的支出控制按 credit 计，所以这里标
+    /// `credits`，显示端据此不加货币符号。
+    static func codexExtraUsage(_ json: [String: Any]) -> ExtraUsage? {
+        let candidates = [
+            json["individual_limit"],
+            (json["rate_limit"] as? [String: Any])?["individual_limit"],
+            (json["spend_control"] as? [String: Any])?["individual_limit"],
+        ]
+        guard let object = candidates.compactMap({ $0 as? [String: Any] }).first,
+              let limit = flexibleDouble(object["limit"]), limit > 0 else { return nil }
+        // `used` 缺席时从剩余百分比反推：接口两种都给过，缺一个不该让整块消失
+        let remaining = flexibleDouble(object["remaining_percent"])
+            ?? flexibleDouble(object["remainingPercent"])
+        let used = flexibleDouble(object["used"])
+            ?? remaining.map { limit * min(100, max(0, 100 - $0)) / 100 }
+            ?? 0
+        let percent = remaining.map { 100 - $0 } ?? used / limit * 100
+        return ExtraUsage(used: used, limit: limit,
+                          percent: min(100, max(0, percent)),
+                          unit: ExtraUsage.creditsUnit)
+    }
+
+    /// 积分余额。只有接口说这个账号确实有积分池时才返回——给每个 Plus 用户
+    /// 挂一行「余额 0」是噪声。`balance` 实测是字符串 `"0"`，数字也见过，两种都收。
+    static func codexCreditBalance(_ json: [String: Any]) -> Double? {
+        guard let credits = json["credits"] as? [String: Any],
+              credits["has_credits"] as? Bool == true else { return nil }
+        return flexibleDouble(credits["balance"])
+    }
+
+    /// 同一个字段在不同账号上见过数字和字符串两种写法，都接受；接不住返回 nil，
+    /// 而不是当成 0——一个凭空的 0 会被读成「额度用光了」。
+    static func flexibleDouble(_ value: Any?) -> Double? {
+        if let number = value as? NSNumber, !(value is Bool) { return number.doubleValue }
+        if let text = value as? String {
+            return Double(text.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+        return nil
+    }
+
+    /// `additional_rate_limits` 是与 primary/secondary 并列、只对某个模型生效的
+    /// 额外限额（例如 Codex Spark）。落到与 Claude 同一个 `scopedLimits` 字段：
+    /// 两家问的是同一个问题——总额度还够，但这个模型自己的那份还剩多少。
+    ///
+    /// 一条限额可能同时有 5 小时和周两个窗口，各占一行；只有一个窗口就只出一行。
+    static func codexScopedLimits(_ json: [String: Any], now: Date = Date()) -> [ScopedLimit] {
+        var result: [ScopedLimit] = []
+        var seen: Set<String> = []
+        for entry in json["additional_rate_limits"] as? [[String: Any]] ?? [] {
+            let name = ((entry["limit_name"] as? String) ?? (entry["metered_feature"] as? String) ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !name.isEmpty else { continue }
+            let windows = codexWindows(entry["rate_limit"] as? [String: Any] ?? [:], now: now)
+            for (suffix, window) in [("", windows.primary),
+                                     (tr(" 周", " weekly"), windows.weekly)] {
+                guard window.percent != nil else { continue }
+                let title = name + suffix
+                guard seen.insert(title.lowercased()).inserted else { continue }
+                result.append(ScopedLimit(id: title, title: title, window: window))
+            }
+        }
+        return result
+    }
+
+    static func codexWindows(_ limits: [String: Any],
+                             now: Date = Date()) -> (primary: UsageWindow, weekly: UsageWindow) {
         var primary = UsageWindow()
         var weekly = UsageWindow()
         let values = [limits["primary_window"], limits["secondary_window"]]
 
         for (index, value) in values.enumerated() {
             guard let object = value as? [String: Any] else { continue }
-            let window = epochWindow(object)
+            let window = epochWindow(object, now: now)
             if let seconds = (object["limit_window_seconds"] as? NSNumber)?.intValue {
                 if seconds >= 6 * 24 * 60 * 60 {
                     weekly = window
@@ -404,6 +589,7 @@ final class UsageFetcher {
         case expiredClaudeCredentials
         case missingCodexFile
         case invalidCodexCredentials
+        case expiredCodexCredentials
 
         var errorDescription: String? {
             switch self {
@@ -428,6 +614,9 @@ final class UsageFetcher {
             case .invalidCodexCredentials:
                 return tr("Codex 凭据格式无效，请运行 codex 重新登录",
                           "Invalid Codex credentials — run codex to sign in again")
+            case .expiredCodexCredentials:
+                return tr("Codex 凭据已过期，请运行 codex 重新登录",
+                          "Codex credentials expired — run codex to sign in again")
             }
         }
     }
@@ -574,39 +763,66 @@ final class UsageFetcher {
         guard let data = FileManager.default.contents(atPath: file) else {
             return .failure(.missingCodexFile)
         }
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        return codexCredentials(fileData: data)
+    }
+
+    /// access_token 是带 `exp` 的 JWT，实测有效期十天，由 codex CLI 自己续期。
+    /// 十天没开过 codex 它就死了，而把一个已知过期的 token 发出去只会换回 401：
+    /// 白费一轮请求，还把「凭据过期」说成「用量接口出错」。这里提前认出来，
+    /// 面板同时回落到会话日志里的窗口。
+    static func codexCredentials(fileData: Data,
+                                 now: Date = Date()) -> Result<(token: String, account: String?),
+                                                               CredentialError> {
+        guard let json = try? JSONSerialization.jsonObject(with: fileData) as? [String: Any],
               let tokens = json["tokens"] as? [String: Any],
               let token = tokens["access_token"] as? String,
               !token.isEmpty else { return .failure(.invalidCodexCredentials) }
+        guard jwtIsUsable(token, at: now) else { return .failure(.expiredCodexCredentials) }
         var account = tokens["account_id"] as? String
         if account == nil, let jwt = tokens["id_token"] as? String { account = accountID(jwt: jwt) }
         return .success((token, account))
     }
 
+    /// 没有 `exp` 的 token 视为有效——不是每个签发方都放这个字段，不能因为读不到
+    /// 就丢掉唯一的凭据。留 60 秒余量，避免卡在过期边界上白发一轮。
+    static func jwtIsUsable(_ jwt: String, at now: Date = Date()) -> Bool {
+        guard let expiry = (jwtClaims(jwt)?["exp"] as? NSNumber)?.doubleValue else { return true }
+        return expiry - now.timeIntervalSince1970 > 60
+    }
+
     static func accountID(jwt: String) -> String? {
+        guard let auth = jwtClaims(jwt)?["https://api.openai.com/auth"] as? [String: Any] else {
+            return nil
+        }
+        return auth["chatgpt_account_id"] as? String
+    }
+
+    /// JWT 的 payload 段，base64url 解码，不验签——这里只读自己写下的声明，
+    /// 验签需要公钥而我们并不用它来授权任何事。
+    static func jwtClaims(_ jwt: String) -> [String: Any]? {
         let parts = jwt.split(separator: ".")
         guard parts.count > 1 else { return nil }
         var value = String(parts[1]).replacingOccurrences(of: "-", with: "+")
             .replacingOccurrences(of: "_", with: "/")
         while value.count % 4 != 0 { value += "=" }
-        guard let data = Data(base64Encoded: value),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let auth = json["https://api.openai.com/auth"] as? [String: Any] else { return nil }
-        return auth["chatgpt_account_id"] as? String
+        guard let data = Data(base64Encoded: value) else { return nil }
+        return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
     }
 
-    private static func isoWindow(_ value: Any?) -> UsageWindow {
+    private static func isoWindow(_ value: Any?, now: Date = Date()) -> UsageWindow {
         guard let object = value as? [String: Any] else { return UsageWindow() }
         let percent = (object["utilization"] as? NSNumber)?.doubleValue
         let resetAt = (object["resets_at"] as? String).flatMap(Self.isoDate)
         return UsageWindow(
             percent: percent,
-            resetMinutes: resetAt.flatMap { Self.remainingMinutes(untilEpoch: $0.timeIntervalSince1970) },
+            resetMinutes: resetAt.flatMap {
+                Self.remainingMinutes(untilEpoch: $0.timeIntervalSince1970, now: now)
+            },
             resetAt: resetAt
-        ).discardingIfExpired()
+        ).discardingIfExpired(at: now)
     }
 
-    private static func epochWindow(_ value: Any?) -> UsageWindow {
+    private static func epochWindow(_ value: Any?, now: Date = Date()) -> UsageWindow {
         guard let object = value as? [String: Any] else { return UsageWindow() }
         let percent = (object["used_percent"] as? NSNumber)?.doubleValue
         let resetAt = (object["reset_at"] as? NSNumber).map {
@@ -614,9 +830,11 @@ final class UsageFetcher {
         }
         return UsageWindow(
             percent: percent,
-            resetMinutes: resetAt.flatMap { Self.remainingMinutes(untilEpoch: $0.timeIntervalSince1970) },
+            resetMinutes: resetAt.flatMap {
+                Self.remainingMinutes(untilEpoch: $0.timeIntervalSince1970, now: now)
+            },
             resetAt: resetAt
-        ).discardingIfExpired()
+        ).discardingIfExpired(at: now)
     }
 
     private static func isoDate(_ value: String) -> Date? {

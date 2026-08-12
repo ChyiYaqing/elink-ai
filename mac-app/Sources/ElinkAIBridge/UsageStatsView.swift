@@ -30,6 +30,21 @@ struct StatsBucket: Identifiable, Equatable {
     var total: Int { models.values.reduce(0, +) }
 }
 
+/// 卡片上的成本汇总：今日与近 30 天的 API 等价成本和 token 量。
+///
+/// 这不是账单——日常用量走订阅，额度内并不按 token 收费。它回答的是「同样这些量
+/// 走官方 API 要花多少」，`hasUnpriced` 为真时其中还有没定价的模型没算进来，
+/// 显示端必须把这个缺口说出来，否则一个偏低的数字看不出偏低。
+struct CostSummary: Equatable {
+    var todayCost = 0.0
+    var todayTokens = 0
+    var monthCost = 0.0
+    var monthTokens = 0
+    var hasUnpriced = false
+
+    var isEmpty: Bool { monthTokens == 0 }
+}
+
 struct DeviceUsage: Identifiable, Equatable {
     let nodeID: String?          // nil = 无来源标记的本地行
     let models: [String: Int]
@@ -195,6 +210,31 @@ enum UsageStats {
         return (result.cost, result.unpriced, priced)
     }
 
+    /// 卡片上那两行成本。口径与统计页完全一致：同一份 model×category 行，
+    /// 同一张定价表——两处并排显示的数字对不上会比不显示更让人不安。
+    ///
+    /// token 数也取自这份行，而不是卡片上的 `tokensToday`：后者只算本机，
+    /// 而金额在组了集群时是全集群的，混在一起就成了「用本机的量除全集群的钱」。
+    static func costSummary(rows: [ModelCategoryUsage], now: Date = Date(),
+                            table: [String: ModelPricing] = Pricing.table()) -> CostSummary {
+        let today = StatusService.dayKey(now)
+        let start = StatusService.dayKey(
+            StatusService.aggregationCalendar.date(byAdding: .day, value: -29, to: now) ?? now)
+        var summary = CostSummary()
+        for row in rows where row.day >= start {
+            let priced = table[row.model].flatMap { $0.rate(for: row.category) }
+                .map { Double(row.tokens) / 1_000_000 * $0 }
+            if priced == nil { summary.hasUnpriced = true }
+            summary.monthCost += priced ?? 0
+            summary.monthTokens += row.tokens
+            if row.day == today {
+                summary.todayCost += priced ?? 0
+                summary.todayTokens += row.tokens
+            }
+        }
+        return summary
+    }
+
     /// 金额覆盖了窗口内多大比例的 token。
     ///
     /// 分类明细可能缺席：还没升级的集群节点不发这份数据，历史回填也可能没跑完。
@@ -204,9 +244,9 @@ enum UsageStats {
         windowTokens > 0 ? min(1, Double(pricedTokens) / Double(windowTokens)) : 1
     }
 
-    /// 金额文案。小额保留分位，超过 100 美元后分位没有意义，取整更好读。
+    /// 金额文案。折算出来的等价成本一律按美元计——定价表就是美元标的。
     static func costText(_ cost: Double) -> String {
-        cost >= 100 ? String(format: "$%.0f", cost) : String(format: "$%.2f", cost)
+        UsageFormat.money(cost)
     }
 
     /// 堆叠条按模型着色的色位。数据序列色在明暗模式下取同一个值——同一个模型

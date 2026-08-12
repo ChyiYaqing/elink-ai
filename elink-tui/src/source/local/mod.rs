@@ -366,6 +366,25 @@ fn apply_usage(status: &mut ProviderStatus, usage: &ProviderUsage, now: i64) {
         status.weekly_pct = usage.weekly.percent;
         status.weekly_reset_min = usage.weekly.reset_minutes(now);
     }
+    status.scoped_limits = usage
+        .scoped_limits
+        .iter()
+        .map(|limit| crate::model::ScopedLimitStatus {
+            id: limit.id.clone(),
+            title: limit.title.clone(),
+            pct: limit.window.percent,
+            reset_min: limit.window.reset_minutes(now),
+        })
+        .collect();
+    status.extra_usage = usage
+        .extra_usage
+        .map(|extra| crate::model::ExtraUsageStatus {
+            used: extra.used,
+            limit: extra.limit,
+            pct: extra.percent,
+            unit: extra.unit.code().to_string(),
+        });
+    status.credit_balance = usage.credit_balance;
     status.error = usage.error.clone();
     if usage.primary.percent.is_some() || usage.weekly.percent.is_some() {
         status.provider_usage_fetched_at = usage.fetched_at;
