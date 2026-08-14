@@ -15,6 +15,8 @@ final class UsageFetcher {
     /// 在同一块末尾读出并清空，因此不需要额外加锁。
     private var pendingRetryAfter: TimeInterval?
     private let claudeTokenProvider: () -> Result<String, CredentialError>
+    /// 入参是「这轮刷新是否由用户主动触发」，返回是否观察到凭据续上。
+    private let claudeRefresher: (Bool) -> Bool
     private let requestHandler: (URLRequest) -> HTTPOutcome?
     var onUpdate: (() -> Void)?
 
@@ -23,9 +25,16 @@ final class UsageFetcher {
 
     init(cacheStore: UsageStore? = nil,
          claudeTokenProvider: (() -> Result<String, CredentialError>)? = nil,
+         claudeRefresher: ((Bool) -> Bool)? = nil,
          requestHandler: ((URLRequest) -> HTTPOutcome?)? = nil) {
         self.cacheStore = cacheStore
         self.claudeTokenProvider = claudeTokenProvider ?? Self.claudeToken
+        self.claudeRefresher = claudeRefresher ?? { userInitiated in
+            ClaudeDelegatedRefresh.attempt(
+                userInitiated: userInitiated,
+                credentialIsUsable: { Self.claudeKeychainCredentialIsValid() }
+            )
+        }
         self.requestHandler = requestHandler ?? Self.request
         storedClaude = cacheStore?.cachedUsage(provider: "claude") ?? ProviderUsage()
         storedCodex = cacheStore?.cachedUsage(provider: "codex") ?? ProviderUsage()
@@ -56,16 +65,16 @@ final class UsageFetcher {
             DispatchQueue.main.async { completion?() }
         }
         guard shouldStart else { return }
-        performRefresh()
+        performRefresh(force: force)
     }
 
     /// `force` 在请求进行中到达时不能只挂一个 completion：那一轮已经捕获了旧
     /// 凭据。保持 fetching=true 串行补跑一轮，直到最后一次强制刷新之后再完成
     /// 所有等待者，避免旧 token 的 401/429 冒充新 token 的结果。
-    private func performRefresh() {
+    private func performRefresh(force: Bool = false) {
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
-            let claude = self.fetchClaude()
+            let claude = self.fetchClaude(userInitiated: force)
             let codex = self.fetchCodex()
             if claude.error == nil || claude.primary.percent != nil || claude.weekly.percent != nil {
                 self.cacheStore?.cacheUsage(provider: "claude", usage: claude)
@@ -101,7 +110,8 @@ final class UsageFetcher {
             DispatchQueue.main.async {
                 self.onUpdate?()
                 if result.refreshAgain {
-                    self.performRefresh()
+                    // 补跑的这一轮就是那次强制刷新本身。
+                    self.performRefresh(force: true)
                 } else {
                     result.completions.forEach { $0() }
                 }
@@ -178,9 +188,22 @@ final class UsageFetcher {
         pendingRetryAfter = max(pendingRetryAfter ?? 0, seconds)
     }
 
-    private func fetchClaude() -> ProviderUsage {
+    /// Claude Code 只在自己发请求时才续期，空闲会话不会：凭据过期时先让它自己
+    /// 刷新一次，再重新读。观察不到续上就别白发一次注定 401 的请求——401 之后的
+    /// 重试会被限流，429 的退避最长能拖到一小时。
+    private func claudeTokenRenewingIfExpired(
+        userInitiated: Bool
+    ) -> Result<String, CredentialError> {
+        let result = claudeTokenProvider()
+        guard case let .failure(error) = result,
+              error == .expiredClaudeCredentials,
+              claudeRefresher(userInitiated) else { return result }
+        return claudeTokenProvider()
+    }
+
+    private func fetchClaude(userInitiated: Bool) -> ProviderUsage {
         let token: String
-        switch claudeTokenProvider() {
+        switch claudeTokenRenewingIfExpired(userInitiated: userInitiated) {
         case let .success(value):
             token = value
         case let .failure(error):
@@ -223,11 +246,15 @@ final class UsageFetcher {
     /// 版本号旧一点无所谓，请求里没有 UA 才是问题。
     static let claudeCodeUserAgent = "claude-code/\(claudeCodeVersion() ?? "2.1.0")"
 
+    static let claudeBinaryCandidates = [
+        "~/.local/bin/claude", "/opt/homebrew/bin/claude", "/usr/local/bin/claude",
+    ]
+
     /// 原生安装器把可执行文件软链到 `.../versions/<版本号>`，顺着链接找回版本号即可。
     /// 其他安装方式找不到就返回 nil，交给上面的兜底值——为了一个请求头去跑
     /// `claude --version`（每次都要起一个进程）不划算。
     static func claudeCodeVersion(
-        candidates: [String] = ["~/.local/bin/claude", "/opt/homebrew/bin/claude", "/usr/local/bin/claude"],
+        candidates: [String] = UsageFetcher.claudeBinaryCandidates,
         resolve: (String) -> String? = { path in
             guard FileManager.default.fileExists(atPath: path) else { return nil }
             return URL(fileURLWithPath: path).resolvingSymlinksInPath().path
@@ -605,9 +632,11 @@ final class UsageFetcher {
             case .invalidClaudeCredentials:
                 return tr("Claude 凭据格式无效，请运行 claude 重新登录",
                           "Invalid Claude credentials — run claude to sign in again")
+            // 走到这条消息时委托刷新已经试过一次了，而且 refresh token 通常还有
+            // 好几周有效期——「重新登录」是多余的动作。
             case .expiredClaudeCredentials:
-                return tr("Claude 凭据已过期，请运行 claude 重新登录",
-                          "Claude credentials expired — run claude to sign in again")
+                return tr("Claude 凭据已过期且自动续期失败，请运行一次 claude",
+                          "Claude credentials expired; auto-renew failed — run claude once")
             case .missingCodexFile:
                 return tr("未找到 ~/.codex/auth.json，请运行 codex 重新登录",
                           "~/.codex/auth.json not found — run codex to sign in again")
@@ -682,7 +711,15 @@ final class UsageFetcher {
         return .failure(sawExpiredCredential ? .expiredClaudeCredentials : .invalidClaudeCredentials)
     }
 
-    private static func claudeKeychainData() -> Result<Data, CredentialError> {
+    /// 委托刷新的成功判据。只看 Keychain：claude 刷新后写回的就是这一项，而走
+    /// 完整的 token 解析链会顺带起一个登录 shell（最长 10 秒），不能放进轮询里。
+    static func claudeKeychainCredentialIsValid(now: Date = Date()) -> Bool {
+        guard case let .success(data) = claudeKeychainData(),
+              let credential = claudeCredential(data) else { return false }
+        return credential.isValid(at: now)
+    }
+
+    static func claudeKeychainData() -> Result<Data, CredentialError> {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
         process.arguments = ["find-generic-password", "-s", "Claude Code-credentials", "-w"]
