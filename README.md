@@ -188,6 +188,16 @@ start it at login. Replace `YOUR-USERNAME` in its two log paths first: they must
 stay under your own `~/Library/Logs`, because a fixed name in the shared `/tmp`
 can be symlinked by any other local account before the agent opens it.
 
+`install/anchor-claude-window.sh` keeps Claude's 5-hour usage window aligned
+with your working day. The window starts at its own first message and expires
+five hours later, so a stray morning question anchors the whole day's
+boundaries at an arbitrary time. Scheduled by
+`local.elink-ai-anchor.plist.example`, the script checks `five_hour.resets_at`
+at the times you pick and sends one minimal message only when no window is
+running, pinning the grid to 09:00 / 14:00 instead. Each anchor consumes a
+five-hour block and unused quota does not carry over, so list only the
+boundaries you actually work past.
+
 Claude hooks can be merged without replacing existing settings:
 
 ```bash
