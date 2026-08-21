@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>local.elink-ai-anchor</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <!-- 换成你自己的用户名。 -->
+    <string>/Users/YOUR-USERNAME/chyi/github/elink-ai/install/anchor-claude-window.sh</string>
+  </array>
+  <!-- claude 装在 ~/.local/bin，launchd 的 PATH 里没有它。 -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/Users/YOUR-USERNAME/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+
+  <!-- 这张时刻表就是你的窗口网格：09:00 锚定 → 09:00-14:00，14:00 再检查一次
+       把下一块钉在 14:00，覆盖 09:00-19:00 的工作日。中午离开一小时也不会让
+       边界跟着漂。
+
+       每多一个时刻，最多多占一个 5 小时块，而块内额度不累积。只放你确实会
+       工作到的边界：给 19:00 排班而你 18:00 就下班了，等于整夜空转一个块。 -->
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict><key>Hour</key><integer>9</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Hour</key><integer>14</integer><key>Minute</key><integer>0</integer></dict>
+  </array>
+
+  <!-- 合盖或关机错过的时刻不补跑：补跑只会在一个你并不打算工作的时间点开窗。 -->
+  <key>RunAtLoad</key><false/>
+
+  <!-- 不要写 /tmp：那是所有本地账户共享的目录，另一个账户可以先在这个固定
+       名字上放一个符号链接，把日志引到别处去。 -->
+  <key>StandardOutPath</key><string>/Users/YOUR-USERNAME/Library/Logs/Elink AI/anchor.log</string>
+  <key>StandardErrorPath</key><string>/Users/YOUR-USERNAME/Library/Logs/Elink AI/anchor.log</string>
+</dict>
+</plist>
