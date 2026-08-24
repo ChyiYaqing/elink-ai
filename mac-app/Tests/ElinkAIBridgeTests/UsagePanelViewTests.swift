@@ -150,7 +150,8 @@ final class UsagePanelViewTests: XCTestCase {
             model: model,
             updater: UpdateChecker(currentVersion: "0.1.21-rc1"),
             cluster: cluster,
-            mesh: MeshMonitor(store: store, lighthouseURL: nil)
+            mesh: MeshMonitor(store: store, lighthouseURL: nil),
+            kiwi: KiwiVMMonitor(credentials: [])
         )
         let host = NSHostingView(rootView: view)
         let size = host.fittingSize
@@ -234,7 +235,8 @@ final class UsagePanelViewTests: XCTestCase {
                 model: model,
                 updater: UpdateChecker(currentVersion: "0.1.21-rc3"),
                 cluster: cluster,
-                mesh: MeshMonitor(store: store, lighthouseURL: nil)
+                mesh: MeshMonitor(store: store, lighthouseURL: nil),
+            kiwi: KiwiVMMonitor(credentials: [])
             ))
             host.frame = NSRect(x: 0, y: 0, width: 440, height: 900)
             host.layoutSubtreeIfNeeded()
@@ -273,6 +275,7 @@ final class UsagePanelViewTests: XCTestCase {
             updater: UpdateChecker(currentVersion: "0.1.21-rc1"),
             cluster: cluster,
             mesh: MeshMonitor(store: store, lighthouseURL: nil),
+            kiwi: KiwiVMMonitor(credentials: []),
             initialDeviceSettingsExpanded: expanded
         )
         let host = NSHostingView(rootView: view)
@@ -303,7 +306,8 @@ final class UsagePanelViewTests: XCTestCase {
             model: model,
             updater: UpdateChecker(currentVersion: "0.1.21-rc1"),
             cluster: cluster,
-            mesh: MeshMonitor(store: store, lighthouseURL: nil)
+            mesh: MeshMonitor(store: store, lighthouseURL: nil),
+            kiwi: KiwiVMMonitor(credentials: [])
         )
         let host = NSHostingView(rootView: view)
         host.frame = NSRect(x: 0, y: 0, width: 440, height: 900)
@@ -342,6 +346,7 @@ final class UsagePanelViewTests: XCTestCase {
             updater: UpdateChecker(currentVersion: "0.1.21-rc1"),
             cluster: cluster,
             mesh: MeshMonitor(store: store, lighthouseURL: nil),
+            kiwi: KiwiVMMonitor(credentials: []),
             initialClusterExpanded: true
         )
         let host = NSHostingView(rootView: view)
@@ -421,6 +426,7 @@ final class UsagePanelViewTests: XCTestCase {
                 updater: UpdateChecker(currentVersion: "0.1.21-rc1"),
                 cluster: cluster,
                 mesh: MeshMonitor(store: store, lighthouseURL: nil),
+            kiwi: KiwiVMMonitor(credentials: []),
                 initialClusterExpanded: true,
                 initialExpandedNodeID: expandedNodeID
             )
