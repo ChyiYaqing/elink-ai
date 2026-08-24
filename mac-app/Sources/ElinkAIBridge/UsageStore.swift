@@ -1516,6 +1516,55 @@ final class UsageStore {
         return saved
     }
 
+    // KiwiVM 的 api_key 与集群密钥同处：这个应用是 ad-hoc 签名的，每次重新构建
+    // 二进制哈希都会变，Keychain 因而把每个新版本都当成陌生程序，向用户索要一次
+    // 登录密码。集群凭据在 77989b1 里正是为此从 Keychain 搬了出来。
+    func vpsCredentialsData() -> Data? {
+        queue.sync {
+            guard db != nil else { return nil }
+            var statement: OpaquePointer?
+            guard sqlite3_prepare_v2(
+                db, "SELECT payload FROM vps_credentials WHERE singleton = 1",
+                -1, &statement, nil
+            ) == SQLITE_OK else { return nil }
+            defer { sqlite3_finalize(statement) }
+            guard sqlite3_step(statement) == SQLITE_ROW,
+                  let bytes = sqlite3_column_blob(statement, 0) else { return nil }
+            let count = Int(sqlite3_column_bytes(statement, 0))
+            guard count > 0 else { return nil }
+            return Data(bytes: bytes, count: count)
+        }
+    }
+
+    /// 空数据表示「一台都不剩」，要真的把行删掉而不是写一份空 blob——留着一行空记录，
+    /// 下次读出来还得再判一次它是不是等于「没有」。
+    @discardableResult
+    func saveVPSCredentialsData(_ data: Data) -> Bool {
+        let saved = queue.sync {
+            guard db != nil else { return false }
+            guard !data.isEmpty else {
+                return sqlite3_exec(db, "DELETE FROM vps_credentials", nil, nil, nil) == SQLITE_OK
+            }
+            let sql = """
+            INSERT INTO vps_credentials (singleton, payload, updated_at)
+            VALUES (1, ?, ?)
+            ON CONFLICT(singleton) DO UPDATE SET
+              payload = excluded.payload,
+              updated_at = excluded.updated_at
+            """
+            var statement: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return false }
+            defer { sqlite3_finalize(statement) }
+            _ = data.withUnsafeBytes { bytes in
+                sqlite3_bind_blob(statement, 1, bytes.baseAddress, Int32(data.count), Self.transient)
+            }
+            sqlite3_bind_double(statement, 2, Date().timeIntervalSince1970)
+            return sqlite3_step(statement) == SQLITE_DONE
+        }
+        if saved { Self.protectDatabaseFiles(at: databasePath) }
+        return saved
+    }
+
     private func upsertCredentialsLocked(_ data: Data) -> Bool {
         let sql = """
         INSERT INTO cluster_credentials (singleton, payload, updated_at)
@@ -2300,6 +2349,11 @@ final class UsageStore {
           PRIMARY KEY (origin_node_id, day, provider, model, category)
         );
         CREATE TABLE IF NOT EXISTS cluster_credentials (
+          singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+          payload BLOB NOT NULL,
+          updated_at REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS vps_credentials (
           singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
           payload BLOB NOT NULL,
           updated_at REAL NOT NULL

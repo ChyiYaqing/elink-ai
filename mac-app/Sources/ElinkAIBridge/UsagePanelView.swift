@@ -29,6 +29,12 @@ final class PanelModel: ObservableObject {
     @Published var lighthouseURL = ""
     var onSaveLighthouse: ((String) -> Void)?
     @Published var showMesh = false
+    @Published var showVPS = false
+    /// 只带 veid 与显示名。api_key 永远不进面板模型——UI 从不需要回显它。
+    @Published var vpsServers: [(veid: String, label: String)] = []
+    @Published var vpsSaving = false
+    var onSaveVPS: ((String, String, String, @escaping (Bool) -> Void) -> Void)?
+    var onRemoveVPS: ((String) -> Void)?
     @Published var launchAtLogin = false
     @Published var deviceHost = ""
     @Published var bridgeAddress = ""
@@ -64,6 +70,7 @@ struct UsagePanelView: View {
     @ObservedObject var updater: UpdateChecker
     @ObservedObject var cluster: ClusterManager
     @ObservedObject var mesh: MeshMonitor
+    @ObservedObject var kiwi: KiwiVMMonitor
     @Environment(\.colorScheme) private var scheme
     @State private var updatesExpanded = false
     @State private var deviceSettingsExpanded = false
@@ -77,19 +84,27 @@ struct UsagePanelView: View {
     @State private var claudeTokenInput = ""
     @State private var showRemoveClaudeTokenConfirmation = false
     @State private var expandedNodeID: String?
+    @State private var vpsExpanded = false
+    @State private var vpsVeidInput = ""
+    @State private var vpsLabelInput = ""
+    @State private var vpsKeyInput = ""
+    @State private var vpsPendingRemoval: String?
 
     init(model: PanelModel, updater: UpdateChecker, cluster: ClusterManager,
-         mesh: MeshMonitor,
+         mesh: MeshMonitor, kiwi: KiwiVMMonitor,
          initialDeviceSettingsExpanded: Bool = false,
          initialClusterExpanded: Bool = false,
-         initialExpandedNodeID: String? = nil) {
+         initialExpandedNodeID: String? = nil,
+         initialVPSExpanded: Bool = false) {
         self.model = model
         self.updater = updater
         self.cluster = cluster
         self.mesh = mesh
+        self.kiwi = kiwi
         _deviceSettingsExpanded = State(initialValue: initialDeviceSettingsExpanded)
         _clusterExpanded = State(initialValue: initialClusterExpanded)
         _expandedNodeID = State(initialValue: initialExpandedNodeID)
+        _vpsExpanded = State(initialValue: initialVPSExpanded)
     }
 
     var body: some View {
@@ -121,6 +136,12 @@ struct UsagePanelView: View {
                         if model.agentSessionsEnabled && !model.agentSessions.isEmpty {
                             AgentSessionsCard(sessions: model.agentSessions, theme: theme)
                         }
+                        if kiwi.configured {
+                            VpsCard(monitor: kiwi, theme: theme) {
+                                Log.user("open vps detail")
+                                withAnimation(.easeOut(duration: 0.2)) { model.showVPS = true }
+                            }
+                        }
                         meshCard(theme)
                         if model.deviceConnectionEnabled || overlayVisible {
                             deviceCard(theme)
@@ -139,6 +160,12 @@ struct UsagePanelView: View {
                 } else if model.showMesh {
                     meshDetail(theme)
                         .transition(.opacity)
+                } else if model.showVPS {
+                    VpsDetailView(monitor: kiwi, theme: theme) {
+                        Log.user("close vps detail")
+                        withAnimation(.easeOut(duration: 0.2)) { model.showVPS = false }
+                    }
+                    .transition(.opacity)
                 }
             }
             footer(theme)
@@ -149,9 +176,9 @@ struct UsagePanelView: View {
         .background(theme.backgroundGradient)
     }
 
-    /// 设置、用量统计、Nebula 三页互斥，都盖在主列表上。
+    /// 设置、用量统计、Nebula、VPS 四页互斥，都盖在主列表上。
     private var overlayVisible: Bool {
-        model.showSettings || model.statsProvider != nil || model.showMesh
+        model.showSettings || model.statsProvider != nil || model.showMesh || model.showVPS
     }
 
     private func header(_ theme: PanelTheme) -> some View {
@@ -304,6 +331,7 @@ struct UsagePanelView: View {
                     agentSessionsSettings(theme)
                     claudeCredentialSettings(theme)
                     clusterSettings(theme)
+                    vpsSettings(theme)
                     logSettings(theme)
                     updateSettings(theme)
                     aboutSettings(theme)
@@ -624,6 +652,124 @@ struct UsagePanelView: View {
         guard !model.claudeCredentialValidating else { return }
         model.onSaveClaudeToken?(claudeTokenInput) { saved in
             if saved { claudeTokenInput = "" }
+        }
+    }
+
+    // MARK: - KiwiVM
+
+    /// 搬瓦工 VPS 的接入。放在多机同步之后、日志之前：它和集群同属「外部服务」，
+    /// 而插进 Claude 认证与 Agent 会话中间会把那两节本地凭据的设置拆散。
+    private func vpsSettings(_ theme: PanelTheme) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+                withAnimation(.easeOut(duration: 0.2)) { vpsExpanded.toggle() }
+            } label: {
+                settingsHeader(
+                    theme,
+                    icon: "server.rack",
+                    color: theme.statusInfo,
+                    title: tr("VPS 监控", "VPS Monitoring"),
+                    subtitle: Self.vpsSettingsSubtitle(count: model.vpsServers.count),
+                    expanded: vpsExpanded
+                )
+                .padding(12)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityValue(vpsExpanded ? tr("已展开", "Expanded") : tr("已折叠", "Collapsed"))
+
+            if vpsExpanded {
+                VStack(alignment: .leading, spacing: 9) {
+                    Text(tr("在 KiwiVM 面板的 API 页面开启 API 并复制 VM ID 与 API key。Elink 只读取状态，不会执行开关机。",
+                            "Enable the API on KiwiVM's API page, then copy the VM ID and API key. Elink only reads status; it never starts or stops a VPS."))
+                        .font(.system(size: 8, weight: .medium))
+                        .foregroundStyle(theme.textTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    ForEach(model.vpsServers, id: \.veid) { server in
+                        HStack(spacing: 8) {
+                            Text(server.label)
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle(theme.textPrimary)
+                                .lineLimit(1)
+                            Text(server.veid)
+                                .font(.system(size: 9, design: .monospaced))
+                                .foregroundStyle(theme.textTertiary)
+                            Spacer(minLength: 0)
+                            RowIconButton(
+                                icon: "trash", theme: theme,
+                                label: tr("移除 \(server.label)", "Remove \(server.label)"),
+                                hint: tr("删除这台的 API key 并停止读取它",
+                                         "Deletes this server's API key and stops reading it")
+                            ) { vpsPendingRemoval = server.veid }
+                            .disabled(model.vpsSaving)
+                        }
+                    }
+
+                    if model.vpsServers.count < KiwiVMCredentialStore.maxServers {
+                        HStack(spacing: 6) {
+                            TextField(tr("VM ID", "VM ID"), text: $vpsVeidInput)
+                                .frame(width: 76)
+                            TextField(tr("名称", "Name"), text: $vpsLabelInput)
+                                .frame(width: 96)
+                            SecureField(tr("API key", "API key"), text: $vpsKeyInput)
+                                .onSubmit { saveVPS() }
+                        }
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 10, design: .monospaced))
+                        .disabled(model.vpsSaving)
+
+                        PillButton(title: model.vpsSaving
+                                    ? tr("验证中", "Validating")
+                                    : tr("添加服务器", "Add Server"),
+                                   icon: model.vpsSaving ? "hourglass" : "checkmark.shield.fill",
+                                   theme: theme) { saveVPS() }
+                            .disabled(model.vpsSaving
+                                      || vpsVeidInput.trimmingCharacters(in: .whitespaces).isEmpty
+                                      || vpsKeyInput.trimmingCharacters(in: .whitespaces).isEmpty)
+                    } else {
+                        Text(tr("已达到 \(KiwiVMCredentialStore.maxServers) 台上限，移除一台后才能再添加",
+                                "At the \(KiwiVMCredentialStore.maxServers)-server limit; remove one to add another"))
+                            .font(.system(size: 8, weight: .medium))
+                            .foregroundStyle(theme.textTertiary)
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.bottom, 12)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .glassCard(theme)
+        .alert(tr("移除这台服务器？", "Remove this server?"),
+               isPresented: Binding(get: { vpsPendingRemoval != nil },
+                                    set: { if !$0 { vpsPendingRemoval = nil } })) {
+            Button(tr("取消", "Cancel"), role: .cancel) { vpsPendingRemoval = nil }
+            Button(tr("移除", "Remove"), role: .destructive) {
+                if let veid = vpsPendingRemoval { model.onRemoveVPS?(veid) }
+                vpsPendingRemoval = nil
+            }
+        } message: {
+            Text(tr("只会删除本机保存的 API key，服务器本身不受影响。",
+                    "Only the API key stored on this Mac is deleted. The server itself is untouched."))
+        }
+    }
+
+    static func vpsSettingsSubtitle(count: Int) -> String {
+        count == 0
+            ? tr("未添加服务器 · 添加后在主页显示", "No servers yet · they appear on the main page once added")
+            : tr("\(count) 台 · 面板打开时每 5 分钟读取一次",
+                 "\(count) server(s) · read every 5 minutes while the panel is open")
+    }
+
+    private func saveVPS() {
+        guard !model.vpsSaving else { return }
+        model.onSaveVPS?(vpsVeidInput, vpsLabelInput, vpsKeyInput) { saved in
+            if saved {
+                vpsVeidInput = ""
+                vpsLabelInput = ""
+                vpsKeyInput = ""
+            }
         }
     }
 
@@ -1884,7 +2030,7 @@ struct ProviderCard: View {
     }
 }
 
-private struct UsageBar: View {
+struct UsageBar: View {
     let percent: Double
     let theme: PanelTheme
     @State private var animated = false
@@ -1974,6 +2120,39 @@ private struct WideButton: View {
         .buttonStyle(.plain)
         .animation(.easeOut(duration: 0.15), value: hovering)
         .onHover { hovering = $0 }
+    }
+}
+
+/// 列表行末尾的图标按钮。
+///
+/// 与 `DestructiveButton` 分开是因为它们回答的不是同一个问题：那个是设置页里一段
+/// 独立操作的主按钮，理应显眼且占满半行；这个挂在一行内容的末尾，行的主体是内容
+/// 本身，动作要退到后面去。破坏性的提示交给悬停时的红色和之后的二次确认，常态
+/// 不喊——一列常驻的红按钮会让整节看起来像是在推销删除。
+private struct RowIconButton: View {
+    let icon: String
+    let theme: PanelTheme
+    let label: String
+    let hint: String
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(hovering ? theme.statusCritical : theme.textTertiary)
+                .frame(width: 20, height: 20)
+                .background(
+                    Circle().fill(hovering ? theme.statusCritical.opacity(0.12) : .clear)
+                )
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .animation(.easeOut(duration: 0.15), value: hovering)
+        .onHover { hovering = $0 }
+        .accessibilityLabel(label)
+        .accessibilityHint(hint)
     }
 }
 

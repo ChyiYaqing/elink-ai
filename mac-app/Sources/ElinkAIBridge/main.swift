@@ -20,6 +20,9 @@ let meshMonitor = MeshMonitor(
     store: usageStore,
     lighthouseURL: MeshMonitor.lighthouseURL(from: MeshMonitor.lighthouse)
 )
+// KiwiVM 面板的只读镜像。这里只构造：它的轮询挂在菜单栏面板的开关上，因为
+// KiwiVM 的调用是计量的，而没人看着的时候读到的数字不会被任何人用到。
+let kiwiMonitor = KiwiVMMonitor(credentials: KiwiVMCredentialStore.shared.load())
 cluster.localStatusProvider = { status.localSnapshotForSync() }
 // backfill 和时区重分桶共用一条串行队列：并发解析会读到可变的全局时区，产生混合桶。
 // runUsageMaintenance 自查“已应用分桶时区”与当前时区，过期任务自然变成 no-op，
@@ -95,7 +98,8 @@ app.setActivationPolicy(.accessory)
 // 不显示菜单栏的应用同样需要主菜单：面板里每个输入框的 Cmd+C/V 都靠它分发
 EditMenu.install(into: app)
 let menu = MenuBarController(usage: usage, status: status, cluster: cluster,
-                             link: linkMonitor, mesh: meshMonitor, port: port)
+                             link: linkMonitor, mesh: meshMonitor, kiwi: kiwiMonitor,
+                             port: port)
 _ = menu
 linkMonitor.start()
 // 没配 lighthouse 就不起探测：没有名册就没有设备清单，空转只会白发包

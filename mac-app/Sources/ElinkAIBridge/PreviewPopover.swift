@@ -10,6 +10,7 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
     private let updater = UpdateChecker()
     private let link: LinkMonitor
     private let mesh: MeshMonitor
+    private let kiwi: KiwiVMMonitor
     private let port: UInt16
     private var pollTimer: Timer?
     private var clickMonitor: Any?
@@ -20,14 +21,16 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
     private var loadingSessions = false
 
     init(status: StatusService, usage: UsageFetcher, cluster: ClusterManager,
-         link: LinkMonitor, mesh: MeshMonitor, port: UInt16) {
+         link: LinkMonitor, mesh: MeshMonitor, kiwi: KiwiVMMonitor, port: UInt16) {
         self.status = status
         self.usage = usage
         self.cluster = cluster
         self.link = link
         self.mesh = mesh
+        self.kiwi = kiwi
         self.port = port
         super.init()
+        model.vpsServers = KiwiVMCredentialStore.shared.servers()
         model.deviceConnectionEnabled = DeviceClient.isEnabled
         if !model.deviceConnectionEnabled {
             model.deviceSummary = tr("屏幕连接已关闭", "Screen Connection off")
@@ -212,9 +215,14 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
             Log.user("open device status page \(base.appendingPathComponent("v1/device").absoluteString)")
             NSWorkspace.shared.open(base.appendingPathComponent("v1/device"))
         }
+        model.onSaveVPS = { [weak self] veid, label, apiKey, completion in
+            self?.saveVPSCredential(veid: veid, label: label, apiKey: apiKey,
+                                    completion: completion)
+        }
+        model.onRemoveVPS = { [weak self] veid in self?.removeVPSCredential(veid: veid) }
         let hosting = NSHostingController(
             rootView: UsagePanelView(model: model, updater: updater, cluster: cluster,
-                                     mesh: mesh)
+                                     mesh: mesh, kiwi: kiwi)
         )
         hosting.sizingOptions = .preferredContentSize
         popover.contentViewController = hosting
@@ -269,15 +277,98 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
         reload()
         // 常规节拍是 30 秒；打开时补一轮，第一眼的数字才不至于旧到一个节拍
         mesh.refreshIfStale()
+        // KiwiVM 的调用是计量的，所以它只在面板开着时跑：没人在看的时候读一次 VPS
+        // 状态，换不回任何东西，却实实在在花掉一次配额。
+        model.vpsServers = KiwiVMCredentialStore.shared.servers()
+        kiwi.start()
+        kiwi.refreshIfStale()
     }
 
     func popoverDidClose(_ notification: Notification) {
         pollTimer?.invalidate()
         pollTimer = nil
         sessionMonitor.reset()
+        kiwi.stop()
         if let clickMonitor {
             NSEvent.removeMonitor(clickMonitor)
             self.clickMonitor = nil
+        }
+    }
+
+    /// 先向 KiwiVM 验证再落盘，与保存 Claude token 是同一套纪律：写进 Keychain 的
+    /// 凭据必须是已知可用的，否则用户要等到下一个轮询周期才发现自己粘错了一个字符。
+    /// 验证用的那次响应直接上屏，既省一次计量调用，也让第一行数字立刻出现。
+    private func saveVPSCredential(veid: String, label: String, apiKey: String,
+                                   completion: @escaping (Bool) -> Void) {
+        guard let veid = KiwiVMCredentialStore.normalizedVeid(veid) else {
+            model.settingsMessage = KiwiVMCredentialError.invalidVeid.errorDescription
+            completion(false)
+            return
+        }
+        guard let key = KiwiVMCredentialStore.normalizedApiKey(apiKey) else {
+            model.settingsMessage = KiwiVMCredentialError.invalidApiKey.errorDescription
+            completion(false)
+            return
+        }
+        let credential = VpsCredential(
+            veid: veid,
+            label: KiwiVMCredentialStore.normalizedLabel(label, veid: veid),
+            apiKey: key
+        )
+        model.vpsSaving = true
+        model.settingsMessage = tr("正在向 KiwiVM 验证…", "Validating with KiwiVM…")
+        kiwi.probe(credential: credential) { [weak self] result in
+            guard let self else { completion(false); return }
+            self.model.vpsSaving = false
+            switch result {
+            case .success:
+                do {
+                    try KiwiVMCredentialStore.shared.save(credential)
+                    self.model.vpsServers = KiwiVMCredentialStore.shared.servers()
+                    self.kiwi.reconfigure(credentials: KiwiVMCredentialStore.shared.load())
+                    self.model.settingsMessage = tr("\(credential.label) 已验证并保存",
+                                                    "\(credential.label) validated and saved")
+                    Log.user("save kiwivm credential veid=\(veid)")
+                    completion(true)
+                } catch {
+                    self.model.settingsMessage = error.localizedDescription
+                    Log.warning("save kiwivm credential veid=\(veid) failed: \(error.localizedDescription)",
+                                category: "kiwivm")
+                    completion(false)
+                }
+            case let .failure(error):
+                self.model.settingsMessage = Self.vpsProbeMessage(error)
+                Log.warning("validate kiwivm credential veid=\(veid) failed: \(error)",
+                            category: "kiwivm")
+                completion(false)
+            }
+        }
+    }
+
+    static func vpsProbeMessage(_ error: VpsFetchError) -> String {
+        switch error {
+        case .rejected:
+            return tr("KiwiVM 拒绝了这组 VM ID 和 API key，请核对后重试",
+                      "KiwiVM rejected this VM ID and API key; check them and try again")
+        case .unreachable:
+            return tr("连不上 KiwiVM，请稍后重试", "Cannot reach KiwiVM; try again shortly")
+        case .malformed:
+            return tr("KiwiVM 返回了看不懂的内容", "KiwiVM returned something unreadable")
+        }
+    }
+
+    private func removeVPSCredential(veid: String) {
+        do {
+            try KiwiVMCredentialStore.shared.remove(veid: veid)
+            model.vpsServers = KiwiVMCredentialStore.shared.servers()
+            kiwi.reconfigure(credentials: KiwiVMCredentialStore.shared.load())
+            model.settingsMessage = tr("已移除该服务器的 API key",
+                                       "The server's API key has been removed")
+            Log.user("remove kiwivm credential veid=\(veid)")
+        } catch {
+            model.settingsMessage = error.localizedDescription
+            Log.warning("remove kiwivm credential veid=\(veid) failed: \(error.localizedDescription)",
+                        category: "kiwivm")
         }
     }
 
