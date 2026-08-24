@@ -6,6 +6,26 @@ and `Removed`.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## 0.1.21-rc5
+
+### Added
+
+- The macOS panel can monitor Bandwagon VPS instances through KiwiVM. The main
+  page shows state, memory, disk, and monthly traffic at a glance, while a
+  read-only detail page includes load, addresses, SSH port, OS, and the traffic
+  reset date. API credentials are validated before being stored locally.
+- An optional LaunchAgent helper can anchor Claude's rolling five-hour window
+  to chosen workday boundaries by sending a minimal Haiku message only when no
+  window is active.
+
+### Fixed
+
+- Expired Claude credentials are now renewed by delegating to the installed
+  Claude CLI, avoiding stale usage data while an otherwise idle Claude session
+  is open and leaving refresh-token rotation to its owner.
+- Copy, cut, paste, and select-all keyboard shortcuts work again in the
+  menu-bar panel's token, pairing, cluster, and lighthouse text fields.
+
 ## 0.1.21-rc4
 
 ### Packaging
