@@ -9,6 +9,8 @@ from PIL import Image, ImageDraw, ImageFont
 from . import __version__
 from .models import ProviderStatus, RecentEvent, SessionSummary, StatusSnapshot
 
+_CPU_CORES = os.cpu_count() or 1
+
 
 class DashboardRenderer:
     width = 648
@@ -37,6 +39,10 @@ class DashboardRenderer:
 
     def __init__(self, font_path: str = ""):
         self.font_path = self._find_font(font_path)
+        self._bold_font_path = self._bold_variant(self.font_path)
+        # 字体按 (size, bold) 缓存。每次重新 truetype 都会丢掉 FreeType 的字形
+        # 缓存，而一帧监控页要取二十多次字体，重复开销比真正的绘制还大。
+        self._fonts: dict[tuple[int, bool], ImageFont.FreeTypeFont | ImageFont.ImageFont] = {}
 
     def render(self, snapshot: StatusSnapshot, *, stale: bool = False,
                mode: str = "dashboard", updated_at: datetime | None = None) -> Image.Image:
@@ -316,15 +322,26 @@ class DashboardRenderer:
         return text + suffix
 
     def _font(self, size: int, bold: bool = True) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-        path = self.font_path
-        if bold and path.endswith("DejaVuSans.ttf"):
-            bold_path = path.replace("DejaVuSans.ttf", "DejaVuSans-Bold.ttf")
-            if Path(bold_path).exists():
-                path = bold_path
+        font = self._fonts.get((size, bold))
+        if font is None:
+            font = self._load_font(size, bold)
+            self._fonts[(size, bold)] = font
+        return font
+
+    def _load_font(self, size: int, bold: bool) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+        path = self._bold_font_path if bold else self.font_path
         try:
             return ImageFont.truetype(path, size=size)
         except (OSError, ValueError):
             return ImageFont.load_default(size=size)
+
+    @staticmethod
+    def _bold_variant(path: str) -> str:
+        if path.endswith("DejaVuSans.ttf"):
+            bold_path = path.replace("DejaVuSans.ttf", "DejaVuSans-Bold.ttf")
+            if Path(bold_path).exists():
+                return bold_path
+        return path
 
     def _fit_font(self, draw: ImageDraw.ImageDraw, text: str, *, preferred: int,
                   minimum: int, max_width: int,
@@ -359,7 +376,7 @@ class DashboardRenderer:
         return boxes
 
     def _monitor_cards(self, mon, panel):
-        cores = os.cpu_count() or 1
+        cores = _CPU_CORES
         cpu_pct = mon.cpu_percent
         if cpu_pct is None:
             cpu_pct = min(100.0, mon.load_1m / cores * 100)

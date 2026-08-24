@@ -74,6 +74,7 @@ class SystemMonitor:
         self._prev_cpu: tuple[int, int] | None = None
         self._prev_net: NetTotals | None = None
         self._prev_net_ts: float | None = None
+        self._vcgencmd_missing = False
         self._rate_rx_bps: float | None = None
         self._rate_tx_bps: float | None = None
 
@@ -175,13 +176,18 @@ class SystemMonitor:
         percent = 100.0 * usage.used / usage.total if usage.total else 0.0
         return usage.total, usage.used, percent
 
-    @staticmethod
-    def _temperature() -> float | None:
+    def _temperature(self) -> float | None:
         try:
             value = int(Path(SystemMonitor.THERMAL_ZONE).read_text().strip())
             return value / 1000.0
         except (OSError, ValueError):
             pass
+        # 没有 vcgencmd 的机器（任何非树莓派）不必每次采样都再 fork 一次去确认
+        if self._vcgencmd_missing:
+            return None
+        return self._vcgencmd_temperature()
+
+    def _vcgencmd_temperature(self) -> float | None:
         try:
             output = subprocess.run(
                 ["vcgencmd", "measure_temp"],
@@ -189,9 +195,15 @@ class SystemMonitor:
                 text=True,
                 timeout=2,
             ).stdout
+        except FileNotFoundError:
+            self._vcgencmd_missing = True
+            return None
+        except (OSError, subprocess.SubprocessError):
+            return None
+        try:
             raw = output.split("=", 1)[-1].strip().replace("'C", "").replace("C", "")
             return float(raw)
-        except (OSError, ValueError, subprocess.SubprocessError):
+        except ValueError:
             return None
 
     @staticmethod

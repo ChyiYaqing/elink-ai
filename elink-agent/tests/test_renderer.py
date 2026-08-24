@@ -311,3 +311,10 @@ def test_monitor_panel_card_reflects_refresh_error():
     assert renderer._panel_value(panel) == "ERROR"
     image = renderer.render_monitor(_monitor(), updated_at=FIXED_TIME, panel=panel)
     assert image.size == (648, 480)
+
+
+def test_fonts_are_cached_per_size_and_weight():
+    renderer = DashboardRenderer()
+    assert renderer._font(20, bold=True) is renderer._font(20, bold=True)
+    assert renderer._font(20, bold=True) is not renderer._font(20, bold=False)
+    assert renderer._font(20, bold=True) is not renderer._font(21, bold=True)
