@@ -92,6 +92,8 @@ do {
 
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
+// 不显示菜单栏的应用同样需要主菜单：面板里每个输入框的 Cmd+C/V 都靠它分发
+EditMenu.install(into: app)
 let menu = MenuBarController(usage: usage, status: status, cluster: cluster,
                              link: linkMonitor, mesh: meshMonitor, port: port)
 _ = menu
