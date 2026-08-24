@@ -8,6 +8,7 @@ from elink_agent.display.frame_diff import FrameDiffer
 from elink_agent.models import (ModelUsage, ProviderStatus, RecentEvent,
                                 SessionSummary, StatusSnapshot)
 from elink_agent.renderer import DashboardRenderer
+from elink_agent.system_monitor import MonitorSnapshot
 
 FIXED_TIME = datetime(2026, 7, 31, 9, 30, tzinfo=timezone.utc)
 
@@ -249,3 +250,64 @@ class TestStaleBadge:
 
         assert filled(self._cached()) is False
         assert filled(self._cached(usage_cached=False, primary_pct=None, weekly_pct=None)) is True
+
+
+def _monitor(**overrides) -> MonitorSnapshot:
+    base = MonitorSnapshot(
+        ts=1_783_933_000.0, load_1m=1.0, load_5m=0.8, load_15m=0.5,
+        cpu_percent=None, mem_total_kb=1_000_000, mem_available_kb=600_000,
+        mem_percent=40.0, disk_total=60 * 1024 ** 3, disk_used=12 * 1024 ** 3,
+        disk_percent=20.0, temp_c=47.0, uptime_s=90000.0,
+        net_rx_bps=1_000_000, net_tx_bps=500_000,
+        net_rx_total=1_000_000_000, net_tx_total=500_000_000, hostname="3BP",
+    )
+    return replace(base, **overrides)
+
+
+def test_render_monitor_is_one_bit_648_by_480():
+    image = DashboardRenderer().render_monitor(_monitor(), updated_at=FIXED_TIME, panel={})
+    assert image.size == (648, 480)
+    assert image.mode == "1"
+    assert image.convert("L").getextrema() == (0, 255)
+
+
+def test_monitor_cards_render_text_in_each_card():
+    image = DashboardRenderer().render_monitor(
+        _monitor(), updated_at=FIXED_TIME, panel={"last_refresh_kind": "region"}).convert("L")
+    for box in DashboardRenderer()._monitor_boxes():
+        x0, y0, x1, y1 = box
+        assert image.crop((x0, y0, x1, y1)).getextrema()[0] == 0, f"card {box} is blank"
+
+
+def test_monitor_boxes_do_not_overlap_and_stay_in_bounds():
+    renderer = DashboardRenderer()
+    boxes = renderer._monitor_boxes()
+    assert len(boxes) == 6
+    for box in boxes:
+        x0, y0, x1, y1 = box
+        assert x0 >= 0 and x1 <= renderer.width
+        assert y0 >= 0 and y1 <= renderer.height
+    for index, first in enumerate(boxes):
+        for second in boxes[index + 1:]:
+            overlaps = (first[0] < second[2] and second[0] < first[2]
+                        and first[1] < second[3] and second[1] < first[3])
+            assert not overlaps, f"{first} overlaps {second}"
+
+
+def test_monitor_single_card_change_stays_inside_its_card():
+    renderer = DashboardRenderer()
+    cpu_box = renderer._monitor_boxes()[0]
+    before = renderer.render_monitor(_monitor(load_1m=1.0), updated_at=FIXED_TIME, panel={})
+    after = renderer.render_monitor(_monitor(load_1m=3.0), updated_at=FIXED_TIME, panel={})
+    plan = FrameDiffer().plan(before, after)
+    assert plan.kind == "region"
+    _assert_within(plan.regions, cpu_box, renderer)
+
+
+def test_monitor_panel_card_reflects_refresh_error():
+    renderer = DashboardRenderer()
+    panel = {"last_refresh_kind": "full", "error": "display: SPI error",
+             "last_busy_wait_ms": 420}
+    assert renderer._panel_value(panel) == "ERROR"
+    image = renderer.render_monitor(_monitor(), updated_at=FIXED_TIME, panel=panel)
+    assert image.size == (648, 480)

@@ -83,6 +83,13 @@ counts successful non-full operations. A `smart` request may perform no panel
 operation when the rendered frame is unchanged; `partial` may safely fall back
 to a full operation when there is no trusted displayed-frame baseline.
 
+When the optional `[monitor]` idle screen is enabled, `content` is `"monitor"`
+while the panel shows the device-monitor page and `"ai"` while it shows the
+AI dashboard; `monitor.enabled`, `monitor.idle_after_s`, and `monitor.idle`
+report whether the feature is on, the idle threshold, and whether the panel
+currently sits on the monitor page. The monitor page is an idle fill-in, not a
+new selectable `mode` — `mode` stays `dashboard|claude|codex`.
+
 No endpoint accepts or returns OAuth tokens or raw session logs.
 
 ## Host peer sync protocol v2

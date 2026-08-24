@@ -23,6 +23,10 @@ class AgentConfig:
     full_refresh_every: int = 20
     full_refresh_interval_s: int = 21600
     orientation: int = 0
+    monitor_enabled: bool = False
+    monitor_idle_after_s: int = 300
+    monitor_refresh_interval_s: float = 60.0
+    monitor_net_sample_interval_s: float = 5.0
     bridge_url_env_override: str | None = None
 
     @classmethod
@@ -34,6 +38,7 @@ class AgentConfig:
             agent = data.get("agent", {})
             display = data.get("display", {})
             refresh = data.get("refresh", {})
+            monitor = data.get("monitor", {})
             config.bridge_url = str(agent.get("bridge_url", config.bridge_url)).rstrip("/")
             config.listen_host = str(agent.get("listen_host", config.listen_host))
             config.listen_port = int(agent.get("listen_port", config.listen_port))
@@ -49,6 +54,10 @@ class AgentConfig:
             config.coalesce_s = float(refresh.get("coalesce_s", config.coalesce_s))
             config.full_refresh_every = int(refresh.get("full_every", config.full_refresh_every))
             config.full_refresh_interval_s = int(refresh.get("full_interval_s", config.full_refresh_interval_s))
+            config.monitor_enabled = bool(monitor.get("enabled", config.monitor_enabled))
+            config.monitor_idle_after_s = int(monitor.get("idle_after_s", config.monitor_idle_after_s))
+            config.monitor_refresh_interval_s = float(monitor.get("refresh_interval_s", config.monitor_refresh_interval_s))
+            config.monitor_net_sample_interval_s = float(monitor.get("net_sample_interval_s", config.monitor_net_sample_interval_s))
         override = os.getenv("ELINK_BRIDGE_URL")
         if override:
             config.bridge_url = override.rstrip("/")

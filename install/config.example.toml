@@ -20,3 +20,17 @@ min_interval_s = 30
 coalesce_s = 2
 full_every = 20
 full_interval_s = 21600
+
+[monitor]
+# When AI usage is idle for `idle_after_s`, the panel flips to a device-monitor
+# page (CPU load, memory, disk, temperature, network, panel health). AI activity
+# (a working session or a permission request) flips it back to the AI dashboard.
+# With a single e-paper you get a live panel during quiet hours, not a frozen
+# dashboard. Set enabled = false to keep the dashboard always on screen.
+enabled = false
+idle_after_s = 300
+# How often the monitor page re-renders. Bounded below by `min_interval_s`;
+# the frame differ skips it when nothing actually changed.
+refresh_interval_s = 60
+# Sampling window used to derive network throughput from /proc/net/dev.
+net_sample_interval_s = 5

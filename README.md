@@ -60,8 +60,11 @@ percentages (collected locally from the day the feature is enabled).
 - token-category breakdown (input/output/cache read/cache write/reasoning) per range
 - English and Chinese interface language, switchable in settings at runtime
 - attention border for permission requests
-- smart, partial, periodic full, and manual full refresh
+- final full, and manual full refresh
 - stale/offline display, last-frame preview, and persistent device settings
+- device-monitor idle screen: when AI usage is idle the panel flips to a live
+  CPU / memory / disk / temperature / network / panel-health page and flips back
+  the moment a session starts (configurable via the `[monitor]` section)
 - menu-bar device discovery, DHCP/bridge self-healing, and detailed quota/reset status
 - exact last-frame preview with page switching and smart/full refresh controls
 - restart-safe quota caching with per-provider freshness and fallback status

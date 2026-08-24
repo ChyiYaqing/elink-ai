@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import tempfile
 import threading
@@ -461,3 +462,122 @@ def test_bridge_client_refuses_redirects_and_huge_bodies():
     finally:
         fat.shutdown()
         fat.server_close()
+
+
+# --- Device-monitor idle switching -------------------------------------------
+
+
+def _monitor_config(**overrides) -> AgentConfig:
+    base = AgentConfig(
+        output_path=Path("/tmp/frame.png"),
+        state_path=Path("/tmp/state.json"),
+        monitor_enabled=True,
+        monitor_idle_after_s=5,
+        monitor_refresh_interval_s=60,
+        coalesce_s=0,
+    )
+    return dataclasses.replace(base, **overrides)
+
+
+def _make_service(**overrides):
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        config = _monitor_config(output_path=root / "frame.png",
+                                 state_path=root / "state.json", **overrides)
+        return AgentService(config, MockDisplay(config.output_path))
+
+
+def test_target_content_switches_after_idle_threshold():
+    service = _make_service(monitor_idle_after_s=10)
+    service._last_ai_activity_at = 1000.0
+    assert service._target_content(1005) == "ai"
+    assert service._target_content(1011) == "monitor"
+
+
+def test_target_content_always_ai_when_monitor_disabled():
+    service = _make_service(monitor_enabled=False)
+    service._last_ai_activity_at = 1000.0
+    assert service._target_content(2000) == "ai"
+
+
+def test_ai_active_only_counts_current_work():
+    service = _make_service()
+    assert not service._ai_active(StatusSnapshot.offline())
+    assert service._ai_active(StatusSnapshot(
+        claude=ProviderStatus(status="working"), codex=ProviderStatus(status="idle")))
+    assert service._ai_active(StatusSnapshot(
+        claude=ProviderStatus(status="idle", needs_input=True)))
+
+
+def test_idle_switch_to_monitor_is_full_refresh():
+    service = _make_service(monitor_idle_after_s=5)
+    service._last_ai_activity_at = 0.0
+    service._displayed_content = "ai"
+    service.runtime.last_refresh_at = 0.0
+    decision = service._decide_refresh(100.0, False, None)
+    assert decision.refresh
+    assert decision.kind == "full"
+    assert decision.reason == "content-switch"
+    assert service._content == "monitor"
+
+
+def test_ai_activity_switches_back_from_monitor_to_ai():
+    service = _make_service(monitor_idle_after_s=5)
+    service._last_ai_activity_at = 0.0
+    service._displayed_content = "monitor"
+    service.runtime.last_refresh_at = 0.0
+    # AI 此刻又开工：即使已经 idle 很久，活动本身应立即把计时刷新并切回 AI 页
+    service.snapshot = StatusSnapshot(claude=ProviderStatus(status="working"),
+                                      codex=ProviderStatus(status="idle"))
+    decision = service._decide_refresh(100.0, False, None)
+    assert decision.refresh
+    assert decision.kind == "full"
+    assert decision.reason == "content-switch"
+    assert service._content == "ai"
+    # 计时被刷新：下一拍不会因为旧的 idle 计时误判回监控页
+    assert service._last_ai_activity_at == 100.0
+
+
+def test_monitor_tick_is_partial_and_respects_cadence():
+    service = _make_service(monitor_idle_after_s=5)
+    service._last_ai_activity_at = 0.0
+    service._displayed_content = "monitor"
+    service.runtime.last_refresh_at = 0.0
+    service._monitor_last_refresh_at = 0.0
+    first = service._decide_refresh(100.0, False, None)
+    assert first.refresh
+    assert first.kind == "partial"
+    assert first.reason == "monitor-tick"
+    # 刚刷过一次，下一拍仍在节奏窗口内 → 节流
+    service._monitor_last_refresh_at = 100.0
+    assert not service._decide_refresh(100.5, False, None).refresh
+
+
+def test_display_mode_is_preserved_for_monitor_health():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        config = _monitor_config(output_path=root / "frame.png",
+                                 state_path=root / "state.json")
+        display = MockDisplay(config.output_path)
+        service = AgentService(config, display)
+        service._content = "monitor"
+        service._displayed_content = "monitor"
+        service._refresh("full", False)
+        assert config.output_path.exists()
+        assert service._displayed_content == "monitor"
+        assert service.runtime.last_refresh_kind == "full"
+        assert service._monitor_snapshot is not None
+        info = service.device_info()
+        assert info["content"] == "monitor"
+        assert info["monitor"]["idle"] is True
+
+
+def test_manual_refresh_renders_current_content():
+    service = _make_service(monitor_idle_after_s=5)
+    service._last_ai_activity_at = 0.0
+    service._displayed_content = "monitor"
+    service.runtime.last_refresh_at = 0.0
+    decision = service._decide_refresh(100.0, False, "full")
+    assert decision.refresh
+    assert decision.kind == "full"
+    assert service._content == "monitor"

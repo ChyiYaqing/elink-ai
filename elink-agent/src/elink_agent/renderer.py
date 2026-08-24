@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from datetime import datetime
 from pathlib import Path
 
@@ -21,6 +22,14 @@ class DashboardRenderer:
     CODEX_BOX = (332, 74, 630, 458)
     SINGLE_BOX = (18, 74, 630, 458)
     FOOTER_BOX = (18, 459, 630, 476)
+
+    # Device-monitor grid: three rows, two cards per row. Kept fixed and
+    # non-overlapping so a region refresh stays inside the card that changed.
+    MONITOR_HEADER_BOX = (18, 8, 630, 66)
+    MONITOR_COL_LEFT = (18, 316)
+    MONITOR_COL_RIGHT = (332, 630)
+    MONITOR_ROWS = (76, 204, 332)
+    MONITOR_CARD_HEIGHT = 112
 
     _MODEL_ROWS = 4
     _MODEL_ROW_HEIGHT = 15
@@ -325,6 +334,151 @@ class DashboardRenderer:
             if draw.textbbox((0, 0), text, font=font)[2] <= max_width:
                 return font
         return self._font(minimum, bold=bold)
+
+    # ---------------------------------------------------------------------- #
+    #  Device-monitor page. Rendered straight to a full 648x480 frame; the
+    #  frame differ keeps region refreshes inside the card that changed.
+    # ---------------------------------------------------------------------- #
+
+    def render_monitor(self, mon, *, updated_at=None, panel=None) -> Image.Image:
+        updated_at = updated_at or datetime.now().astimezone()
+        image = Image.new("L", (self.width, self.height), 255)
+        draw = ImageDraw.Draw(image)
+        self._monitor_header(draw, mon, updated_at)
+        for box, spec in zip(self._monitor_boxes(), self._monitor_cards(mon, panel)):
+            self._monitor_card(draw, *box, **spec)
+        return image.convert("1", dither=Image.Dither.NONE)
+
+    def _monitor_boxes(self):
+        boxes = []
+        left_x0, left_x1 = self.MONITOR_COL_LEFT
+        right_x0, right_x1 = self.MONITOR_COL_RIGHT
+        for y0 in self.MONITOR_ROWS:
+            boxes.append((left_x0, y0, left_x1, y0 + self.MONITOR_CARD_HEIGHT))
+            boxes.append((right_x0, y0, right_x1, y0 + self.MONITOR_CARD_HEIGHT))
+        return boxes
+
+    def _monitor_cards(self, mon, panel):
+        cores = os.cpu_count() or 1
+        cpu_pct = mon.cpu_percent
+        if cpu_pct is None:
+            cpu_pct = min(100.0, mon.load_1m / cores * 100)
+        return [
+            dict(title="CPU", value=f"{mon.load_1m:.1f}", bar_pct=cpu_pct,
+                 sub=f"{cores}c · 5m {mon.load_5m:.1f} 15m {mon.load_15m:.1f}"),
+            dict(title="MEM", value=f"{mon.mem_percent:.0f}%", bar_pct=mon.mem_percent,
+                 sub=f"{self._fmt_bytes(mon.mem_available_kb * 1024)} free"),
+            dict(title="DISK", value=f"{mon.disk_percent:.0f}%", bar_pct=mon.disk_percent,
+                 sub=f"{self._fmt_bytes(mon.disk_used)} / {self._fmt_bytes(mon.disk_total)}"),
+            dict(title="TEMP", value=self._fmt_temp(mon.temp_c), bar_pct=self._temp_pct(mon.temp_c),
+                 sub="cpu thermal zone"),
+            dict(title="NET", value=self._net_rate(mon), bar_pct=None,
+                 sub=f"rx {self._fmt_bytes(mon.net_rx_total)} · tx {self._fmt_bytes(mon.net_tx_total)}"),
+            dict(title="PANEL", value=self._panel_value(panel), bar_pct=None,
+                 sub=self._panel_sub(panel)),
+        ]
+
+    def _monitor_card(self, draw, x0, y0, x1, y1, *, title, value, sub="",
+                      bar_pct=None) -> None:
+        draw.rounded_rectangle((x0, y0, x1, y1), radius=10, outline=0, width=2)
+        draw.text((x0 + 14, y0 + 10), title, font=self._font(15, bold=True), fill=0)
+        value_font = self._fit_font(
+            draw, value, preferred=30, minimum=20, max_width=(x1 - x0 - 28), bold=True)
+        draw.text((x0 + 14, y0 + 32), value, font=value_font, fill=0)
+        if bar_pct is not None:
+            self._progress(draw, x0 + 14, y1 - 36, x1 - 14, bar_pct, height=12)
+        if sub:
+            font = self._font(12, bold=False)
+            draw.text((x0 + 14, y1 - 15), self._truncate(draw, sub, font, x1 - x0 - 28),
+                      font=font, fill=0)
+
+    def _monitor_header(self, draw, mon, updated_at) -> None:
+        draw.text((18, 12), "DEVICE MONITOR", font=self._font(30, bold=True), fill=0)
+        stamp = updated_at.strftime("Updated %H:%M")
+        stamp_font = self._font(14)
+        stamp_w = draw.textbbox((0, 0), stamp, font=stamp_font)[2]
+        draw.text((630 - stamp_w, 14), stamp, font=stamp_font, fill=0)
+        up = self._uptime_str(mon.uptime_s)
+        up_font = self._font(16, bold=True)
+        up_w = draw.textbbox((0, 0), up, font=up_font)[2]
+        draw.text((630 - up_w, 38), up, font=up_font, fill=0)
+        draw.line((18, 64, 630, 64), fill=0, width=2)
+
+    @staticmethod
+    def _panel_value(panel) -> str:
+        if not panel:
+            return "WAIT"
+        if panel.get("error"):
+            return "ERROR"
+        kind = panel.get("last_refresh_kind") or "none"
+        return kind.upper()
+
+    @staticmethod
+    def _panel_sub(panel) -> str:
+        if not panel:
+            return "no refresh yet"
+        parts = []
+        kind = panel.get("last_refresh_kind") or "none"
+        parts.append(kind)
+        regions = panel.get("last_refresh_region_count")
+        if regions:
+            parts.append(f"{regions} win")
+        busy = panel.get("last_busy_wait_ms")
+        if busy:
+            parts.append(f"busy {busy}ms")
+        if panel.get("error"):
+            parts.append("error")
+        return " · ".join(parts)
+
+    @staticmethod
+    def _net_rate(mon) -> str:
+        if mon.net_rx_bps is None and mon.net_tx_bps is None:
+            return "—"
+        down = DashboardRenderer._fmt_rate(mon.net_rx_bps)
+        up = DashboardRenderer._fmt_rate(mon.net_tx_bps)
+        return f"RX {down} · TX {up}"
+
+    @staticmethod
+    def _fmt_rate(bps: float | None) -> str:
+        if bps is None:
+            return "—"
+        if bps >= 1_000_000:
+            return f"{bps / 1_000_000:.1f}M/s"
+        if bps >= 1_000:
+            return f"{bps / 1_000:.1f}K/s"
+        return f"{bps:.0f}B/s"
+
+    @staticmethod
+    def _fmt_bytes(value: int) -> str:
+        if value >= 1 << 30:
+            return f"{value / (1 << 30):.1f}G"
+        if value >= 1 << 20:
+            return f"{value / (1 << 20):.0f}M"
+        if value >= 1 << 10:
+            return f"{value / (1 << 10):.0f}K"
+        return f"{value}B"
+
+    @staticmethod
+    def _fmt_temp(temp: float | None) -> str:
+        return "—" if temp is None else f"{temp:.1f}°C"
+
+    @staticmethod
+    def _temp_pct(temp: float | None) -> float | None:
+        if temp is None:
+            return None
+        return min(100.0, temp / 85.0 * 100)
+
+    @staticmethod
+    def _uptime_str(seconds: float) -> str:
+        seconds = int(seconds)
+        days = seconds // 86400
+        hours = (seconds % 86400) // 3600
+        minutes = (seconds % 3600) // 60
+        if days:
+            return f"up {days}d {hours}h"
+        if hours:
+            return f"up {hours}h {minutes}m"
+        return f"up {minutes}m"
 
     @staticmethod
     def _find_font(configured: str) -> str:
