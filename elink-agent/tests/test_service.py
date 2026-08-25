@@ -580,6 +580,34 @@ def test_the_dwell_clock_starts_when_the_monitor_page_reaches_the_panel():
     assert service._monitor_shown_at > 0.0
 
 
+def test_monitor_cadence_is_not_floored_by_the_global_min_interval():
+    """监控页是定时采样，节拍该由它自己定。
+
+    min_interval_s 管的是数据驱动页面的抖动（AI 页一有变化就想刷），把监控页的
+    采样节奏也压在同一个地板下，就没法在不加快 AI 页的前提下让监控数据动起来。
+    """
+    service = _make_service(monitor_idle_after_s=5, monitor_refresh_interval_s=2,
+                            min_refresh_interval_s=30)
+    service._last_ai_activity_at = 0.0
+    service._displayed_content = "monitor"
+    service._monitor_last_refresh_at = 100.0
+    service.runtime.last_refresh_at = 100.0
+    decision = service._decide_refresh(103.0, False, None)
+    assert decision.refresh, "3 秒后应当已经过了监控页自己的 2 秒节拍"
+    assert decision.kind == "partial"
+
+
+def test_monitor_cadence_never_goes_below_the_panel_cycle():
+    """配得再小也没用：面板一次局部刷新要 1.28 秒，更密只会排队。"""
+    service = _make_service(monitor_idle_after_s=5, monitor_refresh_interval_s=0.1)
+    service._last_ai_activity_at = 0.0
+    service._displayed_content = "monitor"
+    service._monitor_last_refresh_at = 100.0
+    service.runtime.last_refresh_at = 100.0
+    assert not service._decide_refresh(100.5, False, None).refresh
+    assert service._decide_refresh(100.0 + AgentService.PANEL_MIN_REFRESH_S, False, None).refresh
+
+
 def test_monitor_tick_is_partial_and_respects_cadence():
     service = _make_service(monitor_idle_after_s=5)
     service._last_ai_activity_at = 0.0

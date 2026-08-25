@@ -72,6 +72,10 @@ class RuntimeState:
 
 
 class AgentService:
+    # 面板一次局部刷新的实测周期（3BP / 5.83" V2）：423ms BUSY + 驱动固定时序。
+    # 比这更密地下发刷新只会排队，不会让画面更快。
+    PANEL_MIN_REFRESH_S = 1.5
+
     def __init__(self, config: AgentConfig, display: Display):
         self.config = config
         self.display = display
@@ -271,7 +275,11 @@ class AgentService:
 
         内容切换已在上层处理，这里只管同内容下按时间重绘。
         """
-        cadence = max(self.config.min_refresh_interval_s, self.config.monitor_refresh_interval_s)
+        # 监控页的节拍由它自己的配置决定，只受面板物理周期的约束，不再被全局的
+        # min_interval_s 拖住：那个地板管的是数据驱动页面的抖动（AI 页一有变化就
+        # 想刷），而监控页是定时采样，两者该分开定。真机实测一次局部刷新 1.28s，
+        # 其中 423ms 是面板 BUSY，剩下是驱动的固定复位时序——比这更快没有意义。
+        cadence = max(self.PANEL_MIN_REFRESH_S, self.config.monitor_refresh_interval_s)
         if self._monitor_last_refresh_at and now_wall - self._monitor_last_refresh_at < cadence:
             return RefreshDecision(False, reason="throttled")
         if (self._monitor_partials_since_full >= self.config.full_refresh_every
