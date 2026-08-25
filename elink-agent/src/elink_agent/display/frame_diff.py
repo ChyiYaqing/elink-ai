@@ -40,6 +40,9 @@ class FrameDiffer:
     # 碎片多到这个数量就不再逐对合并：整页都在变，挑也没用
     MERGE_LIMIT = 32
 
+    # 窗口数的硬上限。再多就不如整屏重画：一个窗口约 350ms BUSY，整屏 4.5s。
+    max_windows = 10
+
     # 窗口数就是成本：面板的分区窗口寄存器一次只认一个，所以每个窗口都要自己走
     # 一遍刷新周期，各付一次约 350ms 的 BUSY。面积反而几乎免费——4MHz 下 3KB 只要
     # 6ms。所以预算的取法是「在不越过面积阈值的前提下窗口尽量少」：真机上监控页
@@ -75,9 +78,20 @@ class FrameDiffer:
         if difference.getbbox() is None:
             return RefreshPlan("none")
 
-        regions = self._merge_to_budget(self._regions(difference))
+        clusters = self._regions(difference)
+        regions = self._merge_to_budget(clusters, self.max_regions)
         planned_area = sum(region.area for region in regions)
         if planned_area / screen_area > self.fast_full_threshold:
+            # 合并得太狠会把面积撑过阈值。与其整屏重画，不如多花几个窗口：一个
+            # 窗口约 350ms BUSY，整屏重画是 4.5s，所以在 max_windows 之前多开窗口
+            # 总是划算的，而且不会在屏上留下一次整页重绘。
+            for budget in range(self.max_regions + 1, self.max_windows + 1):
+                candidate = self._merge_to_budget(clusters, budget)
+                candidate_area = sum(region.area for region in candidate)
+                if candidate_area / screen_area <= self.fast_full_threshold:
+                    return RefreshPlan("region", candidate, candidate_area, "pixel-change")
+                if len(candidate) < budget:
+                    break  # 已经并无可并，再放宽预算也没有新解
             return RefreshPlan("fast-full", planned_area=screen_area,
                                reason="region-area-threshold")
         return RefreshPlan("region", regions, planned_area, "pixel-change")
@@ -141,7 +155,7 @@ class FrameDiffer:
             ))
         return tuple(sorted(regions, key=lambda value: (value.top, value.left)))
 
-    def _merge_to_budget(self, regions: tuple[Rect, ...]) -> tuple[Rect, ...]:
+    def _merge_to_budget(self, regions: tuple[Rect, ...], budget: int) -> tuple[Rect, ...]:
         """把区域数收进预算，每次合并「多出来的面积最小」的一对。
 
         原来的做法是一旦超预算就把所有区域并成一个外接矩形，那等于让相距最远的
@@ -151,12 +165,12 @@ class FrameDiffer:
         碎片多到 MERGE_LIMIT 以上时不值得再挑：那说明整页都在变，并成一块交给
         面积阈值判定即可，也免得在树莓派上跑一个 O(n³) 的合并。
         """
-        if len(regions) <= self.max_regions:
+        if len(regions) <= budget:
             return regions
         if len(regions) > self.MERGE_LIMIT:
             return (self._union(regions),)
         merged = list(regions)
-        while len(merged) > self.max_regions:
+        while len(merged) > budget:
             best_cost = best_pair = None
             for first in range(len(merged)):
                 for second in range(first + 1, len(merged)):

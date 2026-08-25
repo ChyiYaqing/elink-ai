@@ -1,4 +1,4 @@
-from PIL import Image, ImageDraw
+from PIL import Image, ImageChops, ImageDraw
 import pytest
 
 from elink_agent.display.frame_diff import FrameDiffer, Rect
@@ -90,3 +90,42 @@ def test_large_planned_region_uses_fast_full():
     assert plan.kind == "fast-full"
     assert plan.reason == "region-area-threshold"
     assert plan.regions == ()
+
+
+def _six_tall_bars():
+    """六根细高条：任意两根并起来都是一个很宽的盒子，硬并到 4 个窗口就要 36% 的屏。"""
+    previous = frame()
+    current = previous.copy()
+    draw = ImageDraw.Draw(current)
+    for x in (16, 140, 264, 388, 512, 624):
+        draw.rectangle((x, 40, x + 7, 439), fill=0)
+    return previous, current
+
+
+def test_extra_windows_are_preferred_over_repainting_the_whole_screen():
+    """并得太狠会把面积撑过阈值，那就多开窗口，而不是整屏重画。
+
+    一个窗口约 350ms BUSY，整屏重画是 4.5s，而且在屏上是看得见的一次全页重绘。
+    """
+    previous, current = _six_tall_bars()
+    differ = FrameDiffer(max_regions=4)
+    strict = differ._merge_to_budget(differ._regions(
+        ImageChops.difference(previous.convert("L"), current.convert("L"))), 4)
+    strict_area = sum(region.area for region in strict)
+    assert strict_area / (648 * 480) > differ.fast_full_threshold, "这个场景本该触发整屏"
+
+    plan = differ.plan(previous, current)
+    assert plan.kind == "region", "宁可多开窗口也不要整屏重画"
+    assert len(plan.regions) > differ.max_regions
+    assert len(plan.regions) <= differ.max_windows
+    assert plan.planned_area < strict_area
+    assert plan.planned_area / (648 * 480) <= differ.fast_full_threshold
+
+
+def test_a_change_too_large_for_any_window_count_still_falls_back_to_fast_full():
+    previous = frame()
+    current = previous.copy()
+    ImageDraw.Draw(current).rectangle((0, 0, 499, 399), fill=0)
+    plan = FrameDiffer().plan(previous, current)
+    assert plan.kind == "fast-full"
+    assert plan.reason == "region-area-threshold"
