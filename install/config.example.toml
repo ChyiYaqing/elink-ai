@@ -14,6 +14,11 @@ output_path = "/var/lib/elink-ai/last-frame.png"
 state_path = "/var/lib/elink-ai/state.json"
 font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 orientation = 0
+# 两次刷新之间保持面板初始化状态的最长秒数。0 = 每次刷新后立刻休眠断电（默认，
+# 也是 Waveshare 要求的长期状态）。设成几秒可以让密集的局部刷新跳过复位时序，
+# 单次从约 1.25 秒降到约 0.55 秒；窗口一过主循环会立刻让它休眠。不要设很大的
+# 值：面板长期停在上电状态会一直处于高压，可能造成永久损伤。
+keep_awake_s = 0
 
 [refresh]
 min_interval_s = 30

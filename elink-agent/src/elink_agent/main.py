@@ -16,7 +16,7 @@ def build_display(config: AgentConfig):
         return MockDisplay(config.output_path)
     if config.display_driver == "waveshare_5in83_v2":
         from .display.waveshare_5in83_v2 import Waveshare583V2Display
-        return Waveshare583V2Display()
+        return Waveshare583V2Display(keep_awake_s=config.display_keep_awake_s)
     raise ValueError(f"unsupported display driver: {config.display_driver}")
 
 

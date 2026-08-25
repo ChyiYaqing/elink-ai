@@ -21,7 +21,15 @@ class Waveshare583V2Display(Display):
     BUSY_PIN = 24
     PWR_PIN = 18
 
-    def __init__(self, *, busy_timeout_s: float = 60.0):
+    def __init__(self, *, busy_timeout_s: float = 60.0, keep_awake_s: float = 0.0):
+        """`keep_awake_s` 是两次刷新之间保持面板初始化状态的最长时间。
+
+        默认 0，即每次刷新后立刻 deep sleep 并断电——Waveshare 要求不刷新时让屏
+        进入休眠，长时间停在上电状态会让面板持续处于高压，可能造成永久损伤。所以
+        这个窗口只用来覆盖「下一拍马上就来」的情形：跳过复位（402ms）、上电等待
+        和收尾休眠（200ms+BUSY），一次局部刷新从约 1.25 秒降到约 0.55 秒。窗口一
+        过，主循环的 idle() 会立即把它放回休眠。
+        """
         try:
             import gpiozero
             import spidev
@@ -36,6 +44,10 @@ class Waveshare583V2Display(Display):
         self.last_busy_wait_s = 0.0
         self._lock = Lock()
         self._opened = False
+        self._keep_awake_s = max(0.0, keep_awake_s)
+        # 面板当前保持着哪一种初始化（partial / full），None 表示已休眠断电
+        self._awake_mode: str | None = None
+        self._awake_until = 0.0
 
     def show(self, image: Image.Image, *, kind: str = "full",
              regions: tuple[Rect, ...] = ()) -> None:
@@ -48,24 +60,31 @@ class Waveshare583V2Display(Display):
             packed = image.convert("1", dither=Image.Dither.NONE).tobytes()
             if len(packed) != self.width * self.height // 8:
                 raise ValueError("unexpected packed image size")
+        mode = "full" if kind == "full" else "partial"
         with self._lock:
             self.last_busy_wait_s = 0.0
             try:
                 self._open()
+                # 已经保持着同一种初始化就直接下发数据，省掉复位和上电等待
+                if self._awake_mode != mode:
+                    self._init_full() if mode == "full" else self._init_partial()
+                    self._awake_mode = mode
                 if kind == "region":
-                    self._init_partial()
                     self._display_regions(image, regions)
                 elif kind in {"partial", "fast-full"}:
-                    self._init_partial()
                     self._display_partial(packed)
                 elif kind == "full":
-                    self._init_full()
                     self._display_full(packed)
                 else:
                     raise ValueError(f"unsupported refresh kind: {kind}")
-                self._sleep()
-            finally:
-                self._close_bus()
+            except BaseException:
+                # 出了任何问题都别把面板丢在上电状态上
+                self._park(graceful=False)
+                raise
+            if self._keep_awake_s > 0:
+                self._awake_until = time.monotonic() + self._keep_awake_s
+            else:
+                self._park()
 
     def _open(self) -> None:
         self._power.on()
@@ -168,6 +187,27 @@ class Waveshare583V2Display(Display):
             raise ValueError("unexpected region payload size")
         return packed
 
+    def idle(self) -> None:
+        """保活窗口到期就休眠断电。主循环每一拍都会调用。"""
+        with self._lock:
+            if self._awake_mode is not None and time.monotonic() >= self._awake_until:
+                self._park()
+
+    def _park(self, *, graceful: bool = True) -> None:
+        """面板长期该待的状态：deep sleep + 断电。
+
+        出错路径上 graceful=False：面板可能已经卡住，再发一次休眠命令只会在
+        BUSY 上又等一个超时，还会用第二个异常盖住真正的失败原因。断电本身由
+        _close_bus() 完成，那才是安全上必须做到的一步。
+        """
+        try:
+            if graceful and self._awake_mode is not None:
+                self._sleep()
+        finally:
+            self._awake_mode = None
+            self._awake_until = 0.0
+            self._close_bus()
+
     def _sleep(self) -> None:
         self._command(0x50); self._data(0xF7)
         self._command(0x02); self._wait_busy()
@@ -181,5 +221,6 @@ class Waveshare583V2Display(Display):
         self._rst.off(); self._dc.off(); self._power.off()
 
     def close(self) -> None:
-        self._close_bus()
+        with self._lock:
+            self._park()
         self._rst.close(); self._dc.close(); self._power.close(); self._busy.close()

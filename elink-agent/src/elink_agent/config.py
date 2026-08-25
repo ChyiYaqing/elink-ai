@@ -23,6 +23,7 @@ class AgentConfig:
     full_refresh_every: int = 20
     full_refresh_interval_s: int = 21600
     orientation: int = 0
+    display_keep_awake_s: float = 0.0
     monitor_enabled: bool = False
     monitor_idle_after_s: int = 300
     monitor_min_dwell_s: float = 300.0
@@ -51,6 +52,8 @@ class AgentConfig:
             config.state_path = Path(display.get("state_path", config.state_path))
             config.font_path = str(display.get("font_path", config.font_path))
             config.orientation = int(display.get("orientation", config.orientation))
+            config.display_keep_awake_s = float(
+                display.get("keep_awake_s", config.display_keep_awake_s))
             config.min_refresh_interval_s = float(refresh.get("min_interval_s", config.min_refresh_interval_s))
             config.coalesce_s = float(refresh.get("coalesce_s", config.coalesce_s))
             config.full_refresh_every = int(refresh.get("full_every", config.full_refresh_every))

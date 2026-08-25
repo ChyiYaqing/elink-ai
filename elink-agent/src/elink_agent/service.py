@@ -346,6 +346,11 @@ class AgentService:
                         self.runtime.refresh_error = f"refresh: {error}"
                         self._display_retry_at = time.time() + 60
 
+            # 保活窗口过期后由这里把面板放回休眠；驱动不保活时是个空操作
+            try:
+                self.display.idle()
+            except Exception as error:
+                logger.warning("display idle failed: %s", error)
             self._wake.wait(self.config.poll_interval_s)
             self._wake.clear()
 

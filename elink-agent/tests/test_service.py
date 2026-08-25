@@ -580,6 +580,36 @@ def test_the_dwell_clock_starts_when_the_monitor_page_reaches_the_panel():
     assert service._monitor_shown_at > 0.0
 
 
+def test_the_loop_lets_the_display_park_itself():
+    """会在两次刷新之间保持上电的驱动，靠主循环把面板放回休眠。
+
+    没有这一步，最后一次刷新之后面板会一直停在上电状态——Waveshare 明确说那会让
+    它持续处于高压并可能永久损伤，所以这不是优化，是安全要求。
+    """
+    class ParkingDisplay(MockDisplay):
+        def __init__(self, path):
+            super().__init__(path)
+            self.idle_calls = 0
+
+        def idle(self) -> None:
+            self.idle_calls += 1
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        config = _monitor_config(output_path=root / "frame.png",
+                                 state_path=root / "state.json", poll_interval_s=0.05)
+        display = ParkingDisplay(config.output_path)
+        service = AgentService(config, display)
+        service.start()
+        try:
+            deadline = time.time() + 5
+            while display.idle_calls == 0 and time.time() < deadline:
+                time.sleep(0.05)
+        finally:
+            service.stop()
+        assert display.idle_calls > 0, "主循环从未给驱动收电源状态的机会"
+
+
 def test_monitor_ticks_do_not_wait_for_the_coalesce_window():
     """合并窗口是给会抖的页面去抖的，定时采样的页面排这个队只是白等一轮循环。
 
