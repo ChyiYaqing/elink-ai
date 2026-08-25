@@ -580,6 +580,20 @@ def test_the_dwell_clock_starts_when_the_monitor_page_reaches_the_panel():
     assert service._monitor_shown_at > 0.0
 
 
+def test_the_loop_wakes_often_enough_to_honour_the_monitor_cadence():
+    """循环睡满 poll_interval_s 会让 refresh_interval_s 变成一句空话。
+
+    真机上配 2 秒的监控节拍实际跑成 4.8 秒：面板干活 1.8 秒，剩下 2 秒是刷完之后
+    白睡的。取数由 _next_fetch_at 单独把关，所以醒得勤不会多打桥接方一次。
+    """
+    service = _make_service(poll_interval_s=2.0, monitor_refresh_interval_s=2)
+    assert service._loop_tick_s() <= AgentService.LOOP_TICK_S
+    assert service._loop_tick_s() < 2.0
+    # 取数间隔比循环粒度还小时，不该反过来把循环拖慢
+    fast = _make_service(poll_interval_s=0.05)
+    assert fast._loop_tick_s() == 0.05
+
+
 def test_the_loop_lets_the_display_park_itself():
     """会在两次刷新之间保持上电的驱动，靠主循环把面板放回休眠。
 

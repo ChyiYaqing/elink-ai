@@ -75,6 +75,8 @@ class AgentService:
     # 面板一次局部刷新的实测周期（3BP / 5.83" V2）：423ms BUSY + 驱动固定时序。
     # 比这更密地下发刷新只会排队，不会让画面更快。
     PANEL_MIN_REFRESH_S = 1.5
+    # 循环重新做决定的粒度。决定本身很便宜，醒得勤只是让配置里的节拍能兑现。
+    LOOP_TICK_S = 0.5
 
     def __init__(self, config: AgentConfig, display: Display):
         self.config = config
@@ -204,6 +206,15 @@ class AgentService:
 
     def preview_path(self) -> Path:
         return self.config.output_path
+
+    def _loop_tick_s(self) -> float:
+        """循环醒来的粒度：决定「上一次刷新做完之后，最快多久能做出下一次决定」。
+
+        取数由 _next_fetch_at 单独把关，所以醒得勤不会增加对桥接方的请求。睡满
+        poll_interval_s 会让 refresh_interval_s 兑现不了：真机上配 2 秒的监控节拍
+        实际跑成 4.8 秒，其中 2 秒就是刷完之后白睡的。
+        """
+        return min(self.config.poll_interval_s, self.LOOP_TICK_S)
 
     def _target_content(self, now: float) -> str:
         """当前屏幕应当展示的内容：有 AI 活动时看 AI Usage，空闲久了看设备监控。"""
@@ -351,7 +362,7 @@ class AgentService:
                 self.display.idle()
             except Exception as error:
                 logger.warning("display idle failed: %s", error)
-            self._wake.wait(self.config.poll_interval_s)
+            self._wake.wait(self._loop_tick_s())
             self._wake.clear()
 
     def _refresh(self, kind: str, stale: bool) -> None:
