@@ -260,7 +260,8 @@ def _monitor(**overrides) -> MonitorSnapshot:
         disk_percent=20.0, temp_c=47.0, uptime_s=90000.0,
         net_rx_bps=1_000_000, net_tx_bps=500_000,
         net_rx_total=1_000_000_000, net_tx_total=500_000_000, hostname="3BP",
-        ip_address="192.168.31.42",
+        ip_address="10.1.9.16",
+        interfaces=(("wlan0", "10.1.9.16"), ("nebula1", "192.168.100.6")),
     )
     return replace(base, **overrides)
 
@@ -369,15 +370,37 @@ def test_rate_formatting_keeps_three_significant_digits():
     assert DashboardRenderer._fmt_rate(None) == "—"
 
 
-def test_monitor_strip_shows_the_ip_next_to_the_hostname():
+def test_monitor_strip_lists_every_interface_address():
     renderer = DashboardRenderer()
-    assert renderer._identity(_monitor()) == "3BP · 192.168.31.42"
-    assert renderer._identity(_monitor(ip_address=None)) == "3BP"
+    assert renderer._address_line(_monitor()) == "wlan0 10.1.9.16 · nebula1 192.168.100.6"
     strip = renderer._monitor_boxes()[5]
-    with_ip = renderer.render_monitor(_monitor(), updated_at=FIXED_TIME, panel={}).convert("L")
-    without = renderer.render_monitor(_monitor(ip_address=None),
-                                      updated_at=FIXED_TIME, panel={}).convert("L")
-    assert with_ip.crop(strip).tobytes() != without.crop(strip).tobytes()
+    both = renderer.render_monitor(_monitor(), updated_at=FIXED_TIME, panel={}).convert("L")
+    one = renderer.render_monitor(_monitor(interfaces=(("wlan0", "10.1.9.16"),)),
+                                  updated_at=FIXED_TIME, panel={}).convert("L")
+    assert both.crop(strip).tobytes() != one.crop(strip).tobytes()
+
+
+def test_address_line_falls_back_to_the_outbound_ip_without_interface_names():
+    """非 Linux 上取不到网卡名，但那一个地址仍然是「怎么连上它」的答案。"""
+    renderer = DashboardRenderer()
+    assert renderer._address_line(_monitor(interfaces=())) == "10.1.9.16"
+    assert renderer._address_line(_monitor(interfaces=(), ip_address=None)) == ""
+
+
+def test_addresses_never_reach_the_page_dots():
+    """地址列表再长也停在翻页点左侧，否则两页指示会被地址糊掉。"""
+    renderer = DashboardRenderer()
+    x0, y0, x1, y1 = renderer._monitor_boxes()[5]
+    many = tuple((f"nebula{index}", f"192.168.{index}.240") for index in range(6))
+    panel = {"last_refresh_kind": "region", "last_refresh_region_count": 3,
+             "last_busy_wait_ms": 423}
+    short = renderer.render_monitor(_monitor(interfaces=(("wlan0", "10.1.9.16"),)),
+                                    updated_at=FIXED_TIME, panel=panel).convert("L")
+    long = renderer.render_monitor(_monitor(interfaces=many),
+                                   updated_at=FIXED_TIME, panel=panel).convert("L")
+    dots = (x1 - renderer.MONITOR_DOTS_GUTTER, y0, x1, y1)
+    assert short.crop(dots).tobytes() == long.crop(dots).tobytes()
+    assert short.crop(dots).getextrema()[0] == 0, "expected the page dots to be drawn"
 
 
 def test_monitor_identity_never_runs_into_the_panel_state():

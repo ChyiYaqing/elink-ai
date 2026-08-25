@@ -84,9 +84,12 @@ operation when the rendered frame is unchanged; `partial` may safely fall back
 to a full operation when there is no trusted displayed-frame baseline.
 
 `ip_address` is the device's own IPv4 address on its default route, or `null`
-when the device has no route. It is the address a client should use to reach
-this endpoint, and it is also shown on the device-monitor page next to the
-hostname.
+when the device has no route. `interfaces` lists every non-loopback interface
+that has an IPv4 address as `{"name", "address"}`, in kernel interface order,
+so a device on an overlay network reports both its LAN and overlay addresses.
+Interfaces without an address are omitted, and the list is empty where named
+addresses cannot be read. The device-monitor page shows the same list in its
+panel strip.
 
 When the optional `[monitor]` idle screen is enabled, `content` is `"monitor"`
 while the panel shows the device-monitor page and `"ai"` while it shows the

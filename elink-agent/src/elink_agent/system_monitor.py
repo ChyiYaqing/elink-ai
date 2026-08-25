@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import fcntl
 import socket
+import struct
 import subprocess
 import time
 from collections import deque
@@ -48,6 +50,8 @@ class MonitorSnapshot:
     cpu_history: tuple[float, ...] = field(default_factory=tuple)
     # 出口路由上的本机 IPv4；没有可用网络时是 None
     ip_address: str | None = None
+    # 每张网卡的 (名字, IPv4)，按内核接口序，不含回环
+    interfaces: tuple[tuple[str, str], ...] = ()
 
     def signature(self) -> str:
         """变化的粒度：足够细以反映实时状态，但网络速率取整到 KiB/s 避免抖刷新。"""
@@ -63,6 +67,7 @@ class MonitorSnapshot:
             int(self.net_rx_bps // 1024) if self.net_rx_bps is not None else None,
             int(self.net_tx_bps // 1024) if self.net_tx_bps is not None else None,
             self.ip_address,
+            self.interfaces,
         ))
 
 
@@ -74,6 +79,7 @@ class SystemMonitor:
     STAT = "/proc/stat"
     THERMAL_ZONE = "/sys/class/thermal/thermal_zone0/temp"
     HISTORY_SAMPLES = 30
+    SIOCGIFADDR = 0x8915
 
     def __init__(self, *, net_sample_interval_s: float = 5.0):
         self.net_sample_interval_s = max(0.1, net_sample_interval_s)
@@ -122,6 +128,7 @@ class SystemMonitor:
             hostname=self._hostname,
             cpu_history=tuple(self._cpu_history),
             ip_address=self.primary_ipv4(),
+            interfaces=self.interface_ipv4s(),
         )
 
     def _update_rates(self, now: float, rx: int, tx: int) -> None:
@@ -227,6 +234,33 @@ class SystemMonitor:
             return float(lines[0].split()[0])
         except (IndexError, ValueError):
             return 0.0
+
+    @staticmethod
+    def interface_ipv4s() -> tuple[tuple[str, str], ...]:
+        """每张网卡的 IPv4，按内核接口序，跳过回环和没有地址的网卡。
+
+        用 ioctl 而不是 fork 一次 `ip -4 -o addr`：这是每个监控周期都要跑的采样器。
+        /proc 下没有带网卡名的 IPv4 表——`/proc/net/fib_trie` 只有地址，`if_inet6`
+        只有 IPv6——所以具名地址只能问内核要。SIOCGIFADDR 是 Linux 的号，别的系统
+        上这里整个取空，监控页退回出口 IP。
+        """
+        try:
+            names = socket.if_nameindex()
+            probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        except OSError:
+            return ()
+        found = []
+        with probe as sock:
+            for _, name in names:
+                if name == "lo":
+                    continue
+                try:
+                    packed = fcntl.ioctl(sock.fileno(), SystemMonitor.SIOCGIFADDR,
+                                         struct.pack("256s", name.encode()[:15]))
+                except OSError:
+                    continue  # 网卡在，但没有 IPv4：没插线的 eth0 就是这样
+                found.append((name, socket.inet_ntoa(packed[20:24])))
+        return tuple(found)
 
     @staticmethod
     def primary_ipv4() -> str | None:

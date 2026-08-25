@@ -1,5 +1,6 @@
 from dataclasses import replace
 
+import fcntl
 import socket
 import subprocess
 
@@ -131,6 +132,45 @@ def test_ip_is_none_when_there_is_no_route(proc, monkeypatch):
 
     monkeypatch.setattr(socket, "socket", fail)
     assert monitor.poll().ip_address is None
+
+
+def test_interface_ipv4s_skips_loopback_and_addressless_cards(proc, monkeypatch):
+    """没插线的 eth0 存在但没有 IPv4，ioctl 报 EADDRNOTAVAIL——跳过，别让它占一行。"""
+    addresses = {"wlan0": "10.1.9.16", "nebula1": "192.168.100.6", "lo": "127.0.0.1"}
+
+    def fake_ioctl(fd, request, arg):
+        assert request == SystemMonitor.SIOCGIFADDR
+        name = arg.split(b"\0", 1)[0].decode()
+        if name not in addresses:
+            raise OSError(99, "Cannot assign requested address")
+        return b"\0" * 20 + socket.inet_aton(addresses[name]) + b"\0" * 8
+
+    monkeypatch.setattr(socket, "if_nameindex",
+                        lambda: [(1, "lo"), (2, "eth0"), (3, "wlan0"), (4, "nebula1")])
+    monkeypatch.setattr(fcntl, "ioctl", fake_ioctl)
+    assert SystemMonitor.interface_ipv4s() == (("wlan0", "10.1.9.16"),
+                                               ("nebula1", "192.168.100.6"))
+    assert SystemMonitor(net_sample_interval_s=0.1).poll().interfaces[0] == ("wlan0", "10.1.9.16")
+
+
+def test_interfaces_are_empty_where_the_ioctl_is_not_available(proc, monkeypatch):
+    def fail(*args, **kwargs):
+        raise OSError("inappropriate ioctl for device")
+
+    monkeypatch.setattr(fcntl, "ioctl", fail)
+    assert SystemMonitor.interface_ipv4s() == ()
+
+
+def test_poll_reports_interfaces_on_this_host():
+    for name, address in SystemMonitor(net_sample_interval_s=0.1).poll().interfaces:
+        assert name and name != "lo"
+        assert address.count(".") == 3
+
+
+def test_signature_changes_when_the_interfaces_change(proc):
+    mon = SystemMonitor(net_sample_interval_s=0.1).poll()
+    assert (replace(mon, interfaces=(("wlan0", "10.1.9.16"),)).signature()
+            != replace(mon, interfaces=(("wlan0", "10.1.9.17"),)).signature())
 
 
 def test_signature_changes_when_the_ip_changes(proc):

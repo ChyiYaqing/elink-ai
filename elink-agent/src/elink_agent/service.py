@@ -159,9 +159,10 @@ class AgentService:
         self._wake.set()
 
     def device_info(self) -> dict[str, Any]:
-        # 出口 IP 在锁外查：这个端点必须在刷新阻塞时仍然可答，别把一次 syscall
-        # 押在 self._lock 后面。
+        # 地址在锁外查：这个端点必须在刷新阻塞时仍然可答，别把 syscall 押在
+        # self._lock 后面。
         ip_address = self.monitor.primary_ipv4()
+        interfaces = self.monitor.interface_ipv4s()
         with self._lock:
             now = time.time()
             return {
@@ -170,6 +171,8 @@ class AgentService:
                 "version": __version__,
                 "resolution": [self.display.width, self.display.height],
                 "ip_address": ip_address,
+                "interfaces": [{"name": name, "address": address}
+                               for name, address in interfaces],
                 "bridge_url": self.config.bridge_url,
                 "mode": self.runtime.mode,
                 "content": self._content,

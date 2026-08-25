@@ -36,6 +36,8 @@ class DashboardRenderer:
     MONITOR_ROW_HEIGHT = 78
     MONITOR_STRIP_BOX = (18, 414, 630, 470)
     MONITOR_SPARK_SLOTS = 30
+    # 状态条右下角留给翻页点的宽度：地址行到此为止
+    MONITOR_DOTS_GUTTER = 40
     MONITOR_SPARK_MIN_SCALE = 25.0
 
     _MODEL_ROWS = 4
@@ -469,16 +471,23 @@ class DashboardRenderer:
         value_font = self._font(20, bold=True)
         draw.text((x0 + 64, y0), value, font=value_font, fill=0)
         value_right = x0 + 64 + draw.textbbox((0, 0), value, font=value_font)[2]
-        # 设备身份行：主机名 + 出口 IP。无头设备上这两项决定「怎么连上它」，
-        # 所以并排放在右上角，而不是塞进 NET 行 12px 的副标题里。
         host_font = self._font(16, bold=True)
-        host = self._truncate(draw, self._identity(mon), host_font, x1 - value_right - 16)
+        host = self._truncate(draw, mon.hostname, host_font, x1 - value_right - 16)
         host_w = draw.textbbox((0, 0), host, font=host_font)[2]
         draw.text((x1 - host_w, y0 + 2), host, font=host_font, fill=0)
         sub_font = self._font(12)
-        draw.text((x0, y0 + 30),
-                  self._truncate(draw, self._panel_sub(panel), sub_font, x1 - x0 - 60),
-                  font=sub_font, fill=0)
+        sub = self._truncate(draw, self._panel_sub(panel), sub_font, x1 - x0 - 60)
+        draw.text((x0, y0 + 30), sub, font=sub_font, fill=0)
+        # 地址行和面板副标题共用一行：左边是面板健康，右边是每张网卡的地址。右端停
+        # 在翻页点左侧的 DOTS_GUTTER 处，所以再长的地址列表也不会画到点上。
+        addresses = self._address_line(mon)
+        sub_w = draw.textbbox((0, 0), sub, font=sub_font)[2]
+        right = x1 - self.MONITOR_DOTS_GUTTER
+        room = right - (x0 + sub_w + 16)
+        if addresses and room >= 60:
+            text = self._truncate(draw, addresses, sub_font, room)
+            text_w = draw.textbbox((0, 0), text, font=sub_font)[2]
+            draw.text((right - text_w, y0 + 30), text, font=sub_font, fill=0)
         self._page_dots(draw, x1, y1 - 12, active=1)
 
     def _sparkline(self, draw: ImageDraw.ImageDraw, x0: int, y0: int, x1: int, y1: int,
@@ -528,9 +537,16 @@ class DashboardRenderer:
         draw.line((18, 64, 630, 64), fill=0, width=2)
 
     @staticmethod
-    def _identity(mon) -> str:
-        ip = getattr(mon, "ip_address", None)
-        return f"{mon.hostname} · {ip}" if ip else mon.hostname
+    def _address_line(mon) -> str:
+        """每张网卡一段「名字 地址」。无头设备上这一行就是「怎么连上它」的答案，
+        而带 overlay 的机器有好几个都是对的答案，所以全列出来而不是只挑一个。
+
+        取不到具名地址时（非 Linux）退回出口 IP：一个没有名字的地址仍然可用。
+        """
+        interfaces = tuple(getattr(mon, "interfaces", ()) or ())
+        if interfaces:
+            return " · ".join(f"{name} {address}" for name, address in interfaces)
+        return getattr(mon, "ip_address", None) or ""
 
     @staticmethod
     def _panel_value(panel) -> str:
