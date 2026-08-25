@@ -6,6 +6,26 @@ and `Removed`.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## 0.1.21-rc6
+
+### Added
+
+- When AI usage goes idle, the e-paper panel now flips to a device-monitor
+  page and flips back the moment a session starts. It leads with CPU load,
+  usage, and a trend of the last 30 samples, then memory, disk, temperature,
+  and network rates, and closes with the panel's own refresh health, the
+  hostname, and the device's IP address.
+- The device API reports the device's IPv4 address on its default route in
+  `ip_address`, so a client can find the panel without reading the screen.
+
+### Changed
+
+- The monitor page is grouped by hairlines drawn between its boxes instead of
+  a border around each card, which keeps a steady-state tick to a region
+  refresh of well under 1% of the screen rather than repainting a whole card.
+- The CPU trend scales to its own peak, so an idle device shows a readable
+  chart instead of a flat line at the bottom of the axis.
+
 ## 0.1.21-rc5
 
 ### Added
