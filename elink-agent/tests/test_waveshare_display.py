@@ -206,17 +206,32 @@ def test_a_full_refresh_reinitialises_even_while_awake():
 
 
 def test_idle_parks_the_panel_once_the_window_expires():
-    with _fake_panel(keep_awake_s=0.05) as (display, spi):
+    with _fake_panel(keep_awake_s=30) as (display, spi):
         slept = _spy(display, "_sleep")
         display.show(FRAME, kind="region", regions=REGION)
         display.idle()
         assert display._awake_mode == "partial", "窗口未到期不该休眠"
-        time.sleep(0.06)
+        display._awake_until = time.monotonic() - 0.001
         display.idle()
         assert display._awake_mode is None
         assert display._power.value == 0
         assert spi.opened is None
         assert len(slept) == 1
+        display.close()
+
+
+def test_the_awake_window_does_not_renew_with_each_refresh():
+    """窗口从唤醒起算。若每次刷新都续期，密集刷新下面板就永远不会休眠——那正是
+    Waveshare 禁止的长期上电状态，而密集刷新恰恰是启用保活的唯一场景。"""
+    with _fake_panel(keep_awake_s=30) as (display, _):
+        display.show(FRAME, kind="region", regions=REGION)
+        deadline = display._awake_until
+        display.show(FRAME, kind="region", regions=REGION)
+        assert display._awake_until == deadline, "第二次刷新不该把休眠推后"
+        display._awake_until = time.monotonic() - 0.001
+        display.idle()
+        assert display._awake_mode is None
+        assert display._power.value == 0
         display.close()
 
 

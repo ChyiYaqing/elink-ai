@@ -29,6 +29,9 @@ class Waveshare583V2Display(Display):
         这个窗口只用来覆盖「下一拍马上就来」的情形：跳过复位（402ms）、上电等待
         和收尾休眠（200ms+BUSY），一次局部刷新从约 1.25 秒降到约 0.55 秒。窗口一
         过，主循环的 idle() 会立即把它放回休眠。
+
+        窗口从唤醒那一刻起算，不随刷新续期——否则密集刷新会让它永不休眠，正好落进
+        上面那条禁忌里。所以连续上电时间的上界就是这个值（加上主循环一拍的粒度）。
         """
         try:
             import gpiozero
@@ -69,6 +72,9 @@ class Waveshare583V2Display(Display):
                 if self._awake_mode != mode:
                     self._init_full() if mode == "full" else self._init_partial()
                     self._awake_mode = mode
+                    # 从唤醒那一刻起算，之后的刷新不续期：连续上电时间因此有硬
+                    # 上界。续期的写法在密集刷新下等于永不休眠，正是要避免的。
+                    self._awake_until = time.monotonic() + self._keep_awake_s
                 if kind == "region":
                     self._display_regions(image, regions)
                 elif kind in {"partial", "fast-full"}:
@@ -81,9 +87,7 @@ class Waveshare583V2Display(Display):
                 # 出了任何问题都别把面板丢在上电状态上
                 self._park(graceful=False)
                 raise
-            if self._keep_awake_s > 0:
-                self._awake_until = time.monotonic() + self._keep_awake_s
-            else:
+            if self._keep_awake_s <= 0:
                 self._park()
 
     def _open(self) -> None:
