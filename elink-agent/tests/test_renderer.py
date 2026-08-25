@@ -417,6 +417,22 @@ def test_monitor_identity_never_runs_into_the_panel_state():
     assert short.crop(state).tobytes() == long.crop(state).tobytes()
 
 
+def test_monitor_stamp_advances_every_second_at_a_negligible_cost():
+    """监控页的时间戳带秒。
+
+    分钟粒度下，15 秒一拍的监控页四拍里只有一拍看得出时间在走，整页像是卡住了。
+    代价是每一拍时钟都变，「整帧未变直接跳过」那条省刷新的路径对这一页失效——
+    所以这一拍必须足够小，否则就是拿一次面板刷新换一个走字的时钟。
+    """
+    renderer = DashboardRenderer()
+    before = renderer.render_monitor(_monitor(), updated_at=FIXED_TIME, panel={})
+    after = renderer.render_monitor(_monitor(), updated_at=FIXED_TIME + timedelta(seconds=15),
+                                    panel={})
+    plan = FrameDiffer().plan(before, after)
+    assert plan.kind == "region", "同一分钟内的两拍应当画出不同的时间戳"
+    assert plan.planned_area < 1000
+
+
 def test_monitor_tick_under_changing_load_stays_a_region_refresh():
     """真实负载下的一次 tick 必须是局部刷新，而不是整屏。
 

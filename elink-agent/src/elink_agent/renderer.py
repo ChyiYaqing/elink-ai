@@ -526,7 +526,10 @@ class DashboardRenderer:
 
     def _monitor_header(self, draw, mon, updated_at) -> None:
         draw.text((18, 12), "DEVICE MONITOR", font=self._font(30, bold=True), fill=0)
-        stamp = updated_at.strftime("Updated %H:%M")
+        # 监控页的时间戳带秒。分钟粒度下四次 tick 里只有一次看得出变化，这一页
+        # 看起来就像卡住了。代价是每一拍时钟都变，也就没有「整帧未变直接跳过」
+        # 那条省刷新的路径了——AI 页仍是分钟粒度，它只在数据变化时才重绘。
+        stamp = updated_at.strftime("Updated %H:%M:%S")
         stamp_font = self._font(14)
         stamp_w = draw.textbbox((0, 0), stamp, font=stamp_font)[2]
         draw.text((630 - stamp_w, 14), stamp, font=stamp_font, fill=0)
