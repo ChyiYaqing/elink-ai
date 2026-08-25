@@ -1,5 +1,6 @@
 from dataclasses import replace
 
+import socket
 import subprocess
 
 import pytest
@@ -114,6 +115,28 @@ def test_signature_is_stable_and_changes_with_data(proc):
     assert mon.signature() == mon.signature()
     changed = replace(mon, load_1m=round(mon.load_1m + 10.0, 1))
     assert changed.signature() != mon.signature()
+
+
+def test_poll_reports_an_ipv4_address_or_none(proc):
+    mon = SystemMonitor(net_sample_interval_s=0.1).poll()
+    assert mon.ip_address is None or mon.ip_address.count(".") == 3
+
+
+def test_ip_is_none_when_there_is_no_route(proc, monkeypatch):
+    """断网的机器只是没有 IP，不该让整帧采样失败。"""
+    monitor = SystemMonitor(net_sample_interval_s=0.1)
+
+    def fail(*args, **kwargs):
+        raise OSError("network is unreachable")
+
+    monkeypatch.setattr(socket, "socket", fail)
+    assert monitor.poll().ip_address is None
+
+
+def test_signature_changes_when_the_ip_changes(proc):
+    mon = SystemMonitor(net_sample_interval_s=0.1).poll()
+    assert (replace(mon, ip_address="10.0.0.8").signature()
+            != replace(mon, ip_address="10.0.0.9").signature())
 
 
 def test_cpu_history_accumulates_and_is_capped(proc):

@@ -1,5 +1,6 @@
 import dataclasses
 import json
+import socket
 import tempfile
 import threading
 import time
@@ -570,6 +571,23 @@ def test_display_mode_is_preserved_for_monitor_health():
         info = service.device_info()
         assert info["content"] == "monitor"
         assert info["monitor"]["idle"] is True
+
+
+def test_device_info_reports_the_ip_even_when_the_monitor_page_never_rendered():
+    service = _make_service()
+    assert service._monitor_snapshot is None
+    info = service.device_info()
+    assert info["ip_address"] is None or info["ip_address"].count(".") == 3
+
+
+def test_device_info_reports_a_null_ip_when_there_is_no_route(monkeypatch):
+    service = _make_service()
+
+    def fail(*args, **kwargs):
+        raise OSError("network is unreachable")
+
+    monkeypatch.setattr(socket, "socket", fail)
+    assert service.device_info()["ip_address"] is None
 
 
 def test_manual_refresh_renders_current_content():

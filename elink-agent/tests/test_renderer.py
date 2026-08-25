@@ -260,6 +260,7 @@ def _monitor(**overrides) -> MonitorSnapshot:
         disk_percent=20.0, temp_c=47.0, uptime_s=90000.0,
         net_rx_bps=1_000_000, net_tx_bps=500_000,
         net_rx_total=1_000_000_000, net_tx_total=500_000_000, hostname="3BP",
+        ip_address="192.168.31.42",
     )
     return replace(base, **overrides)
 
@@ -366,6 +367,31 @@ def test_rate_formatting_keeps_three_significant_digits():
     assert DashboardRenderer._fmt_rate(1_500) == "1.5K/s"
     assert DashboardRenderer._fmt_rate(999) == "999B/s"
     assert DashboardRenderer._fmt_rate(None) == "—"
+
+
+def test_monitor_strip_shows_the_ip_next_to_the_hostname():
+    renderer = DashboardRenderer()
+    assert renderer._identity(_monitor()) == "3BP · 192.168.31.42"
+    assert renderer._identity(_monitor(ip_address=None)) == "3BP"
+    strip = renderer._monitor_boxes()[5]
+    with_ip = renderer.render_monitor(_monitor(), updated_at=FIXED_TIME, panel={}).convert("L")
+    without = renderer.render_monitor(_monitor(ip_address=None),
+                                      updated_at=FIXED_TIME, panel={}).convert("L")
+    assert with_ip.crop(strip).tobytes() != without.crop(strip).tobytes()
+
+
+def test_monitor_identity_never_runs_into_the_panel_state():
+    """主机名再长也只能占右边的空档，不能盖住左边的面板状态。"""
+    renderer = DashboardRenderer()
+    x0, y0, x1, y1 = renderer._monitor_boxes()[5]
+    panel = {"last_refresh_kind": "region"}
+    short = renderer.render_monitor(_monitor(), updated_at=FIXED_TIME, panel=panel).convert("L")
+    long = renderer.render_monitor(
+        _monitor(hostname="raspberrypi-workshop-3b-plus-north-lab-rack-07",
+                 ip_address="192.168.31.240"),
+        updated_at=FIXED_TIME, panel=panel).convert("L")
+    state = (x0, y0, x0 + 160, y1)
+    assert short.crop(state).tobytes() == long.crop(state).tobytes()
 
 
 def test_monitor_separators_stay_out_of_every_card():

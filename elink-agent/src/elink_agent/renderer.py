@@ -465,10 +465,16 @@ class DashboardRenderer:
     def _monitor_strip(self, draw: ImageDraw.ImageDraw, box, mon, panel) -> None:
         x0, y0, x1, y1 = box
         draw.text((x0, y0 + 6), "PANEL", font=self._font(14, bold=True), fill=0)
-        draw.text((x0 + 64, y0), self._panel_value(panel), font=self._font(20, bold=True), fill=0)
+        value = self._panel_value(panel)
+        value_font = self._font(20, bold=True)
+        draw.text((x0 + 64, y0), value, font=value_font, fill=0)
+        value_right = x0 + 64 + draw.textbbox((0, 0), value, font=value_font)[2]
+        # 设备身份行：主机名 + 出口 IP。无头设备上这两项决定「怎么连上它」，
+        # 所以并排放在右上角，而不是塞进 NET 行 12px 的副标题里。
         host_font = self._font(16, bold=True)
-        host_w = draw.textbbox((0, 0), mon.hostname, font=host_font)[2]
-        draw.text((x1 - host_w, y0 + 2), mon.hostname, font=host_font, fill=0)
+        host = self._truncate(draw, self._identity(mon), host_font, x1 - value_right - 16)
+        host_w = draw.textbbox((0, 0), host, font=host_font)[2]
+        draw.text((x1 - host_w, y0 + 2), host, font=host_font, fill=0)
         sub_font = self._font(12)
         draw.text((x0, y0 + 30),
                   self._truncate(draw, self._panel_sub(panel), sub_font, x1 - x0 - 60),
@@ -520,6 +526,11 @@ class DashboardRenderer:
         up_w = draw.textbbox((0, 0), up, font=up_font)[2]
         draw.text((630 - up_w, 38), up, font=up_font, fill=0)
         draw.line((18, 64, 630, 64), fill=0, width=2)
+
+    @staticmethod
+    def _identity(mon) -> str:
+        ip = getattr(mon, "ip_address", None)
+        return f"{mon.hostname} · {ip}" if ip else mon.hostname
 
     @staticmethod
     def _panel_value(panel) -> str:

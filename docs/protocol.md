@@ -83,6 +83,11 @@ counts successful non-full operations. A `smart` request may perform no panel
 operation when the rendered frame is unchanged; `partial` may safely fall back
 to a full operation when there is no trusted displayed-frame baseline.
 
+`ip_address` is the device's own IPv4 address on its default route, or `null`
+when the device has no route. It is the address a client should use to reach
+this endpoint, and it is also shown on the device-monitor page next to the
+hostname.
+
 When the optional `[monitor]` idle screen is enabled, `content` is `"monitor"`
 while the panel shows the device-monitor page and `"ai"` while it shows the
 AI dashboard; `monitor.enabled`, `monitor.idle_after_s`, and `monitor.idle`

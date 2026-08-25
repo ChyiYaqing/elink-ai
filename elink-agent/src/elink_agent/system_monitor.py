@@ -46,6 +46,8 @@ class MonitorSnapshot:
     hostname: str
     # 最近若干次采样的 CPU 使用率，旧→新。给监控页画趋势条用。
     cpu_history: tuple[float, ...] = field(default_factory=tuple)
+    # 出口路由上的本机 IPv4；没有可用网络时是 None
+    ip_address: str | None = None
 
     def signature(self) -> str:
         """变化的粒度：足够细以反映实时状态，但网络速率取整到 KiB/s 避免抖刷新。"""
@@ -60,6 +62,7 @@ class MonitorSnapshot:
             int(self.uptime_s // 60),
             int(self.net_rx_bps // 1024) if self.net_rx_bps is not None else None,
             int(self.net_tx_bps // 1024) if self.net_tx_bps is not None else None,
+            self.ip_address,
         ))
 
 
@@ -118,6 +121,7 @@ class SystemMonitor:
             net_tx_total=tx,
             hostname=self._hostname,
             cpu_history=tuple(self._cpu_history),
+            ip_address=self.primary_ipv4(),
         )
 
     def _update_rates(self, now: float, rx: int, tx: int) -> None:
@@ -223,6 +227,21 @@ class SystemMonitor:
             return float(lines[0].split()[0])
         except (IndexError, ValueError):
             return 0.0
+
+    @staticmethod
+    def primary_ipv4() -> str | None:
+        """出口路由上的本机地址。
+
+        UDP 的 connect 只是让内核挑一条路由并绑定本地端口，不发包也不做 DNS，
+        所以不依赖对端是否存在——地址取自 RFC 5737 的文档段，永远不会被真的访问。
+        比解析 /proc/net/fib_trie 稳，也不必猜哪张网卡才是主网卡。
+        """
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                sock.connect(("192.0.2.1", 53))
+                return sock.getsockname()[0]
+        except OSError:
+            return None
 
     @staticmethod
     def _net_totals() -> tuple[int, int]:

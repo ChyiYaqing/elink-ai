@@ -22,6 +22,9 @@ def test_device_api_and_mode_change():
             with urlopen(f"http://127.0.0.1:{port}/v1/device") as response:
                 obj = json.load(response)
             assert obj["device_type"] == "elink-agent"
+            # 无头设备靠这个字段被发现；断网时是 null，不是缺字段
+            assert "ip_address" in obj
+            assert obj["ip_address"] is None or obj["ip_address"].count(".") == 3
             assert obj["last_refresh_kind"] == "none"
             assert obj["last_refresh_region_count"] == 0
             assert obj["last_refresh_area"] == 0
