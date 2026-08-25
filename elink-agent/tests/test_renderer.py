@@ -452,7 +452,11 @@ def test_monitor_tick_under_changing_load_stays_a_region_refresh():
         panel={"last_refresh_kind": "region"})
     plan = FrameDiffer().plan(before, after)
     assert plan.kind == "region", "一次 tick 不该刷整屏"
-    assert plan.planned_area / (renderer.width * renderer.height) < 0.20
+    # 窗口数就是成本：面板一次只认一个分区窗口，每个都要自己走一遍刷新周期，
+    # 各付一次约 350ms 的 BUSY。面积几乎免费，但要和整屏阈值留出余量，否则
+    # 负载再抖一点就翻成整屏。
+    assert len(plan.regions) <= FrameDiffer().max_regions
+    assert plan.planned_area / (renderer.width * renderer.height) < 0.30
 
 
 def test_monitor_separators_stay_out_of_every_card():

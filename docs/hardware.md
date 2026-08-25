@@ -146,3 +146,32 @@ with a 10 s window the panel is powered roughly 80% of the time, against
 roughly 36% when every refresh ends asleep. The 24-hour soak test is still
 outstanding, so treat a fast cadence combined with a keep-awake window as
 unproven for long-term ghosting and panel life.
+
+### Each partial window costs its own refresh cycle
+
+On 2026-08-25 the monitor page's `Updated HH:MM:SS` stamp was observed never to
+advance on the panel; the seconds only appeared after a full refresh. The
+region was in the plan every time — `Rect(616, 17, 632, 27)`, 160 pixels — so
+the fault was in the driver.
+
+`_display_regions` used to enter partial mode once, write each window's
+coordinates to 0x90 and its payload to 0x13 in a loop, and then issue a single
+0x12 refresh. 0x90 is one set of registers that each iteration overwrites, so
+only the window set last was actually driven; the other payloads sat in the
+controller's RAM until the next full refresh. Regions are sorted by (top,
+left), which put the top-right stamp first every time, so it was never the one
+refreshed. Waveshare's own 5.83 V2 reference performs a complete cycle per
+window — 0x50, 0x91, 0x90, 0x13, 0x12, 0x92 — and the driver now does the same.
+
+This inverts the cost model. A window is not nearly free: each one waits out
+its own BUSY, about 350 ms with a keep-awake window and about 420 ms without.
+Area is the cheap axis at 6 ms of SPI per 3 KB. The earlier observation that
+BUSY stayed at about 423 ms whether the plan had one window or eight was not
+evidence that windows were free; it was evidence that seven of them were never
+refreshed.
+
+The frame differ's budget follows from the corrected model: prefer the fewest
+windows that keep the merged area below the fast-full threshold. Measured on a
+monitor tick under changing load, three windows cover 27.8% of the screen in
+about 1.05 s, four cover 15.9% in about 1.4 s, and eight cover 7.7% but take
+about 2.45 s, longer than the monitor page's own cadence. The default is four.

@@ -67,9 +67,6 @@ def test_region_refresh_transfers_only_each_window_payload():
         regions = (Rect(8, 2, 24, 6), Rect(32, 10, 40, 12))
         display.show(image, kind="region", regions=regions)
         assert [len(block) for block in spi.blocks] == [8, 2]
-        assert spi.commands.count(0x90) == 2
-        assert spi.commands.count(0x13) == 2
-        assert spi.commands.count(0x12) == 1
         display.close()
     finally:
         if old_spi is None: sys.modules.pop("spidev", None)
@@ -255,3 +252,26 @@ def test_a_failure_while_awake_cuts_power_without_a_second_busy_wait():
         assert display._awake_mode is None
         assert display._power.value == 0
         assert spi.opened is None
+
+
+def test_every_window_gets_its_own_refresh_cycle():
+    """0x90 是会被覆写的寄存器：攒着多个窗口只发一次 0x12，面板只驱动最后一个。
+
+    真机症状是监控页右上角的秒数永远不动——区域按 (top, left) 排序，时间戳永远是
+    第 0 个，永远轮不到最后，只有整屏刷新才能让它现形。Waveshare 的 5.83 V2 参考
+    实现也是一窗口一周期。
+    """
+    with _fake_panel() as (display, _):
+        turned_on = _spy(display, "_turn_on")
+        display.show(FRAME, kind="region",
+                     regions=(Rect(8, 2, 24, 6), Rect(32, 10, 40, 12), Rect(64, 40, 80, 44)))
+        assert len(turned_on) == 3, "每个窗口都要自己刷一次"
+        display.close()
+
+
+def test_a_single_window_still_costs_one_cycle():
+    with _fake_panel() as (display, _):
+        turned_on = _spy(display, "_turn_on")
+        display.show(FRAME, kind="region", regions=REGION)
+        assert len(turned_on) == 1
+        display.close()

@@ -157,10 +157,20 @@ class Waveshare583V2Display(Display):
         self._turn_on(); self._command(0x92)
 
     def _display_regions(self, image: Image.Image, regions: tuple[Rect, ...]) -> None:
-        self._command(0x50); self._data(0xA9); self._data(0x07)
-        self._command(0x91)
+        """每个窗口一个完整的分区刷新周期。
+
+        0x90 是一组会被覆写的寄存器：把多个窗口攒起来只发一次 0x12，面板就只驱动
+        最后设置的那一个，其余窗口的数据留在 RAM 里，要等下一次整屏刷新才现形。
+        真机上的表现是监控页右上角的秒数永远不动——区域按 (top, left) 排序，它永远
+        是第 0 个，永远轮不到最后。Waveshare 的 5.83 V2 参考实现同样是一窗口一周期。
+
+        代价是每个窗口各付一次 BUSY，所以窗口数量本身就是成本，帧差器的区域预算要
+        按这个来定，而不是按面积。
+        """
         for region in regions:
             packed = self._pack_region(image, region)
+            self._command(0x50); self._data(0xA9); self._data(0x07)
+            self._command(0x91)
             self._command(0x90)
             x_end = region.right - 1
             y_end = region.bottom - 1
@@ -174,7 +184,8 @@ class Waveshare583V2Display(Display):
                 self._data(value)
             self._command(0x13)
             self._data_block(packed)
-        self._turn_on(); self._command(0x92)
+            self._turn_on()
+            self._command(0x92)
 
     def _pack_region(self, image: Image.Image, region: Rect) -> bytes:
         if (region.left < 0 or region.top < 0 or region.right > self.width

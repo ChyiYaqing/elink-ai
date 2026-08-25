@@ -40,12 +40,14 @@ class FrameDiffer:
     # 碎片多到这个数量就不再逐对合并：整页都在变，挑也没用
     MERGE_LIMIT = 32
 
-    # 窗口数的预算给得比较宽，因为它几乎不要钱：驱动把所有窗口写进同一个 0x91
-    # 分区会话，最后只做一次 _turn_on()——多一个窗口只多几 KB SPI 传输，而不是
-    # 多一个面板刷新周期。真正的代价是面积，那由 fast_full_threshold 管。
+    # 窗口数就是成本：面板的分区窗口寄存器一次只认一个，所以每个窗口都要自己走
+    # 一遍刷新周期，各付一次约 350ms 的 BUSY。面积反而几乎免费——4MHz 下 3KB 只要
+    # 6ms。所以预算的取法是「在不越过面积阈值的前提下窗口尽量少」：真机上监控页
+    # 一次 tick 给 4 个窗口是 15.9% 面积、约 1.4 秒，给 8 个是 7.7% 面积但要 2.45
+    # 秒，比整页刷新的 4.5 秒省，却已经超过了监控页自己的节拍。
 
     def __init__(self, *, width: int = 648, height: int = 480,
-                 tile_size: int = 8, max_regions: int = 8,
+                 tile_size: int = 8, max_regions: int = 4,
                  fast_full_threshold: float = 0.35):
         if width <= 0 or height <= 0 or width % 8:
             raise ValueError("display width must be positive and byte-aligned")
