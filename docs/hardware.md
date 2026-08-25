@@ -115,3 +115,34 @@ stale samples, refresh failures, or agent restarts; uptime advanced from 84 to
 with a region operation. Region refreshes were about 1.24 s with about 0.42 s
 BUSY wait. The 24-hour ambient run is intentionally deferred; defaults remain
 unchanged and the shorter window is the evidence used for this release.
+
+### Refresh-cost breakdown and the keep-awake window
+
+On 2026-08-25 the per-refresh cost was measured on `3BP` while the device
+monitor page was on screen. A region refresh took 1.25 s end to end, made up
+of 402 ms of reset delays, 200 ms of power-on and pre-refresh delays, 200 ms
+closing the deep sleep, 423 ms of BUSY, 6 ms of SPI for a 3 KB payload, and
+52 ms of agent work (rendering the frame, diffing it, and saving the preview).
+Only the BUSY portion is the panel imaging; the rest was the driver walking the
+whole power-up and power-down cycle for every update.
+
+With `[display] keep_awake_s = 10`, refreshes that land inside the window skip
+the reset and the closing sleep, and a region refresh takes 463-480 ms with
+342-353 ms of BUSY. The first refresh after the window closes pays for
+initialisation again at 990-1024 ms. A full refresh takes 4.5 s.
+
+The window runs from the moment the panel wakes and is not extended by later
+refreshes, so continuous powered time is bounded. This matters: Waveshare
+requires the panel to be put to sleep when it is not being refreshed, because
+sitting powered holds it under high voltage and can damage it permanently. A
+renewing window would keep a page that ticks every few seconds powered
+indefinitely. The default is 0, which sleeps and powers off after every
+refresh as before, and the agent's main loop parks the panel as soon as the
+window closes.
+
+Note that a keep-awake window raises the share of time the panel spends
+powered even though it lowers the cost of each refresh: at a 3.1 s cadence
+with a 10 s window the panel is powered roughly 80% of the time, against
+roughly 36% when every refresh ends asleep. The 24-hour soak test is still
+outstanding, so treat a fast cadence combined with a keep-awake window as
+unproven for long-term ghosting and panel life.
