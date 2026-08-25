@@ -29,6 +29,9 @@ full_interval_s = 21600
 # dashboard. Set enabled = false to keep the dashboard always on screen.
 enabled = false
 idle_after_s = 300
+# 翻到监控页后的最短驻留时间。没有它，断续的 AI 活动会让面板在两个版面之间来回
+# 抖，而每次切换都是一次整屏刷新（5.83" 面板上约 3.6 秒）。待审批可以立刻打断。
+min_dwell_s = 300
 # How often the monitor page re-renders. Bounded below by `min_interval_s`;
 # the frame differ skips it when nothing actually changed.
 refresh_interval_s = 60

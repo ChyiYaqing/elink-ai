@@ -106,6 +106,7 @@ class AgentService:
         # 实际上仍活跃，首个循环的 _ai_active() 会把它校正回当前时刻。
         self._last_ai_activity_at = time.time() - config.monitor_idle_after_s
         self._monitor_snapshot = None
+        self._monitor_shown_at = 0.0
         self._monitor_last_refresh_at = 0.0
         self._monitor_partials_since_full = 0
         self._monitor_last_full_at = 0.0
@@ -206,7 +207,20 @@ class AgentService:
             return "ai"
         if now - self._last_ai_activity_at >= self.config.monitor_idle_after_s:
             return "monitor"
+        # 刚翻到监控页就被一次短暂的 AI 活动赶回去，两次切换要花两次整屏刷新
+        # （真机实测每次约 3.6 秒）。断续干活时这样来回抖，整屏刷新就成了面板
+        # 的主要开销——比监控页自己的 tick 贵得多。所以进了监控页先待满一个最短
+        # 驻留时间。唯一的例外是待审批：那件事就是要抢人注意，不能压着。
+        if (self._displayed_content == "monitor"
+                and now - self._monitor_shown_at < self.config.monitor_min_dwell_s
+                and not self._needs_attention(self.snapshot)):
+            return "monitor"
         return "ai"
+
+    @staticmethod
+    def _needs_attention(snapshot: StatusSnapshot) -> bool:
+        """有事情在等人处理（待审批）。这是唯一能打断监控页驻留的信号。"""
+        return snapshot.claude.needs_input or snapshot.codex.needs_input
 
     @staticmethod
     def _ai_active(snapshot: StatusSnapshot) -> bool:
@@ -396,6 +410,8 @@ class AgentService:
             policy_kind = "full" if plan.kind == "full" else "partial"
             self._displayed_frame = image.copy()
             # 记录屏幕当前展示的是哪一类内容，供切换判断与 AI 签名记账
+            if content == "monitor" and self._displayed_content != "monitor":
+                self._monitor_shown_at = now_wall
             self._displayed_content = content
             if content == "monitor":
                 self._monitor_snapshot = mon

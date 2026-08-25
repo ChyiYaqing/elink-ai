@@ -25,6 +25,7 @@ class AgentConfig:
     orientation: int = 0
     monitor_enabled: bool = False
     monitor_idle_after_s: int = 300
+    monitor_min_dwell_s: float = 300.0
     monitor_refresh_interval_s: float = 60.0
     monitor_net_sample_interval_s: float = 5.0
     bridge_url_env_override: str | None = None
@@ -56,6 +57,7 @@ class AgentConfig:
             config.full_refresh_interval_s = int(refresh.get("full_interval_s", config.full_refresh_interval_s))
             config.monitor_enabled = bool(monitor.get("enabled", config.monitor_enabled))
             config.monitor_idle_after_s = int(monitor.get("idle_after_s", config.monitor_idle_after_s))
+            config.monitor_min_dwell_s = float(monitor.get("min_dwell_s", config.monitor_min_dwell_s))
             config.monitor_refresh_interval_s = float(monitor.get("refresh_interval_s", config.monitor_refresh_interval_s))
             config.monitor_net_sample_interval_s = float(monitor.get("net_sample_interval_s", config.monitor_net_sample_interval_s))
         override = os.getenv("ELINK_BRIDGE_URL")

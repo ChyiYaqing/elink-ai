@@ -522,14 +522,20 @@ def test_idle_switch_to_monitor_is_full_refresh():
     assert service._content == "monitor"
 
 
-def test_ai_activity_switches_back_from_monitor_to_ai():
-    service = _make_service(monitor_idle_after_s=5)
+def _on_monitor_since(service, shown_at: float, *, working: bool = True, needs_input: bool = False):
     service._last_ai_activity_at = 0.0
     service._displayed_content = "monitor"
+    service._monitor_shown_at = shown_at
     service.runtime.last_refresh_at = 0.0
-    # AI 此刻又开工：即使已经 idle 很久，活动本身应立即把计时刷新并切回 AI 页
-    service.snapshot = StatusSnapshot(claude=ProviderStatus(status="working"),
-                                      codex=ProviderStatus(status="idle"))
+    service.snapshot = StatusSnapshot(
+        claude=ProviderStatus(status="working" if working else "idle", needs_input=needs_input),
+        codex=ProviderStatus(status="idle"))
+    return service
+
+
+def test_ai_activity_switches_back_from_monitor_to_ai_after_the_dwell():
+    service = _make_service(monitor_idle_after_s=5, monitor_min_dwell_s=60)
+    _on_monitor_since(service, shown_at=0.0)
     decision = service._decide_refresh(100.0, False, None)
     assert decision.refresh
     assert decision.kind == "full"
@@ -537,6 +543,41 @@ def test_ai_activity_switches_back_from_monitor_to_ai():
     assert service._content == "ai"
     # 计时被刷新：下一拍不会因为旧的 idle 计时误判回监控页
     assert service._last_ai_activity_at == 100.0
+
+
+def test_a_brief_ai_blip_does_not_flip_the_panel_off_the_monitor_page():
+    """断续干活时的短暂活动不该把面板赶回 AI 页。
+
+    每次来回切换是两次整屏刷新（真机实测每次约 3.6 秒）。真机追踪里三分钟内的
+    三次整屏全部来自这种抖动，而不是监控页自己的 tick。
+    """
+    service = _make_service(monitor_idle_after_s=5, monitor_min_dwell_s=300)
+    _on_monitor_since(service, shown_at=0.0)
+    decision = service._decide_refresh(100.0, False, None)
+    assert service._content == "monitor"
+    assert decision.reason != "content-switch"
+    # 驻留只是压住切换，AI 的活动计时照常前进
+    assert service._last_ai_activity_at == 100.0
+
+
+def test_needs_input_breaks_the_monitor_dwell_immediately():
+    """待审批就是要抢人注意，驻留压不住它。"""
+    service = _make_service(monitor_idle_after_s=5, monitor_min_dwell_s=300)
+    _on_monitor_since(service, shown_at=0.0, working=False, needs_input=True)
+    decision = service._decide_refresh(100.0, False, None)
+    assert service._content == "ai"
+    assert decision.refresh
+    assert decision.reason == "content-switch"
+
+
+def test_the_dwell_clock_starts_when_the_monitor_page_reaches_the_panel():
+    service = _make_service(monitor_idle_after_s=5, monitor_min_dwell_s=300)
+    service._last_ai_activity_at = 0.0
+    service._content = "monitor"
+    assert service._monitor_shown_at == 0.0
+    service._refresh("full", False)
+    assert service._displayed_content == "monitor"
+    assert service._monitor_shown_at > 0.0
 
 
 def test_monitor_tick_is_partial_and_respects_cadence():
