@@ -1,5 +1,5 @@
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock
 
 from PIL import Image, ImageDraw
@@ -415,6 +415,28 @@ def test_monitor_identity_never_runs_into_the_panel_state():
         updated_at=FIXED_TIME, panel=panel).convert("L")
     state = (x0, y0, x0 + 160, y1)
     assert short.crop(state).tobytes() == long.crop(state).tobytes()
+
+
+def test_monitor_tick_under_changing_load_stays_a_region_refresh():
+    """真实负载下的一次 tick 必须是局部刷新，而不是整屏。
+
+    每个新样本让整条趋势重画，同时右上角的时钟走一分钟——这是版面上相距最远的
+    两处改动。区域预算不够时它们会被并成一个半屏大的外接矩形，于是 2.6% 的真实
+    变化被判成 100% 的整屏刷新（真机上就是这样，每分钟闪一次全屏）。
+    """
+    renderer = DashboardRenderer()
+    history = tuple(float((value * 37) % 100) for value in range(30))
+    before = renderer.render_monitor(
+        _monitor(cpu_history=history, cpu_percent=history[-1]),
+        updated_at=FIXED_TIME, panel={"last_refresh_kind": "region"})
+    after = renderer.render_monitor(
+        _monitor(cpu_history=history[1:] + (31.0,), cpu_percent=31.0, load_1m=3.0,
+                 uptime_s=90060.0, temp_c=58.4, mem_percent=71.0),
+        updated_at=FIXED_TIME + timedelta(minutes=1),
+        panel={"last_refresh_kind": "region"})
+    plan = FrameDiffer().plan(before, after)
+    assert plan.kind == "region", "一次 tick 不该刷整屏"
+    assert plan.planned_area / (renderer.width * renderer.height) < 0.20
 
 
 def test_monitor_separators_stay_out_of_every_card():

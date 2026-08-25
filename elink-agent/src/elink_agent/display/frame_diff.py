@@ -37,8 +37,15 @@ class RefreshPlan:
 
 
 class FrameDiffer:
+    # 碎片多到这个数量就不再逐对合并：整页都在变，挑也没用
+    MERGE_LIMIT = 32
+
+    # 窗口数的预算给得比较宽，因为它几乎不要钱：驱动把所有窗口写进同一个 0x91
+    # 分区会话，最后只做一次 _turn_on()——多一个窗口只多几 KB SPI 传输，而不是
+    # 多一个面板刷新周期。真正的代价是面积，那由 fast_full_threshold 管。
+
     def __init__(self, *, width: int = 648, height: int = 480,
-                 tile_size: int = 8, max_regions: int = 4,
+                 tile_size: int = 8, max_regions: int = 8,
                  fast_full_threshold: float = 0.35):
         if width <= 0 or height <= 0 or width % 8:
             raise ValueError("display width must be positive and byte-aligned")
@@ -66,9 +73,7 @@ class FrameDiffer:
         if difference.getbbox() is None:
             return RefreshPlan("none")
 
-        regions = self._regions(difference)
-        if len(regions) > self.max_regions:
-            regions = (self._union(regions),)
+        regions = self._merge_to_budget(self._regions(difference))
         planned_area = sum(region.area for region in regions)
         if planned_area / screen_area > self.fast_full_threshold:
             return RefreshPlan("fast-full", planned_area=screen_area,
@@ -133,6 +138,34 @@ class FrameDiffer:
                 tile_box[1] + exact_bottom,
             ))
         return tuple(sorted(regions, key=lambda value: (value.top, value.left)))
+
+    def _merge_to_budget(self, regions: tuple[Rect, ...]) -> tuple[Rect, ...]:
+        """把区域数收进预算，每次合并「多出来的面积最小」的一对。
+
+        原来的做法是一旦超预算就把所有区域并成一个外接矩形，那等于让相距最远的
+        两处改动决定整块面积：监控页上右上角的时钟改了 78 像素、左侧 CPU 卡改了
+        8102 像素，并成一块就是半屏，于是 2.63% 的真实变化被判成整屏刷新。
+
+        碎片多到 MERGE_LIMIT 以上时不值得再挑：那说明整页都在变，并成一块交给
+        面积阈值判定即可，也免得在树莓派上跑一个 O(n³) 的合并。
+        """
+        if len(regions) <= self.max_regions:
+            return regions
+        if len(regions) > self.MERGE_LIMIT:
+            return (self._union(regions),)
+        merged = list(regions)
+        while len(merged) > self.max_regions:
+            best_cost = best_pair = None
+            for first in range(len(merged)):
+                for second in range(first + 1, len(merged)):
+                    union = self._union((merged[first], merged[second]))
+                    cost = union.area - merged[first].area - merged[second].area
+                    if best_cost is None or cost < best_cost:
+                        best_cost, best_pair = cost, (first, second, union)
+            first, second, union = best_pair
+            del merged[second]
+            merged[first] = union
+        return tuple(sorted(merged, key=lambda value: (value.top, value.left)))
 
     @staticmethod
     def _union(regions: tuple[Rect, ...]) -> Rect:
