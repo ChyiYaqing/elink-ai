@@ -13,6 +13,9 @@ class RefreshDecision:
     refresh: bool
     kind: str = "none"
     reason: str = "unchanged"
+    # 是否要过合并窗口。合并是给「数据一变就想刷」的页面去抖用的；定时采样的
+    # 页面本来就不会抖，让它排这个队只是白等一整轮循环。
+    coalesce: bool = True
 
 
 class RefreshPolicy:

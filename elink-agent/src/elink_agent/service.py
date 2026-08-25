@@ -285,8 +285,8 @@ class AgentService:
         if (self._monitor_partials_since_full >= self.config.full_refresh_every
                 or (self._monitor_last_full_at
                     and now_wall - self._monitor_last_full_at >= self.config.full_refresh_interval_s)):
-            return RefreshDecision(True, "full", "monitor-maintenance")
-        return RefreshDecision(True, "partial", "monitor-tick")
+            return RefreshDecision(True, "full", "monitor-maintenance", coalesce=False)
+        return RefreshDecision(True, "partial", "monitor-tick", coalesce=False)
 
     def _run(self) -> None:
         while not self._stop.is_set():
@@ -317,7 +317,7 @@ class AgentService:
                 decision = self._decide_refresh(now_wall, stale, force)
                 if decision.refresh:
                     now_mono = time.monotonic()
-                    if force or self.config.coalesce_s <= 0:
+                    if force or not decision.coalesce or self.config.coalesce_s <= 0:
                         ready = True
                     elif self._pending_since is None:
                         self._pending_since = now_mono

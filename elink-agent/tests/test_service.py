@@ -580,6 +580,25 @@ def test_the_dwell_clock_starts_when_the_monitor_page_reaches_the_panel():
     assert service._monitor_shown_at > 0.0
 
 
+def test_monitor_ticks_do_not_wait_for_the_coalesce_window():
+    """合并窗口是给会抖的页面去抖的，定时采样的页面排这个队只是白等一轮循环。
+
+    真机上这一条值 2 秒：配 2 秒节拍时实际是 5.7 秒一刷，因为第一轮只登记
+    pending、第二轮才够合并窗口、然后才是 1.25 秒的刷新。
+    """
+    service = _make_service(monitor_idle_after_s=5, monitor_refresh_interval_s=2)
+    service._last_ai_activity_at = 0.0
+    service._displayed_content = "monitor"
+    service._monitor_last_refresh_at = 100.0
+    decision = service._decide_refresh(103.0, False, None)
+    assert decision.refresh
+    assert decision.coalesce is False
+    # AI 页仍然要过合并窗口：它是数据驱动的，一次突发变化不该刷两遍屏
+    service._displayed_content = "ai"
+    service._last_ai_activity_at = 103.0
+    assert service._decide_refresh(103.0, False, None).coalesce is True
+
+
 def test_monitor_cadence_is_not_floored_by_the_global_min_interval():
     """监控页是定时采样，节拍该由它自己定。
 
