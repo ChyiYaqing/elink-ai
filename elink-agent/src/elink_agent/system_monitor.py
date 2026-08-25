@@ -3,7 +3,8 @@ from __future__ import annotations
 import socket
 import subprocess
 import time
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
 from pathlib import Path
 from shutil import disk_usage
 
@@ -43,6 +44,8 @@ class MonitorSnapshot:
     net_rx_total: int
     net_tx_total: int
     hostname: str
+    # 最近若干次采样的 CPU 使用率，旧→新。给监控页画趋势条用。
+    cpu_history: tuple[float, ...] = field(default_factory=tuple)
 
     def signature(self) -> str:
         """变化的粒度：足够细以反映实时状态，但网络速率取整到 KiB/s 避免抖刷新。"""
@@ -67,9 +70,11 @@ class SystemMonitor:
     NETDEV = "/proc/net/dev"
     STAT = "/proc/stat"
     THERMAL_ZONE = "/sys/class/thermal/thermal_zone0/temp"
+    HISTORY_SAMPLES = 30
 
     def __init__(self, *, net_sample_interval_s: float = 5.0):
         self.net_sample_interval_s = max(0.1, net_sample_interval_s)
+        self._cpu_history: deque[float] = deque(maxlen=self.HISTORY_SAMPLES)
         self._hostname = socket.gethostname()
         self._prev_cpu: tuple[int, int] | None = None
         self._prev_net: NetTotals | None = None
@@ -91,6 +96,8 @@ class SystemMonitor:
         uptime_s = self._uptime()
         rx, tx = self._net_totals()
         self._update_rates(now, rx, tx)
+        if cpu_percent is not None:
+            self._cpu_history.append(cpu_percent)
         return MonitorSnapshot(
             ts=now,
             load_1m=load[0],
@@ -110,6 +117,7 @@ class SystemMonitor:
             net_rx_total=rx,
             net_tx_total=tx,
             hostname=self._hostname,
+            cpu_history=tuple(self._cpu_history),
         )
 
     def _update_rates(self, now: float, rx: int, tx: int) -> None:

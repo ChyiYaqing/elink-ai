@@ -25,13 +25,18 @@ class DashboardRenderer:
     SINGLE_BOX = (18, 74, 630, 458)
     FOOTER_BOX = (18, 459, 630, 476)
 
-    # Device-monitor grid: three rows, two cards per row. Kept fixed and
-    # non-overlapping so a region refresh stays inside the card that changed.
+    # 设备监控版面：左侧一张主角卡（CPU），右侧四条紧凑指标行，底部一条面板健康
+    # 状态条。分组靠发丝线而不是卡片边框——边框是四条边连成的环，任何重绘都会把
+    # 脏矩形撑成整张卡的外接矩形。所有框固定且互不重叠，分隔线画在框与框的缝里，
+    # 因此它们永远不会进入任何一次区域刷新。
     MONITOR_HEADER_BOX = (18, 8, 630, 66)
-    MONITOR_COL_LEFT = (18, 316)
-    MONITOR_COL_RIGHT = (332, 630)
-    MONITOR_ROWS = (76, 204, 332)
-    MONITOR_CARD_HEIGHT = 112
+    MONITOR_HERO_BOX = (18, 76, 316, 404)
+    MONITOR_ROW_X = (332, 630)
+    MONITOR_ROW_TOPS = (76, 158, 240, 322)
+    MONITOR_ROW_HEIGHT = 78
+    MONITOR_STRIP_BOX = (18, 414, 630, 470)
+    MONITOR_SPARK_SLOTS = 30
+    MONITOR_SPARK_MIN_SCALE = 25.0
 
     _MODEL_ROWS = 4
     _MODEL_ROW_HEIGHT = 15
@@ -113,6 +118,15 @@ class DashboardRenderer:
 
     def _footer(self, draw: ImageDraw.ImageDraw) -> None:
         draw.text((18, 461), f"elink-agent v{__version__}", font=self._font(12, bold=False), fill=0)
+        self._page_dots(draw, 630, 468, active=0)
+
+    @staticmethod
+    def _page_dots(draw: ImageDraw.ImageDraw, right: int, cy: int, *, active: int) -> None:
+        """两页轮播的指示点：AI 面板是第一页，设备监控是第二页。"""
+        for index in range(2):
+            cx = right - 22 + index * 16
+            draw.ellipse((cx - 4, cy - 4, cx + 4, cy + 4), outline=0, width=2,
+                         fill=0 if index == active else 255)
 
     def _provider_panel(self, draw: ImageDraw.ImageDraw, box: tuple[int, int, int, int],
                         name: str, provider: ProviderStatus, *,
@@ -362,52 +376,138 @@ class DashboardRenderer:
         image = Image.new("L", (self.width, self.height), 255)
         draw = ImageDraw.Draw(image)
         self._monitor_header(draw, mon, updated_at)
-        for box, spec in zip(self._monitor_boxes(), self._monitor_cards(mon, panel)):
-            self._monitor_card(draw, *box, **spec)
+        self._monitor_rules(draw)
+        boxes = self._monitor_boxes()
+        self._monitor_hero(draw, boxes[0], mon)
+        for box, spec in zip(boxes[1:5], self._monitor_rows(mon)):
+            self._monitor_row(draw, box, **spec)
+        self._monitor_strip(draw, boxes[5], mon, panel)
         return image.convert("1", dither=Image.Dither.NONE)
 
     def _monitor_boxes(self):
-        boxes = []
-        left_x0, left_x1 = self.MONITOR_COL_LEFT
-        right_x0, right_x1 = self.MONITOR_COL_RIGHT
-        for y0 in self.MONITOR_ROWS:
-            boxes.append((left_x0, y0, left_x1, y0 + self.MONITOR_CARD_HEIGHT))
-            boxes.append((right_x0, y0, right_x1, y0 + self.MONITOR_CARD_HEIGHT))
-        return boxes
+        x0, x1 = self.MONITOR_ROW_X
+        rows = [(x0, top, x1, top + self.MONITOR_ROW_HEIGHT) for top in self.MONITOR_ROW_TOPS]
+        return [self.MONITOR_HERO_BOX, *rows, self.MONITOR_STRIP_BOX]
 
-    def _monitor_cards(self, mon, panel):
-        cores = _CPU_CORES
-        cpu_pct = mon.cpu_percent
-        if cpu_pct is None:
-            cpu_pct = min(100.0, mon.load_1m / cores * 100)
+    def _monitor_rules(self, draw: ImageDraw.ImageDraw) -> None:
+        """分组发丝线。全部画在框与框的空隙里，所以是纯静态墨水。"""
+        hero = self.MONITOR_HERO_BOX
+        row_x0, row_x1 = self.MONITOR_ROW_X
+        gutter = (hero[2] + row_x0) // 2
+        draw.line((gutter, hero[1], gutter, hero[3]), fill=0, width=1)
+        for previous, top in zip(self.MONITOR_ROW_TOPS, self.MONITOR_ROW_TOPS[1:]):
+            # 落在两行之间的空隙正中，而不是压在上一行的下边界上
+            gap = (previous + self.MONITOR_ROW_HEIGHT + top) // 2
+            draw.line((row_x0, gap, row_x1, gap), fill=0, width=1)
+        strip_top = self.MONITOR_STRIP_BOX[1]
+        draw.line((hero[0], strip_top - 6, row_x1, strip_top - 6), fill=0, width=1)
+
+    def _monitor_hero(self, draw: ImageDraw.ImageDraw, box, mon) -> None:
+        """主角卡：一个压倒性的 load 数字，下面挂使用率条和最近半小时的趋势。"""
+        x0, y0, x1, _ = box
+        draw.text((x0, y0 + 2), "CPU LOAD", font=self._font(15, bold=True), fill=0)
+        value = f"{mon.load_1m:.1f}"
+        draw.text((x0, y0 + 20),
+                  value,
+                  font=self._fit_font(draw, value, preferred=76, minimum=52,
+                                      max_width=x1 - x0, bold=True),
+                  fill=0)
+        draw.text((x0, y0 + 106), f"1 MIN AVERAGE · {_CPU_CORES} CORES",
+                  font=self._font(13), fill=0)
+
+        usage = self._cpu_usage_pct(mon)
+        draw.text((x0, y0 + 140), "USAGE", font=self._font(14, bold=True), fill=0)
+        pct = self._percentage(usage)
+        pct_font = self._font(22, bold=True)
+        pct_w = draw.textbbox((0, 0), pct, font=pct_font)[2]
+        draw.text((x1 - pct_w, y0 + 132), pct, font=pct_font, fill=0)
+        self._progress(draw, x0, y0 + 164, x1, usage, height=14)
+
+        history = tuple(mon.cpu_history)[-self.MONITOR_SPARK_SLOTS:]
+        caption = f"LAST {self.MONITOR_SPARK_SLOTS} SAMPLES"
+        if history:
+            caption += f" · PEAK {max(history):.0f}%"
+        draw.text((x0, y0 + 190), caption, font=self._font(12), fill=0)
+        self._sparkline(draw, x0, y0 + 208, x1, y0 + 286, history)
+        draw.text((x0, y0 + 296),
+                  f"5m {mon.load_5m:.1f} · 15m {mon.load_15m:.1f}",
+                  font=self._font(13), fill=0)
+
+    def _monitor_rows(self, mon):
         return [
-            dict(title="CPU", value=f"{mon.load_1m:.1f}", bar_pct=cpu_pct,
-                 sub=f"{cores}c · 5m {mon.load_5m:.1f} 15m {mon.load_15m:.1f}"),
             dict(title="MEM", value=f"{mon.mem_percent:.0f}%", bar_pct=mon.mem_percent,
-                 sub=f"{self._fmt_bytes(mon.mem_available_kb * 1024)} free"),
+                 sub=f"{self._fmt_bytes(mon.mem_available_kb * 1024)} free of "
+                     f"{self._fmt_bytes(mon.mem_total_kb * 1024)}"),
             dict(title="DISK", value=f"{mon.disk_percent:.0f}%", bar_pct=mon.disk_percent,
-                 sub=f"{self._fmt_bytes(mon.disk_used)} / {self._fmt_bytes(mon.disk_total)}"),
+                 sub=f"{self._fmt_bytes(mon.disk_used)} used of {self._fmt_bytes(mon.disk_total)}"),
             dict(title="TEMP", value=self._fmt_temp(mon.temp_c), bar_pct=self._temp_pct(mon.temp_c),
-                 sub="cpu thermal zone"),
-            dict(title="NET", value=self._net_rate(mon), bar_pct=None,
+                 sub="cpu thermal zone · 85°C limit"),
+            dict(title="NET", value=self._net_rate(mon), bar_pct=None, value_size=21,
                  sub=f"rx {self._fmt_bytes(mon.net_rx_total)} · tx {self._fmt_bytes(mon.net_tx_total)}"),
-            dict(title="PANEL", value=self._panel_value(panel), bar_pct=None,
-                 sub=self._panel_sub(panel)),
         ]
 
-    def _monitor_card(self, draw, x0, y0, x1, y1, *, title, value, sub="",
-                      bar_pct=None) -> None:
-        draw.rounded_rectangle((x0, y0, x1, y1), radius=10, outline=0, width=2)
-        draw.text((x0 + 14, y0 + 10), title, font=self._font(15, bold=True), fill=0)
-        value_font = self._fit_font(
-            draw, value, preferred=30, minimum=20, max_width=(x1 - x0 - 28), bold=True)
-        draw.text((x0 + 14, y0 + 32), value, font=value_font, fill=0)
+    def _monitor_row(self, draw: ImageDraw.ImageDraw, box, *, title, value,
+                     sub="", bar_pct=None, value_size: int = 26) -> None:
+        x0, y0, x1, y1 = box
+        title_font = self._font(14, bold=True)
+        draw.text((x0, y0 + 4), title, font=title_font, fill=0)
+        title_w = draw.textbbox((0, 0), title, font=title_font)[2]
+        value_font = self._fit_font(draw, value, preferred=value_size, minimum=15,
+                                    max_width=x1 - x0 - title_w - 12, bold=True)
+        value_w = draw.textbbox((0, 0), value, font=value_font)[2]
+        draw.text((x1 - value_w, y0), value, font=value_font, fill=0)
         if bar_pct is not None:
-            self._progress(draw, x0 + 14, y1 - 36, x1 - 14, bar_pct, height=12)
+            self._progress(draw, x0, y0 + 34, x1, bar_pct, height=12)
         if sub:
             font = self._font(12, bold=False)
-            draw.text((x0 + 14, y1 - 15), self._truncate(draw, sub, font, x1 - x0 - 28),
-                      font=font, fill=0)
+            draw.text((x0, y1 - 18), self._truncate(draw, sub, font, x1 - x0), font=font, fill=0)
+
+    def _monitor_strip(self, draw: ImageDraw.ImageDraw, box, mon, panel) -> None:
+        x0, y0, x1, y1 = box
+        draw.text((x0, y0 + 6), "PANEL", font=self._font(14, bold=True), fill=0)
+        draw.text((x0 + 64, y0), self._panel_value(panel), font=self._font(20, bold=True), fill=0)
+        host_font = self._font(16, bold=True)
+        host_w = draw.textbbox((0, 0), mon.hostname, font=host_font)[2]
+        draw.text((x1 - host_w, y0 + 2), mon.hostname, font=host_font, fill=0)
+        sub_font = self._font(12)
+        draw.text((x0, y0 + 30),
+                  self._truncate(draw, self._panel_sub(panel), sub_font, x1 - x0 - 60),
+                  font=sub_font, fill=0)
+        self._page_dots(draw, x1, y1 - 12, active=1)
+
+    def _sparkline(self, draw: ImageDraw.ImageDraw, x0: int, y0: int, x1: int, y1: int,
+                   values) -> None:
+        """CPU 使用率柱状趋势。柱位固定、右对齐（最新的在最右），样本不足时左侧
+        留空，这样新样本只改变柱高，不会让整条重排。
+
+        纵轴按峰值自适应，并有一个 25% 的下限：闲置的树莓派长期在 2% 上下，固定
+        0-100 会把整条趋势压成一条看不见的线（真机上就是这样），而没有下限又会把
+        1% 和 2% 的噪声放大成剧烈起伏。
+        """
+        draw.line((x0, y1, x1, y1), fill=0, width=1)
+        slot = (x1 - x0) // self.MONITOR_SPARK_SLOTS
+        recent = list(values)[-self.MONITOR_SPARK_SLOTS:]
+        if not recent:
+            draw.text((x0, y0 + 4), "collecting samples…", font=self._font(12), fill=0)
+            return
+        span = y1 - y0 - 1
+        scale = max(self.MONITOR_SPARK_MIN_SCALE, max(recent))
+        first = x1 - len(recent) * slot
+        for index, value in enumerate(recent):
+            value = min(scale, max(0.0, value))
+            if value <= 0:
+                continue
+            # 有负载就至少画得见：2px 的柱子比 0px 的空白诚实
+            height = max(2, int(span * value / scale))
+            left = first + index * slot
+            draw.rectangle((left, y1 - height, left + slot - 2, y1 - 1), fill=0)
+
+    @staticmethod
+    def _cpu_usage_pct(mon) -> float:
+        """采样器给不出瞬时使用率时（第一帧），用 load/核数 近似，别让卡片空着。"""
+        if mon.cpu_percent is not None:
+            return mon.cpu_percent
+        return min(100.0, mon.load_1m / _CPU_CORES * 100)
 
     def _monitor_header(self, draw, mon, updated_at) -> None:
         draw.text((18, 12), "DEVICE MONITOR", font=self._font(30, bold=True), fill=0)
@@ -453,16 +553,17 @@ class DashboardRenderer:
             return "—"
         down = DashboardRenderer._fmt_rate(mon.net_rx_bps)
         up = DashboardRenderer._fmt_rate(mon.net_tx_bps)
-        return f"RX {down} · TX {up}"
+        return f"↓{down} ↑{up}"
 
     @staticmethod
     def _fmt_rate(bps: float | None) -> str:
         if bps is None:
             return "—"
-        if bps >= 1_000_000:
-            return f"{bps / 1_000_000:.1f}M/s"
-        if bps >= 1_000:
-            return f"{bps / 1_000:.1f}K/s"
+        # 三位有效数字就够：440.0K/s 比 440K/s 只多噪音，还多一次局部刷新
+        for scale, suffix in ((1_000_000, "M/s"), (1_000, "K/s")):
+            if bps >= scale:
+                value = bps / scale
+                return f"{value:.0f}{suffix}" if value >= 100 else f"{value:.1f}{suffix}"
         return f"{bps:.0f}B/s"
 
     @staticmethod

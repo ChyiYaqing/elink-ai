@@ -318,3 +318,74 @@ def test_fonts_are_cached_per_size_and_weight():
     assert renderer._font(20, bold=True) is renderer._font(20, bold=True)
     assert renderer._font(20, bold=True) is not renderer._font(20, bold=False)
     assert renderer._font(20, bold=True) is not renderer._font(21, bold=True)
+
+
+def test_monitor_row_change_stays_inside_its_row():
+    renderer = DashboardRenderer()
+    mem_box = renderer._monitor_boxes()[1]
+    before = renderer.render_monitor(_monitor(mem_percent=40.0), updated_at=FIXED_TIME, panel={})
+    after = renderer.render_monitor(_monitor(mem_percent=70.0), updated_at=FIXED_TIME, panel={})
+    plan = FrameDiffer().plan(before, after)
+    assert plan.kind == "region"
+    _assert_within(plan.regions, mem_box, renderer)
+
+
+def test_monitor_sparkline_change_stays_inside_the_hero_card():
+    renderer = DashboardRenderer()
+    hero_box = renderer._monitor_boxes()[0]
+    history = tuple(float(value) for value in range(0, 60, 3))
+    before = renderer.render_monitor(_monitor(cpu_history=history), updated_at=FIXED_TIME, panel={})
+    after = renderer.render_monitor(_monitor(cpu_history=history + (95.0,)),
+                                    updated_at=FIXED_TIME, panel={})
+    plan = FrameDiffer().plan(before, after)
+    assert plan.kind == "region"
+    _assert_within(plan.regions, hero_box, renderer)
+
+
+def test_monitor_sparkline_only_draws_the_newest_samples():
+    renderer = DashboardRenderer()
+    slots = DashboardRenderer.MONITOR_SPARK_SLOTS
+    long_history = tuple(float(value % 100) for value in range(slots * 2))
+    full = renderer.render_monitor(_monitor(cpu_history=long_history),
+                                   updated_at=FIXED_TIME, panel={})
+    tail = renderer.render_monitor(_monitor(cpu_history=long_history[-slots:]),
+                                   updated_at=FIXED_TIME, panel={})
+    assert full.tobytes() == tail.tobytes()
+
+
+def test_monitor_sparkline_without_history_still_renders():
+    renderer = DashboardRenderer()
+    image = renderer.render_monitor(_monitor(cpu_history=()), updated_at=FIXED_TIME, panel={})
+    hero = renderer._monitor_boxes()[0]
+    assert image.convert("L").crop(hero).getextrema()[0] == 0
+
+
+def test_rate_formatting_keeps_three_significant_digits():
+    assert DashboardRenderer._fmt_rate(1_200_000) == "1.2M/s"
+    assert DashboardRenderer._fmt_rate(440_000) == "440K/s"
+    assert DashboardRenderer._fmt_rate(1_500) == "1.5K/s"
+    assert DashboardRenderer._fmt_rate(999) == "999B/s"
+    assert DashboardRenderer._fmt_rate(None) == "—"
+
+
+def test_monitor_separators_stay_out_of_every_card():
+    """分隔线必须落在框与框的缝里，否则会被算进某张卡的脏矩形。"""
+    renderer = DashboardRenderer()
+    blank = Image.new("L", (renderer.width, renderer.height), 255)
+    renderer._monitor_rules(ImageDraw.Draw(blank))
+    assert blank.getextrema()[0] == 0, "expected the rules to draw something"
+    for box in renderer._monitor_boxes():
+        assert blank.crop(box).getextrema() == (255, 255), f"a rule crosses {box}"
+
+
+def test_monitor_sparkline_scales_to_the_peak_so_idle_load_stays_visible():
+    """闲置机器长期在个位数百分比：固定 0-100 会把趋势压没（真机验证发现）。"""
+    renderer = DashboardRenderer()
+    hero = renderer._monitor_boxes()[0]
+    idle = renderer.render_monitor(_monitor(cpu_history=(2.0, 3.0, 2.0, 6.0)),
+                                   updated_at=FIXED_TIME, panel={}).convert("L")
+    flat = renderer.render_monitor(_monitor(cpu_history=(2.0, 2.0, 2.0, 2.0)),
+                                   updated_at=FIXED_TIME, panel={}).convert("L")
+    band = (hero[0], hero[1] + 208, hero[2], hero[1] + 286)
+    assert idle.crop(band).getextrema()[0] == 0, "idle history drew nothing"
+    assert idle.crop(band).tobytes() != flat.crop(band).tobytes()

@@ -63,8 +63,9 @@ percentages (collected locally from the day the feature is enabled).
 - final full, and manual full refresh
 - stale/offline display, last-frame preview, and persistent device settings
 - device-monitor idle screen: when AI usage is idle the panel flips to a live
-  CPU / memory / disk / temperature / network / panel-health page and flips back
-  the moment a session starts (configurable via the `[monitor]` section)
+  page with a CPU hero card (load, usage, and a 30-sample trend) plus memory,
+  disk, temperature, network and panel-health readings, and flips back the
+  moment a session starts (configurable via the `[monitor]` section)
 - menu-bar device discovery, DHCP/bridge self-healing, and detailed quota/reset status
 - exact last-frame preview with page switching and smart/full refresh controls
 - restart-safe quota caching with per-provider freshness and fallback status

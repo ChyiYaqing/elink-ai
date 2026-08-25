@@ -114,3 +114,14 @@ def test_signature_is_stable_and_changes_with_data(proc):
     assert mon.signature() == mon.signature()
     changed = replace(mon, load_1m=round(mon.load_1m + 10.0, 1))
     assert changed.signature() != mon.signature()
+
+
+def test_cpu_history_accumulates_and_is_capped(proc):
+    monitor = SystemMonitor(net_sample_interval_s=0.1)
+    assert monitor.poll().cpu_history == ()  # 第一次只建立基线，还没有使用率
+    for step in range(SystemMonitor.HISTORY_SAMPLES + 5):
+        proc["STAT"].write_text(
+            f"cpu  {100 + step * 50} 0 {100 + step * 50} {800 + step * 100} 0 0 0 0 0 0\n")
+        history = monitor.poll().cpu_history
+    assert len(history) == SystemMonitor.HISTORY_SAMPLES
+    assert all(0 <= value <= 100 for value in history)
