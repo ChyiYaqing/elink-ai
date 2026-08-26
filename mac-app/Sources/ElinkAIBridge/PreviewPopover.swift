@@ -467,14 +467,18 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
             switch result {
             case let .success(info):
                 self.model.mode = info.mode
+                self.model.showsMonitor = info.showsMonitor
                 self.model.deviceSummary = Self.deviceSummary(info)
-                self.model.deviceBadge = info.stale ? tr("数据陈旧", "Stale") : tr("在线", "Online")
+                self.model.deviceBadge = info.showsMonitor
+                    ? tr("监控页", "Monitor")
+                    : (info.stale ? tr("数据陈旧", "Stale") : tr("在线", "Online"))
                 self.model.deviceHealthy = !info.stale
             case let .failure(error):
                 self.model.deviceSummary = tr("设备离线 · \(error.localizedDescription)",
                                               "Device offline · \(error.localizedDescription)")
                 self.model.deviceBadge = tr("离线", "Offline")
                 self.model.deviceHealthy = false
+                self.model.showsMonitor = false
             }
         }
     }
@@ -517,7 +521,10 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
     static func deviceSummary(_ info: DeviceInfo) -> String {
         let connection = info.stale ? tr("数据陈旧", "Stale") : tr("设备在线", "Device online")
         let version = info.version.map { " v\($0)" } ?? ""
-        let mode = ["dashboard": tr("双栏", "Dual"), "claude": "Claude", "codex": "Codex"][info.mode] ?? info.mode
+        // 屏幕停在监控页时报 mode 是错的：那是用量面板的排版，跟屏上正显示的东西无关
+        let mode = info.showsMonitor
+            ? tr("设备监控", "Device Monitor")
+            : (["dashboard": tr("双栏", "Dual"), "claude": "Claude", "codex": "Codex"][info.mode] ?? info.mode)
         let refresh = ["full": tr("完整刷新", "Full refresh"),
                        "partial": tr("局部刷新", "Partial refresh"),
                        "none": tr("尚未刷新", "Not refreshed yet")][info.refreshKind]

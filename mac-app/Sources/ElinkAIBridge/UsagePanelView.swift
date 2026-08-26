@@ -19,6 +19,8 @@ final class PanelModel: ObservableObject {
     @Published var deviceBadge = tr("连接中", "Connecting")
     @Published var deviceHealthy = false
     @Published var mode = "dashboard"
+    /// 屏幕此刻停在设备监控页（空闲填充页）上，而不是用量面板。
+    @Published var showsMonitor = false
     @Published var busy = false
     @Published var refreshingUsage = false
     @Published var showSettings = false
@@ -247,6 +249,16 @@ struct UsagePanelView: View {
                             .font(.system(size: 10))
                             .foregroundStyle(theme.textTertiary)
                     )
+            }
+            if model.showsMonitor {
+                // 屏上是监控页时，下面的模式选择器决定的是「切回用量面板后」的排版，
+                // 不是此刻屏幕的内容。不说清楚就会以为选择器坏了。
+                Text(tr("屏幕空闲中，正显示设备监控页；有 AI 活动时自动切回用量面板。",
+                        "Idle: the panel is showing the device monitor and returns to usage when AI activity resumes."))
+                    .font(.system(size: 10))
+                    .foregroundStyle(theme.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
             HStack(spacing: 8) {
                 Picker("", selection: Binding(

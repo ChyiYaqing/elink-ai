@@ -209,6 +209,11 @@ struct DeviceInfo {
     let lastRefreshAge: Int?
     let refreshKind: String
     let error: String?
+    /// 屏幕此刻在显示哪一类内容：`ai` 是用量面板，`monitor` 是设备监控页。
+    /// 它和 `mode` 是两回事——`mode` 只决定用量面板怎么排版，监控页是空闲填充页。
+    let content: String
+    let monitorEnabled: Bool
+    let monitorIdleAfter: Int?
 
     init(json: [String: Any]) throws {
         guard json["device_type"] as? String == "elink-agent" else {
@@ -223,7 +228,14 @@ struct DeviceInfo {
         lastRefreshAge = (json["last_refresh_age_s"] as? NSNumber)?.intValue
         refreshKind = json["last_refresh_kind"] as? String ?? "none"
         error = json["error"] as? String
+        content = json["content"] as? String ?? "ai"
+        let monitor = json["monitor"] as? [String: Any] ?? [:]
+        monitorEnabled = monitor["enabled"] as? Bool ?? false
+        monitorIdleAfter = (monitor["idle_after_s"] as? NSNumber)?.intValue
     }
+
+    /// 屏幕正停在设备监控页上。
+    var showsMonitor: Bool { content == "monitor" }
 }
 
 enum BridgeError: LocalizedError {

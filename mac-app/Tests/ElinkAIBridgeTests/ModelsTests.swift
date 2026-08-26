@@ -1090,6 +1090,45 @@ final class ModelsTests: XCTestCase {
         XCTAssertTrue(summary.contains("v0.1.12"))
     }
 
+    func testReportsWhatThePanelIsActuallyShowing() throws {
+        // 屏幕停在监控页时报 mode 是错的：mode 只决定用量面板的排版，监控页是空闲
+        // 填充页。图上是监控页、文字写「双栏」，图文就对不上了。
+        let info = try DeviceInfo(json: [
+            "device_type": "elink-agent",
+            "mode": "dashboard",
+            "content": "monitor",
+            "stale": false,
+            "monitor": ["enabled": true, "idle_after_s": 60, "idle": true],
+        ])
+
+        XCTAssertTrue(info.showsMonitor)
+        XCTAssertTrue(info.monitorEnabled)
+        XCTAssertEqual(info.monitorIdleAfter, 60)
+        let summary = PreviewPopoverController.deviceSummary(info)
+        XCTAssertTrue(summary.contains(tr("设备监控", "Device Monitor")))
+        XCTAssertFalse(summary.contains(tr("双栏", "Dual")))
+    }
+
+    func testUsagePageStillReportsItsMode() throws {
+        let info = try DeviceInfo(json: [
+            "device_type": "elink-agent",
+            "mode": "dashboard",
+            "content": "ai",
+            "monitor": ["enabled": true, "idle_after_s": 60, "idle": false],
+        ])
+
+        XCTAssertFalse(info.showsMonitor)
+        XCTAssertTrue(PreviewPopoverController.deviceSummary(info).contains(tr("双栏", "Dual")))
+    }
+
+    func testAgentWithoutMonitorSupportDefaultsToTheUsagePage() throws {
+        // 老版本 agent 不报 content/monitor，那时屏上只可能是用量面板
+        let info = try DeviceInfo(json: ["device_type": "elink-agent", "mode": "claude"])
+        XCTAssertFalse(info.showsMonitor)
+        XCTAssertFalse(info.monitorEnabled)
+        XCTAssertNil(info.monitorIdleAfter)
+    }
+
     func testDeviceSummaryOmitsVersionWhenAgentDoesNotReportOne() throws {
         let info = try DeviceInfo(json: ["device_type": "elink-agent", "mode": "dashboard"])
         XCTAssertNil(info.version)
