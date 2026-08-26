@@ -175,3 +175,28 @@ windows that keep the merged area below the fast-full threshold. Measured on a
 monitor tick under changing load, three windows cover 27.8% of the screen in
 about 1.05 s, four cover 15.9% in about 1.4 s, and eight cover 7.7% but take
 about 2.45 s, longer than the monitor page's own cadence. The default is four.
+
+### Overnight ghosting observation, 2026-08-25
+
+`3BP` ran from 19:00 to 08:00, thirteen hours, with the device-monitor page on
+screen and the settings this release's tuning arrived at: a monitor cadence of
+`refresh_interval_s = 4` measured at 6.9 s per tick, `full_every = 60`,
+`min_dwell_s = 300`, and `[display] keep_awake_s = 10`.
+
+The journal records 6,643 region refreshes and 143 full refreshes, about one
+panel operation every 7.0 s and roughly 46 partial refreshes between full
+ones. There were no warnings, no refresh failures, and no agent restarts in the
+window. The panel was inspected by eye the next morning and showed no ghosting.
+
+This is the first real evidence against the caution carried in this file, and
+it is narrower than the deferred 24-hour ambient run: one panel, thirteen
+hours, one page. The shipped defaults in `install/config.example.toml` stay
+conservative — `full_every = 20`, `keep_awake_s = 0` — because they run on
+panels nobody here has measured. Treat the settings above as validated for
+this device rather than as new defaults.
+
+One more thing to keep in view: with a four-window budget the merged region
+per tick runs 19-35% of the screen, against 1-8% when the budget was eight.
+Fewer windows is the cheaper trade in time, but it means a wider area takes
+partial refreshes between full ones, so the area figure belongs in any future
+ghosting comparison.
