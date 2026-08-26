@@ -6,6 +6,46 @@ and `Removed`.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## 0.1.21-rc7
+
+### Added
+
+- The device-monitor page lists every network interface the device has an
+  address on, so a machine that is also on an overlay network shows both its
+  LAN and overlay addresses instead of only the one its default route uses.
+  The device API reports the same list.
+- The monitor page's timestamp carries seconds, so a page that updates every
+  few seconds no longer looks frozen between minute boundaries.
+- The menu-bar panel says which page the e-paper is actually showing. While
+  the panel sits on the device monitor the card reports that instead of the
+  usage layout, which is what the picture beside it was already showing.
+
+### Changed
+
+- Once the monitor page reaches the panel it stays for a minimum dwell, so
+  intermittent AI activity no longer flips the screen back and forth, at two
+  full refreshes a time. A pending permission request still switches back
+  immediately.
+- An optional `[display] keep_awake_s` lets the panel stay initialised between
+  dense refreshes, taking a region refresh from about 1.25s to about 0.47s.
+  It defaults to off, and the window is bounded so the panel is never left
+  powered indefinitely.
+
+### Fixed
+
+- A monitor update repainted the whole screen once a minute. The change was
+  2.6% of the pixels; the frame differ collapsed every scattered edit into one
+  bounding box and crossed its escalation threshold. Nearby edits now merge
+  pairwise, and when that would still cross the threshold the update spends a
+  few more windows rather than repainting everything.
+- Only one region of a partial refresh ever reached the panel: each window
+  overwrote the previous one's coordinates before a single refresh command.
+  Every window now gets its own refresh cycle, which is what made the seconds
+  on the monitor page stand still until a full refresh.
+- The monitor page no longer waits out a coalescing window meant for pages
+  that repaint on data changes, and the main loop wakes often enough for the
+  configured cadence to mean what it says.
+
 ## 0.1.21-rc6
 
 ### Added
