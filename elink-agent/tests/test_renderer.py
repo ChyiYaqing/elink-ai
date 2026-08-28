@@ -372,7 +372,7 @@ def test_rate_formatting_keeps_three_significant_digits():
 
 def test_monitor_strip_lists_every_interface_address():
     renderer = DashboardRenderer()
-    assert renderer._address_line(_monitor()) == "wlan0 10.1.9.16 · nebula1 192.168.100.6"
+    assert renderer._address_segments(_monitor()) == ("wlan0 10.1.9.16", "nebula1 192.168.100.6")
     strip = renderer._monitor_boxes()[5]
     both = renderer.render_monitor(_monitor(), updated_at=FIXED_TIME, panel={}).convert("L")
     one = renderer.render_monitor(_monitor(interfaces=(("wlan0", "10.1.9.16"),)),
@@ -383,8 +383,8 @@ def test_monitor_strip_lists_every_interface_address():
 def test_address_line_falls_back_to_the_outbound_ip_without_interface_names():
     """非 Linux 上取不到网卡名，但那一个地址仍然是「怎么连上它」的答案。"""
     renderer = DashboardRenderer()
-    assert renderer._address_line(_monitor(interfaces=())) == "10.1.9.16"
-    assert renderer._address_line(_monitor(interfaces=(), ip_address=None)) == ""
+    assert renderer._address_segments(_monitor(interfaces=())) == ("10.1.9.16",)
+    assert renderer._address_segments(_monitor(interfaces=(), ip_address=None)) == ()
 
 
 def test_addresses_never_reach_the_page_dots():
@@ -401,6 +401,41 @@ def test_addresses_never_reach_the_page_dots():
     dots = (x1 - renderer.MONITOR_DOTS_GUTTER, y0, x1, y1)
     assert short.crop(dots).tobytes() == long.crop(dots).tobytes()
     assert short.crop(dots).getextrema()[0] == 0, "expected the page dots to be drawn"
+
+
+def test_long_address_lists_wrap_instead_of_being_cut_off():
+    """网卡多到一行放不下时折行，而不是把最后一张网卡截成省略号。"""
+    renderer = DashboardRenderer()
+    image = Image.new("1", (renderer.width, renderer.height), 255)
+    draw = ImageDraw.Draw(image)
+    font = renderer._font(12)
+    segments = ("eth0 10.1.7.27", "nebula1 192.168.100.6", "wlan0 10.1.9.16",
+                "docker0 172.17.0.1", "tailscale0 100.64.12.9")
+
+    one = renderer._address_lines(draw, segments, font, [420])
+    two = renderer._address_lines(draw, segments, font, [420, 572])
+
+    assert len(one) == 1 and one[0].endswith("…")
+    assert len(two) == 2
+    assert " · ".join(two) == " · ".join(segments), "折行不该丢掉任何一张网卡"
+    # 折行只发生在段与段之间：一张网卡的名字和地址永远在同一行
+    assert all(segment in " ".join(two) for segment in segments)
+
+
+def test_wrapped_addresses_stay_inside_the_status_strip():
+    """第二行地址必须落在状态条框内，且不能画到翻页点上。"""
+    renderer = DashboardRenderer()
+    x0, y0, x1, y1 = renderer._monitor_boxes()[5]
+    many = tuple((f"nebula{index}", f"192.168.{index}.240") for index in range(6))
+    panel = {"last_refresh_kind": "region", "last_refresh_region_count": 3,
+             "last_busy_wait_ms": 423}
+    image = renderer.render_monitor(_monitor(interfaces=many),
+                                    updated_at=FIXED_TIME, panel=panel).convert("L")
+    assert image.crop((x0, y1, x1, renderer.height)).getextrema()[0] == 255, \
+        "地址折行后溢出了状态条"
+    wrapped_row = y0 + renderer.MONITOR_STRIP_SUB_Y + renderer.MONITOR_ADDRESS_LINE_H
+    assert image.crop((x0, wrapped_row, x1 - renderer.MONITOR_DOTS_GUTTER,
+                       y1)).getextrema()[0] == 0, "第二行地址没画出来"
 
 
 def test_monitor_identity_never_runs_into_the_panel_state():
