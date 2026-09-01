@@ -38,6 +38,13 @@ class DashboardRenderer:
     MONITOR_SPARK_SLOTS = 30
     # 状态条右下角留给翻页点的宽度：地址行到此为止
     MONITOR_DOTS_GUTTER = 40
+    # 状态条第二行（面板健康 + 地址）的基线。比原来高 4px，好给折行的地址腾出
+    # 第三行，同时不动状态条的框和翻页点。
+    MONITOR_STRIP_SUB_Y = 26
+    MONITOR_ADDRESS_LINE_H = 15
+    # 比这更窄的空档放不下一段「名字 地址」，与其挤成省略号不如整段折到下一行
+    MONITOR_ADDRESS_MIN_WIDTH = 60
+    MONITOR_ADDRESS_SEP = " · "
     MONITOR_SPARK_MIN_SCALE = 25.0
 
     _MODEL_ROWS = 4
@@ -477,17 +484,21 @@ class DashboardRenderer:
         draw.text((x1 - host_w, y0 + 2), host, font=host_font, fill=0)
         sub_font = self._font(12)
         sub = self._truncate(draw, self._panel_sub(panel), sub_font, x1 - x0 - 60)
-        draw.text((x0, y0 + 30), sub, font=sub_font, fill=0)
+        sub_y = y0 + self.MONITOR_STRIP_SUB_Y
+        draw.text((x0, sub_y), sub, font=sub_font, fill=0)
         # 地址行和面板副标题共用一行：左边是面板健康，右边是每张网卡的地址。右端停
-        # 在翻页点左侧的 DOTS_GUTTER 处，所以再长的地址列表也不会画到点上。
-        addresses = self._address_line(mon)
+        # 在翻页点左侧的 DOTS_GUTTER 处，所以再长的地址列表也不会画到点上。网卡多
+        # 到一行放不下时折到下一行——那一行整条都空着，宽度比第一行的空档宽得多。
         sub_w = draw.textbbox((0, 0), sub, font=sub_font)[2]
         right = x1 - self.MONITOR_DOTS_GUTTER
-        room = right - (x0 + sub_w + 16)
-        if addresses and room >= 60:
-            text = self._truncate(draw, addresses, sub_font, room)
-            text_w = draw.textbbox((0, 0), text, font=sub_font)[2]
-            draw.text((right - text_w, y0 + 30), text, font=sub_font, fill=0)
+        slots = [(0, right - (x0 + sub_w + 16)),
+                 (self.MONITOR_ADDRESS_LINE_H, right - x0)]
+        slots = [slot for slot in slots if slot[1] >= self.MONITOR_ADDRESS_MIN_WIDTH]
+        lines = self._address_lines(draw, self._address_segments(mon), sub_font,
+                                    [width for _, width in slots])
+        for (offset, _), line in zip(slots, lines):
+            text_w = draw.textbbox((0, 0), line, font=sub_font)[2]
+            draw.text((right - text_w, sub_y + offset), line, font=sub_font, fill=0)
         self._page_dots(draw, x1, y1 - 12, active=1)
 
     def _sparkline(self, draw: ImageDraw.ImageDraw, x0: int, y0: int, x1: int, y1: int,
@@ -540,7 +551,7 @@ class DashboardRenderer:
         draw.line((18, 64, 630, 64), fill=0, width=2)
 
     @staticmethod
-    def _address_line(mon) -> str:
+    def _address_segments(mon) -> tuple[str, ...]:
         """每张网卡一段「名字 地址」。无头设备上这一行就是「怎么连上它」的答案，
         而带 overlay 的机器有好几个都是对的答案，所以全列出来而不是只挑一个。
 
@@ -548,8 +559,37 @@ class DashboardRenderer:
         """
         interfaces = tuple(getattr(mon, "interfaces", ()) or ())
         if interfaces:
-            return " · ".join(f"{name} {address}" for name, address in interfaces)
-        return getattr(mon, "ip_address", None) or ""
+            return tuple(f"{name} {address}" for name, address in interfaces)
+        fallback = getattr(mon, "ip_address", None)
+        return (fallback,) if fallback else ()
+
+    def _address_lines(self, draw: ImageDraw.ImageDraw, segments, font,
+                       widths) -> tuple[str, ...]:
+        """把地址段贪心地装进给定宽度的几行。折行永远在段与段之间，所以每张网卡
+        的「名字 地址」不会被拆到两行上。
+
+        行数还是不够时，剩下的段挤进最后一行再截断：截掉几个字符仍然看得出还有
+        别的网卡，而直接丢掉一段会让人以为那条路不通。
+        """
+        pending = list(segments)
+        if not pending or not widths:
+            return ()
+        lines: list[str] = []
+        for width in widths:
+            if not pending:
+                break
+            line = pending.pop(0)
+            while pending:
+                candidate = f"{line}{self.MONITOR_ADDRESS_SEP}{pending[0]}"
+                if draw.textbbox((0, 0), candidate, font=font)[2] > width:
+                    break
+                line = candidate
+                pending.pop(0)
+            lines.append(line)
+        if pending:
+            lines[-1] = self.MONITOR_ADDRESS_SEP.join([lines[-1], *pending])
+        return tuple(self._truncate(draw, line, font, width)
+                     for line, width in zip(lines, widths))
 
     @staticmethod
     def _panel_value(panel) -> str:
