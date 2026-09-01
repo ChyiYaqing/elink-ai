@@ -114,19 +114,23 @@ class DashboardRenderer:
         return {name: (box[0], box[1], box[2] + 1, box[3] + 1) for name, box in boxes.items()}
 
     def _header(self, draw: ImageDraw.ImageDraw, stale: bool, updated_at: datetime) -> None:
-        draw.text((18, 12), "AI USAGE", font=self._font(34, bold=True), fill=0)
+        draw.rounded_rectangle((18, 10, 102, 31), radius=6, fill=0)
+        draw.text((28, 12), "ELINK AI", font=self._font(12, bold=True), fill=255)
+        draw.text((18, 31), "MISSION CONTROL", font=self._font(27, bold=True), fill=0)
         state = "STALE / MAC OFFLINE" if stale else "LIVE"
-        state_font = self._font(18, bold=True)
+        state_font = self._font(14, bold=True)
         state_width = draw.textbbox((0, 0), state, font=state_font)[2]
-        draw.text((630 - state_width, 14), state, font=state_font, fill=0)
-        stamp = updated_at.strftime("Updated %H:%M")
-        stamp_font = self._font(14)
+        badge = (630 - state_width - 20, 10, 630, 33)
+        draw.rounded_rectangle(badge, radius=11, fill=0)
+        draw.text((badge[0] + 10, 13), state, font=state_font, fill=255)
+        stamp = updated_at.strftime("TELEMETRY · %H:%M")
+        stamp_font = self._font(12)
         stamp_width = draw.textbbox((0, 0), stamp, font=stamp_font)[2]
         draw.text((630 - stamp_width, 42), stamp, font=stamp_font, fill=0)
         draw.line((18, 64, 630, 64), fill=0, width=2)
 
     def _footer(self, draw: ImageDraw.ImageDraw) -> None:
-        draw.text((18, 461), f"elink-agent v{__version__}", font=self._font(12, bold=False), fill=0)
+        draw.text((18, 461), f"ELINK AGENT · v{__version__}", font=self._font(12, bold=False), fill=0)
         self._page_dots(draw, 630, 468, active=0)
 
     @staticmethod
@@ -142,41 +146,52 @@ class DashboardRenderer:
                         sessions: list[SessionSummary], events: list[RecentEvent],
                         updated_at: datetime, large: bool = False) -> None:
         x0, y0, x1, y1 = box
-        draw.rounded_rectangle(box, radius=10, outline=0, width=2)
-        title_size = 34 if large else 27
-        draw.text((x0 + 16, y0 + 12), name, font=self._font(title_size, bold=True), fill=0)
+        # PocketJS 风格的实体偏移阴影在 1-bit 屏上比灰阶阴影更可靠。两层都收在
+        # 组件框内，静态外形不会扩大额度变化时的脏矩形。
+        draw.rounded_rectangle((x0 + 3, y0 + 3, x1, y1), radius=12, fill=0)
+        draw.rounded_rectangle((x0, y0, x1 - 3, y1 - 3), radius=12,
+                               fill=255, outline=0, width=2)
+        title_size = 32 if large else 25
+        provider_index = "PROVIDER 01" if name.lower() == "claude" else "PROVIDER 02"
+        draw.text((x0 + 16, y0 + 10), provider_index,
+                  font=self._font(10, bold=True), fill=0)
+        draw.text((x0 + 16, y0 + 25), name.upper(),
+                  font=self._font(title_size, bold=True), fill=0)
         self._status_badge(draw, box, provider, large)
 
         pct = self._percentage(provider.primary_pct)
         label_x = x0 + (250 if large else 168)
-        pct_font = self._fit_font(draw, pct, preferred=92 if large else 66,
+        draw.text((x0 + 16, y0 + 67), "5 HOUR WINDOW",
+                  font=self._font(12, bold=True), fill=0)
+        pct_font = self._fit_font(draw, pct, preferred=92 if large else 68,
                                   minimum=54 if large else 42,
                                   max_width=label_x - (x0 + 16) - 12, bold=True)
-        draw.text((x0 + 16, y0 + 58), pct, font=pct_font, fill=0)
-        draw.text((label_x, y0 + 75), "5 HOUR", font=self._font(18, bold=True), fill=0)
-        draw.text((label_x, y0 + 102), self._reset(provider.primary_reset_min),
-                  font=self._font(15), fill=0)
+        draw.text((x0 + 16, y0 + 79), pct, font=pct_font, fill=0)
+        draw.text((label_x, y0 + 91), "USED", font=self._font(15, bold=True), fill=0)
+        reset = self._reset(provider.primary_reset_min).replace("reset ", "")
+        draw.text((label_x, y0 + 115), f"RESET {reset.upper()}",
+                  font=self._font(12), fill=0)
 
         bar_y = y0 + 156
         self._progress(draw, x0 + 16, bar_y, x1 - 16, provider.primary_pct)
 
-        weekly_y = bar_y + 48
-        draw.text((x0 + 16, weekly_y), "WEEK", font=self._font(17, bold=True), fill=0)
+        weekly_y = bar_y + 45
+        draw.text((x0 + 16, weekly_y), "WEEKLY LIMIT", font=self._font(14, bold=True), fill=0)
         weekly = self._percentage(provider.weekly_pct)
-        wf = self._font(25, bold=True)
+        wf = self._font(24, bold=True)
         ww = draw.textbbox((0, 0), weekly, font=wf)[2]
-        draw.text((x1 - 16 - ww, weekly_y - 5), weekly, font=wf, fill=0)
-        self._progress(draw, x0 + 16, weekly_y + 31, x1 - 16, provider.weekly_pct, height=12)
-        draw.text((x0 + 16, weekly_y + 52), self._reset(provider.weekly_reset_min),
-                  font=self._font(14), fill=0)
+        draw.text((x1 - 16 - ww, weekly_y - 6), weekly, font=wf, fill=0)
+        self._progress(draw, x0 + 16, weekly_y + 28, x1 - 16, provider.weekly_pct, height=12)
+        draw.text((x0 + 16, weekly_y + 48), self._reset(provider.weekly_reset_min).upper(),
+                  font=self._font(12), fill=0)
 
         token_y = y1 - 108
         draw.line((x0 + 16, token_y, x1 - 16, token_y), fill=0, width=1)
-        draw.text((x0 + 16, token_y + 8), "TODAY", font=self._font(15, bold=True), fill=0)
+        draw.text((x0 + 16, token_y + 8), "TODAY TOKENS", font=self._font(12, bold=True), fill=0)
         token = self._compact(provider.tokens_today)
-        tf = self._font(22, bold=True)
+        tf = self._font(24, bold=True)
         tw = draw.textbbox((0, 0), token, font=tf)[2]
-        draw.text((x1 - 16 - tw, token_y + 3), token, font=tf, fill=0)
+        draw.text((x1 - 16 - tw, token_y + 1), token, font=tf, fill=0)
         has_activity = bool(sessions or events)
         self._model_usage(
             draw, x0 + 16, token_y + 34, x1 - 16, provider.model_usage_today, name,
@@ -191,7 +206,7 @@ class DashboardRenderer:
         _, y0, x1, _ = box
         width = 186 if large else 152
         height = 32 if large else 28
-        return (x1 - 16 - width, y0 + 16, x1 - 16, y0 + 16 + height)
+        return (x1 - 16 - width, y0 + 17, x1 - 16, y0 + 17 + height)
 
     def _activity_box(self, box: tuple[int, int, int, int], index: int) -> tuple[int, int, int, int]:
         x0, _, x1, y1 = box
@@ -220,13 +235,13 @@ class DashboardRenderer:
         else:
             text = provider.status.upper()
         font = self._font(18 if large else 15, bold=True)
-        if attention:
-            draw.rectangle((bx0, by0, bx1, by1), fill=0)
+        radius = (by1 - by0) // 2
+        draw.rounded_rectangle((bx0, by0, bx1, by1), radius=radius,
+                               fill=0 if attention else 255, outline=0, width=1)
         bounds = draw.textbbox((0, 0), text, font=font)
         y = by0 + (by1 - by0 - bounds[3]) // 2
-        # 只有反白时才留内边距，否则状态文字的右边缘会比同栏的百分比和 token 内缩
-        padding = 8 if attention else 0
-        draw.text((bx1 - padding - bounds[2], y), text, font=font, fill=255 if attention else 0)
+        text_x = bx0 + (bx1 - bx0 - bounds[2]) // 2
+        draw.text((text_x, y), text, font=font, fill=255 if attention else 0)
 
     def _model_usage(self, draw: ImageDraw.ImageDraw, x0: int, y0: int, x1: int,
                      usage: list, provider_name: str, *, max_rows: int,
@@ -293,14 +308,17 @@ class DashboardRenderer:
     @staticmethod
     def _progress(draw: ImageDraw.ImageDraw, x0: int, y0: int, x1: int,
                   value: float | None, height: int = 18) -> None:
-        draw.rectangle((x0, y0, x1, y0 + height), outline=0, width=2)
+        radius = max(2, height // 2)
+        draw.rounded_rectangle((x0, y0, x1, y0 + height), radius=radius,
+                               outline=0, width=2)
         if value is None:
             for x in range(x0 + 3, x1 - 2, 9):
                 draw.line((x, y0 + height - 3, min(x + 6, x1 - 2), y0 + 3), fill=0, width=1)
             return
         fill_width = int((x1 - x0 - 6) * min(100, max(0, value)) / 100)
         if fill_width:
-            draw.rectangle((x0 + 3, y0 + 3, x0 + 3 + fill_width, y0 + height - 3), fill=0)
+            draw.rounded_rectangle((x0 + 3, y0 + 3, x0 + 3 + fill_width, y0 + height - 3),
+                                   radius=max(1, (height - 6) // 2), fill=0)
 
     @staticmethod
     def _reset(minutes: int | None) -> str:
@@ -413,86 +431,100 @@ class DashboardRenderer:
 
     def _monitor_hero(self, draw: ImageDraw.ImageDraw, box, mon) -> None:
         """主角卡：一个压倒性的 load 数字，下面挂使用率条和最近半小时的趋势。"""
-        x0, y0, x1, _ = box
-        draw.text((x0, y0 + 2), "CPU LOAD", font=self._font(15, bold=True), fill=0)
+        x0, y0, x1, y1 = box
+        self._monitor_surface(draw, box, radius=12)
+        left, right = x0 + 14, x1 - 14
+        draw.text((left, y0 + 10), "PRIMARY METRIC", font=self._font(10, bold=True), fill=0)
+        draw.text((left, y0 + 26), "CPU LOAD", font=self._font(20, bold=True), fill=0)
         value = f"{mon.load_1m:.1f}"
-        draw.text((x0, y0 + 20),
+        draw.text((left, y0 + 50),
                   value,
                   font=self._fit_font(draw, value, preferred=76, minimum=52,
-                                      max_width=x1 - x0, bold=True),
+                                      max_width=right - left, bold=True),
                   fill=0)
-        draw.text((x0, y0 + 106), f"1 MIN AVERAGE · {_CPU_CORES} CORES",
-                  font=self._font(13), fill=0)
+        draw.text((left, y0 + 129), f"1 MIN AVERAGE · {_CPU_CORES} CORES",
+                  font=self._font(11), fill=0)
 
         usage = self._cpu_usage_pct(mon)
-        draw.text((x0, y0 + 140), "USAGE", font=self._font(14, bold=True), fill=0)
+        draw.text((left, y0 + 158), "CPU USAGE", font=self._font(12, bold=True), fill=0)
         pct = self._percentage(usage)
-        pct_font = self._font(22, bold=True)
+        pct_font = self._font(20, bold=True)
         pct_w = draw.textbbox((0, 0), pct, font=pct_font)[2]
-        draw.text((x1 - pct_w, y0 + 132), pct, font=pct_font, fill=0)
-        self._progress(draw, x0, y0 + 164, x1, usage, height=14)
+        draw.text((right - pct_w, y0 + 151), pct, font=pct_font, fill=0)
+        self._progress(draw, left, y0 + 181, right, usage, height=14)
 
         history = tuple(mon.cpu_history)[-self.MONITOR_SPARK_SLOTS:]
         caption = f"LAST {self.MONITOR_SPARK_SLOTS} SAMPLES"
         if history:
             caption += f" · PEAK {max(history):.0f}%"
-        draw.text((x0, y0 + 190), caption, font=self._font(12), fill=0)
-        self._sparkline(draw, x0, y0 + 208, x1, y0 + 286, history)
-        draw.text((x0, y0 + 296),
+        draw.text((left, y0 + 207), caption, font=self._font(10), fill=0)
+        self._sparkline(draw, left, y0 + 224, right, y0 + 286, history)
+        draw.text((left, y0 + 298),
                   f"5m {mon.load_5m:.1f} · 15m {mon.load_15m:.1f}",
-                  font=self._font(13), fill=0)
+                  font=self._font(11), fill=0)
 
     def _monitor_rows(self, mon):
         return [
-            dict(title="MEM", value=f"{mon.mem_percent:.0f}%", bar_pct=mon.mem_percent,
+            dict(title="MEMORY", value=f"{mon.mem_percent:.0f}%", bar_pct=mon.mem_percent,
                  sub=f"{self._fmt_bytes(mon.mem_available_kb * 1024)} free of "
                      f"{self._fmt_bytes(mon.mem_total_kb * 1024)}"),
-            dict(title="DISK", value=f"{mon.disk_percent:.0f}%", bar_pct=mon.disk_percent,
+            dict(title="STORAGE", value=f"{mon.disk_percent:.0f}%", bar_pct=mon.disk_percent,
                  sub=f"{self._fmt_bytes(mon.disk_used)} used of {self._fmt_bytes(mon.disk_total)}"),
-            dict(title="TEMP", value=self._fmt_temp(mon.temp_c), bar_pct=self._temp_pct(mon.temp_c),
+            dict(title="THERMAL", value=self._fmt_temp(mon.temp_c), bar_pct=self._temp_pct(mon.temp_c),
                  sub="cpu thermal zone · 85°C limit"),
-            dict(title="NET", value=self._net_rate(mon), bar_pct=None, value_size=21,
+            dict(title="NETWORK", value=self._net_rate(mon), bar_pct=None, value_size=19,
                  sub=f"rx {self._fmt_bytes(mon.net_rx_total)} · tx {self._fmt_bytes(mon.net_tx_total)}"),
         ]
 
     def _monitor_row(self, draw: ImageDraw.ImageDraw, box, *, title, value,
                      sub="", bar_pct=None, value_size: int = 26) -> None:
         x0, y0, x1, y1 = box
-        title_font = self._font(14, bold=True)
-        draw.text((x0, y0 + 4), title, font=title_font, fill=0)
+        self._monitor_surface(draw, box, radius=6)
+        left, right = x0 + 12, x1 - 12
+        title_font = self._font(12, bold=True)
+        draw.text((left, y0 + 10), title, font=title_font, fill=0)
         title_w = draw.textbbox((0, 0), title, font=title_font)[2]
         value_font = self._fit_font(draw, value, preferred=value_size, minimum=15,
-                                    max_width=x1 - x0 - title_w - 12, bold=True)
+                                    max_width=right - left - title_w - 12, bold=True)
         value_w = draw.textbbox((0, 0), value, font=value_font)[2]
-        draw.text((x1 - value_w, y0), value, font=value_font, fill=0)
+        draw.text((right - value_w, y0 + 4), value, font=value_font, fill=0)
         if bar_pct is not None:
-            self._progress(draw, x0, y0 + 34, x1, bar_pct, height=12)
+            self._progress(draw, left, y0 + 35, right, bar_pct, height=10)
         if sub:
-            font = self._font(12, bold=False)
-            draw.text((x0, y1 - 18), self._truncate(draw, sub, font, x1 - x0), font=font, fill=0)
+            font = self._font(10, bold=False)
+            draw.text((left, y1 - 20), self._truncate(draw, sub, font, right - left),
+                      font=font, fill=0)
 
     def _monitor_strip(self, draw: ImageDraw.ImageDraw, box, mon, panel) -> None:
         x0, y0, x1, y1 = box
-        draw.text((x0, y0 + 6), "PANEL", font=self._font(14, bold=True), fill=0)
+        self._monitor_surface(draw, box, radius=6)
+        left, right_edge = x0 + 12, x1 - 12
+        draw.text((left, y0 + 7), "PANEL", font=self._font(11, bold=True), fill=0)
         value = self._panel_value(panel)
-        value_font = self._font(20, bold=True)
-        draw.text((x0 + 64, y0), value, font=value_font, fill=0)
-        value_right = x0 + 64 + draw.textbbox((0, 0), value, font=value_font)[2]
-        host_font = self._font(16, bold=True)
-        host = self._truncate(draw, mon.hostname, host_font, x1 - value_right - 16)
+        value_font = self._font(13, bold=True)
+        value_w = draw.textbbox((0, 0), value, font=value_font)[2]
+        state_box = (left + 50, y0 + 5, left + 70 + value_w, y0 + 25)
+        alert = value == "ERROR"
+        draw.rounded_rectangle(state_box, radius=10, fill=0 if alert else 255,
+                               outline=0, width=1)
+        draw.text((state_box[0] + 10, y0 + 7), value, font=value_font,
+                  fill=255 if alert else 0)
+        value_right = state_box[2]
+        host_font = self._font(14, bold=True)
+        host = self._truncate(draw, mon.hostname, host_font, right_edge - value_right - 16)
         host_w = draw.textbbox((0, 0), host, font=host_font)[2]
-        draw.text((x1 - host_w, y0 + 2), host, font=host_font, fill=0)
-        sub_font = self._font(12)
+        draw.text((right_edge - host_w, y0 + 7), host, font=host_font, fill=0)
+        sub_font = self._font(10)
         sub = self._truncate(draw, self._panel_sub(panel), sub_font, x1 - x0 - 60)
         sub_y = y0 + self.MONITOR_STRIP_SUB_Y
-        draw.text((x0, sub_y), sub, font=sub_font, fill=0)
+        draw.text((left, sub_y), sub, font=sub_font, fill=0)
         # 地址行和面板副标题共用一行：左边是面板健康，右边是每张网卡的地址。右端停
         # 在翻页点左侧的 DOTS_GUTTER 处，所以再长的地址列表也不会画到点上。网卡多
         # 到一行放不下时折到下一行——那一行整条都空着，宽度比第一行的空档宽得多。
         sub_w = draw.textbbox((0, 0), sub, font=sub_font)[2]
         right = x1 - self.MONITOR_DOTS_GUTTER
-        slots = [(0, right - (x0 + sub_w + 16)),
-                 (self.MONITOR_ADDRESS_LINE_H, right - x0)]
+        slots = [(0, right - (left + sub_w + 16)),
+                 (self.MONITOR_ADDRESS_LINE_H, right - left)]
         slots = [slot for slot in slots if slot[1] >= self.MONITOR_ADDRESS_MIN_WIDTH]
         lines = self._address_lines(draw, self._address_segments(mon), sub_font,
                                     [width for _, width in slots])
@@ -536,19 +568,31 @@ class DashboardRenderer:
         return min(100.0, mon.load_1m / _CPU_CORES * 100)
 
     def _monitor_header(self, draw, mon, updated_at) -> None:
-        draw.text((18, 12), "DEVICE MONITOR", font=self._font(30, bold=True), fill=0)
+        draw.rounded_rectangle((18, 10, 102, 31), radius=6, fill=0)
+        draw.text((28, 12), "ELINK AI", font=self._font(12, bold=True), fill=255)
+        draw.text((18, 31), "DEVICE CONTROL", font=self._font(27, bold=True), fill=0)
         # 监控页的时间戳带秒。分钟粒度下四次 tick 里只有一次看得出变化，这一页
         # 看起来就像卡住了。代价是每一拍时钟都变，也就没有「整帧未变直接跳过」
         # 那条省刷新的路径了——AI 页仍是分钟粒度，它只在数据变化时才重绘。
-        stamp = updated_at.strftime("Updated %H:%M:%S")
-        stamp_font = self._font(14)
-        stamp_w = draw.textbbox((0, 0), stamp, font=stamp_font)[2]
-        draw.text((630 - stamp_w, 14), stamp, font=stamp_font, fill=0)
         up = self._uptime_str(mon.uptime_s)
-        up_font = self._font(16, bold=True)
+        up_font = self._font(13, bold=True)
         up_w = draw.textbbox((0, 0), up, font=up_font)[2]
-        draw.text((630 - up_w, 38), up, font=up_font, fill=0)
+        badge = (630 - up_w - 20, 10, 630, 33)
+        draw.rounded_rectangle(badge, radius=11, fill=0)
+        draw.text((badge[0] + 10, 13), up.upper(), font=up_font, fill=255)
+        stamp = updated_at.strftime("TELEMETRY · %H:%M:%S")
+        stamp_font = self._font(11)
+        stamp_w = draw.textbbox((0, 0), stamp, font=stamp_font)[2]
+        draw.text((630 - stamp_w, 43), stamp, font=stamp_font, fill=0)
         draw.line((18, 64, 630, 64), fill=0, width=2)
+
+    @staticmethod
+    def _monitor_surface(draw: ImageDraw.ImageDraw, box, *, radius: int) -> None:
+        """PocketJS 式实体表面；阴影和白色面板都严格收在动态组件框内。"""
+        x0, y0, x1, y1 = box
+        draw.rounded_rectangle((x0 + 3, y0 + 3, x1 - 1, y1 - 1), radius=radius, fill=0)
+        draw.rounded_rectangle((x0, y0, x1 - 4, y1 - 4), radius=radius,
+                               fill=255, outline=0, width=1)
 
     @staticmethod
     def _address_segments(mon) -> tuple[str, ...]:

@@ -99,8 +99,8 @@ def test_overage_percentage_does_not_overfill_progress_bar():
 
     DashboardRenderer._progress(draw, 10, 5, 110, 102)
 
-    assert draw.rectangle.call_args_list[0].args == ((10, 5, 110, 23),)
-    assert draw.rectangle.call_args_list[1].args == ((13, 8, 107, 20),)
+    assert draw.rounded_rectangle.call_args_list[0].args == ((10, 5, 110, 23),)
+    assert draw.rounded_rectangle.call_args_list[1].args == ((13, 8, 107, 20),)
 
 
 def test_model_labels_drop_redundant_provider_prefix():
@@ -246,7 +246,7 @@ class TestStaleBadge:
         def filled(provider) -> bool:
             image = Image.new("1", (renderer.width, renderer.height), 255)
             renderer._status_badge(ImageDraw.Draw(image), box, provider, False)
-            return image.getpixel((bx0 + 2, by0 + 2)) == 0
+            return image.getpixel(((bx0 + bx1) // 2, by0 + 2)) == 0
 
         assert filled(self._cached()) is False
         assert filled(self._cached(usage_cached=False, primary_pct=None, weekly_pct=None)) is True
