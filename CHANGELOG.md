@@ -6,6 +6,21 @@ and `Removed`.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## 0.1.21-rc8
+
+### Changed
+
+- The e-paper AI dashboard and device-monitor page now share a PocketJS-inspired
+  mission-control design, with stronger numeric hierarchy, compact telemetry
+  modules, pill-shaped status and progress treatments, and solid 1-bit depth.
+  Every dynamic element remains inside its existing fixed refresh region.
+
+### Fixed
+
+- The device-monitor address line wraps whole interface/address pairs onto its
+  reserved second line instead of clipping the final interface when a device
+  has several LAN, overlay, or container-network addresses.
+
 ## 0.1.21-rc7
 
 ### Added
