@@ -1370,7 +1370,29 @@ final class ModelsTests: XCTestCase {
         XCTAssertNil(ElinkClaudeTokenStore.normalizedToken(String(repeating: "a", count: 16 * 1024 + 1)))
     }
 
+    /// 登录钥匙串锁定或会话不允许交互时（例如 self-hosted runner 从锁定会话里
+    /// 启动），所有 SecItem* 调用都会返回 errSecInteractionNotAllowed。这是环境
+    /// 限制而非代码缺陷，跳过即可；其它错误码仍让用例照常失败。
+    private func skipIfKeychainIsUnavailable() throws {
+        let probe: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "ai.elink.tests.probe.\(UUID().uuidString)",
+            kSecAttrAccount as String: "probe",
+        ]
+        var item = probe
+        item[kSecValueData as String] = Data("probe".utf8)
+        let status = SecItemAdd(item as CFDictionary, nil)
+        if status == errSecSuccess {
+            SecItemDelete(probe as CFDictionary)
+            return
+        }
+        if status == errSecInteractionNotAllowed || status == errSecMissingEntitlement {
+            throw XCTSkip("Keychain 不可写（OSStatus \(status)）")
+        }
+    }
+
     func testElinkClaudeTokenStoreRoundTripsAndRemovesCredential() throws {
+        try skipIfKeychainIsUnavailable()
         let store = ElinkClaudeTokenStore(
             service: "ai.elink.tests.\(UUID().uuidString)",
             account: "claude-token"
@@ -1389,6 +1411,7 @@ final class ModelsTests: XCTestCase {
     }
 
     func testElinkClaudeTokenStoreCanReplaceCorruptedItem() throws {
+        try skipIfKeychainIsUnavailable()
         let service = "ai.elink.tests.\(UUID().uuidString)"
         let account = "claude-token"
         let store = ElinkClaudeTokenStore(service: service, account: account)
