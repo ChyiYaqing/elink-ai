@@ -25,6 +25,11 @@ class DashboardRenderer:
     SINGLE_BOX = (18, 74, 630, 458)
     FOOTER_BOX = (18, 459, 630, 476)
 
+    # 即时反馈提示条。左右边界必须 8 对齐——区域刷新按字节打包像素列。
+    # 高度取到 66 与页眉齐平：矮一点会把「Updated hh:mm」拦腰切断。
+    # 与 _status_badge 无关，那是常驻的状态徽章，这个是几秒即逝的输入回执。
+    TOAST_BOX = (544, 0, 648, 66)
+
     # 设备监控版面：左侧一张主角卡（CPU），右侧四条紧凑指标行，底部一条面板健康
     # 状态条。分组靠发丝线而不是卡片边框——边框是四条边连成的环，任何重绘都会把
     # 脏矩形撑成整张卡的外接矩形。所有框固定且互不重叠，分隔线画在框与框的缝里，
@@ -392,6 +397,27 @@ class DashboardRenderer:
             if draw.textbbox((0, 0), text, font=font)[2] <= max_width:
                 return font
         return self._font(minimum, bold=bold)
+
+    def draw_toast(self, base: Image.Image, text: str) -> Image.Image:
+        """在屏幕已显示的帧上叠一条高对比提示，返回新帧。
+
+        墨水屏整页刷新要 2~4 秒，手势这类输入需要一个立刻可见的「收到了」，
+        否则人会以为没生效而重复操作。黑底白字是 1-bit 屏上最醒目的组合。
+        """
+        text = " ".join(str(text).split())[:12]
+        if not text:
+            raise ValueError("toast text is required")
+        left, top, right, bottom = self.TOAST_BOX
+        frame = base.convert("1", dither=Image.Dither.NONE)
+        draw = ImageDraw.Draw(frame)
+        draw.rectangle((left, top, right - 1, bottom - 1), fill=0)
+        font = self._fit_font(draw, text, preferred=26, minimum=9,
+                              max_width=right - left - 12)
+        box = draw.textbbox((0, 0), text, font=font)
+        draw.text((left + (right - left - box[2] - box[0]) // 2,
+                   top + (bottom - top - box[3] - box[1]) // 2),
+                  text, fill=255, font=font)
+        return frame
 
     # ---------------------------------------------------------------------- #
     #  Device-monitor page. Rendered straight to a full 648x480 frame; the

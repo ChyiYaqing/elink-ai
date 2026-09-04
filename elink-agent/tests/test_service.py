@@ -12,6 +12,7 @@ from elink_agent.config import AgentConfig
 from elink_agent.display.frame_diff import Rect
 from elink_agent.display.mock import MockDisplay
 from elink_agent.models import ProviderStatus, StatusSnapshot
+from elink_agent.renderer import DashboardRenderer
 from elink_agent.service import AgentService
 
 
@@ -731,3 +732,110 @@ def test_manual_refresh_renders_current_content():
     assert decision.refresh
     assert decision.kind == "full"
     assert service._content == "monitor"
+
+
+def _service_with_baseline(root, display=None):
+    config = AgentConfig(
+        output_path=root / "frame.png",
+        state_path=root / "state.json",
+        coalesce_s=0,
+    )
+    display = display or MockDisplay(config.output_path)
+    service = AgentService(config, display)
+    service.snapshot = StatusSnapshot(
+        claude=ProviderStatus(status="working", primary_pct=25),
+        codex=ProviderStatus(status="idle", primary_pct=50),
+    )
+    service._refresh("full", False)
+    return config, display, service
+
+
+def _toast_is_inked(frame) -> bool:
+    """提示条是黑底白字，所以那块区域必然有大量黑像素。"""
+    left, top, right, bottom = DashboardRenderer.TOAST_BOX
+    crop = frame.convert("1").crop((left, top, right, bottom))
+    black = sum(1 for value in crop.getdata() if value == 0)
+    return black > crop.width * crop.height * 0.4
+
+
+def test_toast_uses_region_refresh_and_updates_baseline():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        _, display, service = _service_with_baseline(root)
+        assert not _toast_is_inked(service._displayed_frame)
+
+        service.show_toast("VICTORY")
+
+        assert display.calls == ["full", "region"]
+        assert display.region_calls[-1] == (Rect(*DashboardRenderer.TOAST_BOX),)
+        # 基线必须跟着变，否则下一次帧差看不出提示条、也就永远擦不掉它
+        assert _toast_is_inked(service._displayed_frame)
+
+
+def test_toast_region_is_byte_aligned():
+    """区域刷新按字节打包像素列，x 不对齐会被驱动直接拒绝。"""
+    left, _, right, _ = DashboardRenderer.TOAST_BOX
+    assert left % 8 == 0
+    assert right % 8 == 0
+    assert right <= DashboardRenderer.width
+
+
+def test_toast_without_baseline_is_rejected():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        config = AgentConfig(output_path=root / "frame.png", state_path=root / "state.json")
+        display = MockDisplay(config.output_path)
+        service = AgentService(config, display)
+        try:
+            service.show_toast("HI")
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("expected a refusal while the baseline is unknown")
+        assert display.calls == []
+
+
+def test_toast_is_erased_by_the_next_refresh():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        _, display, service = _service_with_baseline(root)
+        service.show_toast("CLAUDE")
+
+        # 数据没变，唯一的差异就是屏幕上那条提示，帧差应当把它认成变化区域
+        service._refresh("smart", False)
+
+        assert display.calls[-1] in {"region", "fast-full", "full"}
+        if display.calls[-1] == "region":
+            left, top, right, bottom = DashboardRenderer.TOAST_BOX
+            assert any(r.left < right and r.right > left
+                       and r.top < bottom and r.bottom > top
+                       for r in display.region_calls[-1])
+        assert not _toast_is_inked(service._displayed_frame)
+
+
+def test_toast_does_not_clobber_a_baseline_replaced_mid_refresh():
+    """刷提示条不持锁，期间主循环可能刚刷完新内容——那份新基线不能被盖掉。"""
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        config = AgentConfig(
+            output_path=root / "frame.png",
+            state_path=root / "state.json",
+            coalesce_s=0,
+        )
+        newer = Image.new("1", (648, 480), 1)
+
+        class SwapDisplay(MockDisplay):
+            def show(self, image, *, kind="full", regions=()):
+                super().show(image, kind=kind, regions=regions)
+                if kind == "region":
+                    service._displayed_frame = newer
+
+        display = SwapDisplay(config.output_path)
+        service = AgentService(config, display)
+        service.snapshot = StatusSnapshot(claude=ProviderStatus(status="working"))
+        service._refresh("full", False)
+
+        service.show_toast("PALM")
+
+        assert service._displayed_frame is newer
+        assert service._toast_until == 0.0

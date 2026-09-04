@@ -15,7 +15,7 @@ from . import __version__
 from .bridge_client import BridgeClient
 from .config import AgentConfig
 from .display.base import Display
-from .display.frame_diff import FrameDiffer, RefreshPlan
+from .display.frame_diff import FrameDiffer, Rect, RefreshPlan
 from .models import StatusSnapshot
 from .refresh_policy import RefreshDecision, RefreshPolicy
 from .renderer import DashboardRenderer
@@ -116,6 +116,7 @@ class AgentService:
         self._monitor_last_refresh_at = 0.0
         self._monitor_partials_since_full = 0
         self._monitor_last_full_at = 0.0
+        self._toast_until = 0.0
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -150,6 +151,31 @@ class AgentService:
                 self._request_gen += 1
                 self._save_state()
         self._wake.set()
+
+    def show_toast(self, text: str, ttl_s: float = 6.0) -> None:
+        """在屏幕角上立刻打一条反馈提示。
+
+        刻意绕过刷新节流：提示的全部意义就是即时，等一个 min_refresh_interval
+        就没有反馈价值了。它只刷一个字节对齐的小区域，代价远低于一次整页刷新。
+
+        提示同时写回 _displayed_frame，于是下一次正常刷新时帧差会把这块认成
+        变化区域而自动擦掉，不需要单独的擦除路径。
+        """
+        with self._lock:
+            base = self._displayed_frame
+        if base is None:
+            # 没有可信基线（刚启动、或上次刷新失败已把基线作废）。此时做区域
+            # 刷新等于往未知内容上盖东西，只会把屏幕画花。
+            raise RuntimeError("no baseline frame on screen yet")
+        framed = self.renderer.draw_toast(base, text)
+        # 不持锁刷屏：区域刷新虽快，但仍走 SPI 和 busy 等待，持锁会卡住所有 HTTP API
+        self.display.show(framed, kind="region", regions=(Rect(*self.renderer.TOAST_BOX),))
+        with self._lock:
+            # 刷屏期间主循环可能已刷完新内容并换掉基线；那时提示已被覆盖，
+            # 再用我们这份旧基线盖回去会让帧差与屏幕失配
+            if self._displayed_frame is base:
+                self._displayed_frame = framed
+                self._toast_until = time.time() + ttl_s
 
     def set_bridge(self, bridge_url: str) -> None:
         if not bridge_url.startswith(("http://", "https://")):
@@ -321,6 +347,12 @@ class AgentService:
 
             refresh_kind = None
             with self._lock:
+                # 提示条是临时反馈，到期就请求一次普通刷新，由帧差把它抹掉
+                if self._toast_until and now_wall >= self._toast_until:
+                    self._toast_until = 0.0
+                    self._force = self._force or "smart"
+                    self._pending_since = 0.0
+                    self._request_gen += 1
                 stale = (not self.runtime.last_fetch_at
                          or now_wall - self.runtime.last_fetch_at >= self.config.stale_after_s)
                 self.runtime.stale = stale

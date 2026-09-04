@@ -94,9 +94,15 @@ class AgentHTTPServer:
                         service.set_mode(str(obj.get("mode", "")))
                     elif path == "/v1/display/refresh":
                         service.request_refresh(str(obj.get("kind", "smart")))
+                    elif path == "/v1/display/toast":
+                        service.show_toast(str(obj.get("text", "")))
                     else:
                         self._json(404, {"error": "not found"})
                         return
+                except RuntimeError as error:
+                    # 屏幕还没有可信基线，区域刷新会画花，等一次整页刷新之后再来
+                    self._json(409, {"error": str(error)})
+                    return
                 except (ValueError, json.JSONDecodeError) as error:
                     self._json(400, {"error": str(error)})
                     return
