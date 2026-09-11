@@ -75,7 +75,7 @@ struct AgentSessionsCard: View {
                     .font(.system(size: 11, weight: .semibold, design: .rounded))
                     .foregroundStyle(theme.textPrimary)
                 Spacer()
-                Text(tagText(session))
+                Text(Self.tagText(session))
                     .font(.system(size: 9, weight: .medium, design: .monospaced))
                     .foregroundStyle(tagColor(busy: session.isBusy, live: session.isLive))
                     .lineLimit(1)
@@ -155,7 +155,7 @@ struct AgentSessionsCard: View {
                     .foregroundStyle(theme.textSecondary)
                     .lineLimit(1)
                 Spacer()
-                Text(tagText(child))
+                Text(Self.tagText(child))
                     .font(.system(size: 8, weight: .medium, design: .monospaced))
                     .foregroundStyle(tagColor(busy: child.isBusy, live: child.isLive))
                     .lineLimit(1)
@@ -253,9 +253,10 @@ struct AgentSessionsCard: View {
         session.prompt.isEmpty ? session.snippet : "You: \(session.prompt)"
     }
 
-    private func tagText(_ session: AgentSession) -> String {
+    static func tagText(_ session: AgentSession, now: Date = Date()) -> String {
         let name = session.model.isEmpty ? session.title : session.model
-        return "\(name) · \(Self.relativeTime(session.lastActivity ?? session.lastModified))"
+        let rate = session.tokensPerSecond.map { String(format: " · %.0f tok/s", $0) } ?? ""
+        return "\(name)\(rate) · \(relativeTime(session.lastActivity ?? session.lastModified, now: now))"
     }
 
     private func tagColor(busy: Bool, live: Bool) -> Color {

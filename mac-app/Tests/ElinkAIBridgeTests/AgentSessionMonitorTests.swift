@@ -131,6 +131,72 @@ final class AgentSessionMonitorTests: XCTestCase {
         XCTAssertEqual(s.transcript.last?.text, "第 79 条")
     }
 
+    // MARK: - 输出速率
+
+    /// 同一条 message 按内容块拆成多行，中间还夹着流式执行的 tool_result：
+    /// 起点必须是这条 message 之前的输入，而不是块之间的工具结果。
+    func testClaudeOutputRateGroupsBlocksByMessageID() throws {
+        let t0 = Date().addingTimeInterval(-100)
+        func at(_ s: Double) -> String { Self.iso.string(from: t0.addingTimeInterval(s)) }
+        try write([
+            #"{"type":"user","message":{"content":"开始"},"timestamp":"\#(at(0))"}"#,
+            #"{"type":"assistant","message":{"id":"m1","model":"claude-opus-5","stop_reason":"tool_use","usage":{"output_tokens":200},"content":[{"type":"thinking","thinking":""}]},"timestamp":"\#(at(4))"}"#,
+            #"{"type":"assistant","message":{"id":"m1","model":"claude-opus-5","stop_reason":"tool_use","usage":{"output_tokens":200},"content":[{"type":"tool_use","name":"Read","input":{}}]},"timestamp":"\#(at(6))"}"#,
+            #"{"type":"user","message":{"content":[{"type":"tool_result","content":"ok"}]},"timestamp":"\#(at(7))"}"#,
+            #"{"type":"assistant","message":{"id":"m1","model":"claude-opus-5","stop_reason":"tool_use","usage":{"output_tokens":200},"content":[{"type":"tool_use","name":"Read","input":{}}]},"timestamp":"\#(at(10))"}"#,
+            #"{"type":"user","message":{"content":[{"type":"tool_result","content":"ok"}]},"timestamp":"\#(at(12))"}"#,
+            #"{"type":"assistant","message":{"id":"m2","model":"claude-opus-5","stop_reason":"end_turn","usage":{"output_tokens":100},"content":[{"type":"text","text":"完成"}]},"timestamp":"\#(at(22))"}"#,
+            // 错误占位消息不是真实的模型输出
+            #"{"type":"assistant","message":{"id":"m3","model":"<synthetic>","stop_reason":"stop_sequence","usage":{"output_tokens":0},"content":[{"type":"text","text":"API Error"}]},"timestamp":"\#(at(23))"}"#,
+        ], to: "-Users-me-myproj/sess.jsonl", under: claudeRoot)
+
+        let s = try XCTUnwrap(scanner().scan(live: [], claudeCwdCounts: [:]).first)
+        // (200 + 100) tokens / (10s + 10s)
+        XCTAssertEqual(try XCTUnwrap(s.tokensPerSecond), 15, accuracy: 0.001)
+    }
+
+    /// 旧版 Claude Code 写的是流式中途的 usage，拿来算会严重偏低。
+    func testClaudeOutputRateIgnoresUsageWithoutStopReason() throws {
+        let t0 = Date().addingTimeInterval(-100)
+        func at(_ s: Double) -> String { Self.iso.string(from: t0.addingTimeInterval(s)) }
+        try write([
+            #"{"type":"user","message":{"content":"开始"},"timestamp":"\#(at(0))"}"#,
+            #"{"type":"assistant","message":{"id":"m1","model":"claude-opus-5","stop_reason":null,"usage":{"output_tokens":3},"content":[{"type":"text","text":"好"}]},"timestamp":"\#(at(20))"}"#,
+        ], to: "-Users-me-myproj/sess.jsonl", under: claudeRoot)
+
+        let s = try XCTUnwrap(scanner().scan(live: [], claudeCwdCounts: [:]).first)
+        XCTAssertNil(s.tokensPerSecond)
+    }
+
+    /// Codex 边流式输出边执行工具，工具结果可能在 token_usage_record 之前落盘。
+    func testCodexOutputRateStartsBeforeTheResponsesFirstOutput() throws {
+        let t0 = Date().addingTimeInterval(-100)
+        func at(_ s: Double) -> String { Self.iso.string(from: t0.addingTimeInterval(s)) }
+        try write([
+            #"{"payload":{"id":"root-1","cwd":"/Users/me/myproj"}}"#,
+            #"{"type":"response_item","payload":{"type":"message","role":"user","content":[]},"timestamp":"\#(at(0))"}"#,
+            #"{"type":"response_item","payload":{"type":"reasoning"},"timestamp":"\#(at(5))"}"#,
+            #"{"type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":""},"timestamp":"\#(at(6))"}"#,
+            #"{"type":"response_item","payload":{"type":"custom_tool_call_output"},"timestamp":"\#(at(7))"}"#,
+            #"{"type":"token_usage_record","payload":{"usage":{"output_tokens":160}},"timestamp":"\#(at(8))"}"#,
+            #"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[]},"timestamp":"\#(at(10))"}"#,
+            #"{"type":"token_usage_record","payload":{"usage":{"output_tokens":40}},"timestamp":"\#(at(12))"}"#,
+        ], to: "rollout-2026-07-22T10-00-00-aaa.jsonl", under: codexRoot)
+
+        let s = try XCTUnwrap(scanner().scan(live: [], claudeCwdCounts: [:]).first)
+        // (160 + 40) tokens / (8s + 5s)
+        XCTAssertEqual(try XCTUnwrap(s.tokensPerSecond), 200.0 / 13, accuracy: 0.001)
+    }
+
+    func testTagShowsOutputRateOnlyWhenKnown() {
+        let now = Date()
+        var s = AgentSession(id: "/a", kind: .claude, title: "proj", snippet: "",
+                             model: "opus-5", lastModified: now)
+        XCTAssertEqual(AgentSessionsCard.tagText(s, now: now), "opus-5 · now")
+        s.tokensPerSecond = 57.6
+        XCTAssertEqual(AgentSessionsCard.tagText(s, now: now), "opus-5 · 58 tok/s · now")
+    }
+
     /// 没有正文可读时不该给出一个展开后是空的箭头。
     func testSessionWithoutTranscriptIsNotExpandable() {
         let s = AgentSession(id: "/a", kind: .claude, title: "a", snippet: "摘要",

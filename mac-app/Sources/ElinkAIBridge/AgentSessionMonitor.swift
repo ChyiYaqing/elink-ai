@@ -41,6 +41,8 @@ struct AgentSession: Identifiable {
     // 最后一条 user/assistant 条目 —— away_summary 等系统写入会更新 mtime，
     // 但不能算作活动
     var lastActivity: Date?
+    // 最近几次模型响应的输出速率；transcript 里拿不到可靠 usage 时为 nil
+    var tokensPerSecond: Double?
     // 混合判定：busy = 进程存活且正在对话；存活但安静视为空闲而非完成
     var isBusy: Bool { isLive && Date().timeIntervalSince(lastActivity ?? lastModified) < 30 }
     var anyLive: Bool { isLive || children.contains { $0.isLive } }
@@ -291,6 +293,9 @@ final class SessionScanner {
             // 判活（claude 不持有 transcript fd）
             let liveByCwd = cwdCounts[proj.lastPathComponent] ?? 0
             for (idx, (f, mtime)) in dated.enumerated() {
+                let isLive = live.contains(f.path) || idx < liveByCwd
+                // 与 scan() 的过滤条件一致：反正会被丢弃的旧文件不读内容
+                if !isLive && Date().timeIntervalSince(mtime) >= 6 * 3600 { continue }
                 let projName = proj.lastPathComponent.split(separator: "-").last.map(String.init) ?? proj.lastPathComponent
                 let info = tailInfo(of: f)
                 var sess = AgentSession(id: f.path, kind: .claude, title: projName,
@@ -298,7 +303,8 @@ final class SessionScanner {
                 sess.prompt = info.prompt
                 sess.transcript = info.transcript
                 sess.lastActivity = info.activity
-                sess.isLive = live.contains(f.path) || idx < liveByCwd
+                sess.tokensPerSecond = info.rate
+                sess.isLive = isLive
                 sess.children = claudeSubagents(sessionFile: f, parentLive: sess.isLive)
                 out.append(sess)
             }
@@ -319,6 +325,7 @@ final class SessionScanner {
                                     snippet: info.snippet, model: info.model, lastModified: mtime)
             sess.prompt = info.prompt
             sess.transcript = info.transcript
+            sess.tokensPerSecond = info.rate
             sess.isLive = live.contains(f.path)
             sess.threadID = meta.id
             sess.parentID = meta.parentID
@@ -345,6 +352,7 @@ final class SessionScanner {
             // 子代理共享父进程 —— 存活继承父会话，忙碌看写入
             kid.isLive = parentLive
             kid.lastActivity = info.activity
+            kid.tokensPerSecond = info.rate
             kids.append(kid)
         }
         return kids.sorted { $0.lastModified > $1.lastModified }
@@ -378,8 +386,8 @@ final class SessionScanner {
     /// 对话（user/assistant）条目的时间戳，以及展开区滚动用的条目列表。
     func tailInfo(of file: URL)
         -> (snippet: String, model: String, prompt: String,
-            transcript: [TranscriptEntry], activity: Date?) {
-        let empty = ("", "", "", [TranscriptEntry](), Date?.none)
+            transcript: [TranscriptEntry], activity: Date?, rate: Double?) {
+        let empty = ("", "", "", [TranscriptEntry](), Date?.none, Double?.none)
         guard let fh = try? FileHandle(forReadingFrom: file) else { return empty }
         defer { try? fh.close() }
         let size = (try? fh.seekToEnd()) ?? 0
@@ -390,7 +398,8 @@ final class SessionScanner {
         var snippet = "", model = "", prompt = ""
         var transcript: [TranscriptEntry] = []
         var activity: Date?
-        for line in text.split(separator: "\n").reversed() {
+        let lines = text.split(separator: "\n")
+        for line in lines.reversed() {
             if model.isEmpty, let r = line.range(of: #""model":"([^"]+)""#, options: .regularExpression) {
                 model = String(line[r].dropFirst(9).dropLast(1))
                 model = model.replacingOccurrences(of: "claude-", with: "")
@@ -429,7 +438,79 @@ final class SessionScanner {
                     .replacingOccurrences(of: "claude-", with: "")
             }
         }
-        return (snippet, model, prompt, transcript, activity)
+        return (snippet, model, prompt, transcript, activity, outputRate(lines))
+    }
+
+    /// 参与速率计算的最近响应数。
+    static let rateSamples = 10
+
+    /// 最近几次模型响应的输出速率（output tokens / 秒），按 token 数加权。
+    /// transcript 没有逐 token 的时间，只能拿「响应前最后一条输入（用户消息或
+    /// 工具结果）→ 响应最后一块落盘」当耗时，因此包含首 token 延迟 —— 这正是
+    /// 用户感受到的快慢。
+    func outputRate(_ lines: [Substring]) -> Double? {
+        var samples: [(tokens: Int, seconds: TimeInterval)] = []
+        var lastInput: Date?
+        // Claude：一条 message 按内容块拆成多行，且边流式输出边执行工具时
+        // tool_result 会插在块之间，所以按 message.id 聚合，遇到 user 行不能断开
+        var claude: [String: (start: Date?, end: Date, tokens: Int, final: Bool)] = [:]
+        var claudeOrder: [String] = []
+        // Codex：一次响应以 token_usage_record 收尾；起点取它第一条输出之前的
+        // 最后一条输入，响应中途回填的工具结果不算
+        var codexStart: Date?, inCodexResponse = false
+        for line in lines {
+            guard let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any] else { continue }
+            // ISO 解析不便宜，只给用得上的行做
+            func time() -> Date? { (obj["timestamp"] as? String).flatMap(Self.isoParser.date(from:)) }
+            let type = obj["type"] as? String
+            if let payload = obj["payload"] as? [String: Any] {
+                let ptype = payload["type"] as? String ?? ""
+                if type == "token_usage_record" {
+                    if inCodexResponse, let start = codexStart, let ts = time(),
+                       let out = (payload["usage"] as? [String: Any])?["output_tokens"] as? Int {
+                        samples.append((out, ts.timeIntervalSince(start)))
+                    }
+                    codexStart = nil
+                    inCodexResponse = false
+                } else if type == "response_item" {
+                    if ptype.hasSuffix("_output")
+                        || (ptype == "message" && payload["role"] as? String != "assistant") {
+                        lastInput = time()
+                    } else if !inCodexResponse {
+                        inCodexResponse = true
+                        codexStart = lastInput
+                    }
+                }
+                continue
+            }
+            if type == "user" {
+                lastInput = time()
+            } else if type == "assistant", let msg = obj["message"] as? [String: Any],
+                      let id = msg["id"] as? String,
+                      msg["model"] as? String != "<synthetic>", let ts = time() {
+                let out = (msg["usage"] as? [String: Any])?["output_tokens"] as? Int ?? 0
+                // 旧版 Claude Code 记下的是流式中途的 usage（stop_reason 为 null，
+                // output_tokens 只有个位数），只有带 stop_reason 的才是最终值
+                let final = msg["stop_reason"] is String
+                if var m = claude[id] {
+                    m.end = ts
+                    m.tokens = max(m.tokens, out)
+                    m.final = m.final || final
+                    claude[id] = m
+                } else {
+                    claude[id] = (lastInput, ts, out, final)
+                    claudeOrder.append(id)
+                }
+            }
+        }
+        for id in claudeOrder {
+            guard let m = claude[id], m.final, let start = m.start else { continue }
+            samples.append((m.tokens, m.end.timeIntervalSince(start)))
+        }
+        let recent = samples.filter { $0.seconds > 0 }.suffix(Self.rateSamples)
+        let tokens = recent.reduce(0) { $0 + $1.tokens }
+        let seconds = recent.reduce(0) { $0 + $1.seconds }
+        return tokens > 0 ? Double(tokens) / seconds : nil
     }
 
     /// 若该行是用户消息则提取。
