@@ -6,6 +6,22 @@ and `Removed`.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## 0.1.21-rc11
+
+### Added
+
+- The menu-bar panel can print a combined Claude and Codex usage receipt for
+  today, the last 7 or 30 days, or the last 12 months. It lists the
+  API-equivalent cost per client and model, token totals, cache hit rate and
+  session count. The receipt feeds out of a printer slot; pull it down to tear
+  it off, and it is copied to the clipboard and saved to Downloads as an image.
+
+### Fixed
+
+- Usage costs now price Claude Opus 5.5, GPT-6 Sol, GPT-6 Astra and GPT-5.6
+  Luna, which were previously left out of the totals, and use the current
+  published rates for Claude Sonnet 5 and GPT-5.6 Sol.
+
 ## 0.1.21-rc10
 
 ### Added
