@@ -117,7 +117,7 @@ final class UsageReceiptTests: XCTestCase {
                                                model: String(repeating: "very-long-model-", count: 8),
                                                tokens: 1_000)]],
             modelCategories: [:], sessions: 1, table: table)
-        let renderer = ImageRenderer(content: ReceiptPaper(receipt: receipt, tornTop: true))
+        let renderer = ImageRenderer(content: ReceiptPaper(receipt: receipt, torn: 1))
         renderer.scale = 1
         let image = try XCTUnwrap(renderer.nsImage)
         XCTAssertEqual(image.size.width, ReceiptPaper.width)
@@ -135,5 +135,33 @@ final class UsageReceiptTests: XCTestCase {
         let year = UsageReceipt.make(range: .year, now: now, usage: [:], modelCategories: [:],
                                      sessions: 0, table: table)
         XCTAssertEqual(ReceiptPaper.periodText(year), "2025年10月 – 2026年9月")
+    }
+
+    /// 往右拉从左边撕起、左边先掉（逆时针）；往上推不算撕，拉过头封顶为 1
+    func testTearGeometryFollowsThePullDirection() {
+        let half = ReceiptView.tearDistance / 2
+        XCTAssertEqual(ReceiptView.tearProgress(CGSize(width: 0, height: half)), 0.5, accuracy: 1e-9)
+        XCTAssertEqual(ReceiptView.tearProgress(CGSize(width: 0, height: -200)), 0)
+        XCTAssertEqual(ReceiptView.tearProgress(CGSize(width: 500, height: 500)), 1)
+
+        XCTAssertEqual(ReceiptView.tearTip(progress: 0.25, fromRight: false, width: 300), 75)
+        XCTAssertEqual(ReceiptView.tearTip(progress: 0.25, fromRight: true, width: 300), 225)
+        XCTAssertLessThan(ReceiptView.tearAngle(progress: 0.5, fromRight: false), 0)
+        XCTAssertGreaterThan(ReceiptView.tearAngle(progress: 0.5, fromRight: true), 0)
+        XCTAssertEqual(ReceiptView.tearAngle(progress: 0, fromRight: false), 0)
+    }
+
+    /// 撕开的那段是锯齿、没撕开的仍是直线；纸身与残边共用同一条线，齿才咬得上
+    func testCutLineIsJaggedOnlyWhereTorn() {
+        let line = ReceiptEdge.cutLine(width: 60, torn: 0.5, fromRight: false, tooth: 6, untornY: 0)
+        let left = line.filter { $0.x < 29 }
+        let right = line.filter { $0.x > 31 }
+        XCTAssertTrue(left.contains { $0.y > 0 }, "左半边已撕开，应有齿")
+        XCTAssertTrue(right.allSatisfy { $0.y == 0 }, "右半边还连着，应是直边")
+
+        let whole = ReceiptEdge.cutLine(width: 60, torn: 1, fromRight: true, tooth: 6, untornY: 9)
+        XCTAssertFalse(whole.contains { $0.y == 9 }, "整条撕开后不应再有直边")
+        XCTAssertEqual(ReceiptEdge.cutLine(width: 60, torn: 0, fromRight: false, tooth: 6, untornY: 2)
+                           .map(\.y), Array(repeating: 2, count: 21))
     }
 }

@@ -6,8 +6,10 @@ struct ReceiptPaper: View {
     let receipt: UsageReceipt
     /// 开了集群时费用与 token 是全集群的，会话数却只能数本机的 transcript
     var sessionsLocalOnly = false
-    /// 撕下后顶边也是锯齿；还连在出纸口上时是直边
-    var tornTop = false
+    /// 顶边已沿切刀撕开的比例（0 = 还整条连在出纸口上，1 = 已撕下），
+    /// 从 `tearFromRight` 那一侧量起；撕开的那段是锯齿
+    var torn: CGFloat = 0
+    var tearFromRight = false
 
     static let width: CGFloat = 300
     static let paper = Color(red: 0.957, green: 0.945, blue: 0.918)
@@ -24,7 +26,7 @@ struct ReceiptPaper: View {
                     .font(mono(8))
                     .foregroundStyle(Self.faint)
             }
-            .padding(.top, tornTop ? 18 : 12)
+            .padding(.top, 16)
             VStack(spacing: 3) {
                 row(tr("日期", "Date"), Self.periodText(receipt))
                 row(tr("出单时间", "Issued"), Self.timeText(receipt.issuedAt))
@@ -128,7 +130,7 @@ struct ReceiptPaper: View {
         .padding(.horizontal, 20)
         .frame(width: Self.width)
         .background(Self.paper)
-        .clipShape(ReceiptEdge(topTeeth: tornTop))
+        .clipShape(ReceiptEdge(torn: torn, fromRight: tearFromRight))
     }
 
     private func mono(_ size: CGFloat, _ weight: Font.Weight = .regular) -> Font {
@@ -204,25 +206,41 @@ private struct Line: Shape {
     }
 }
 
-/// 小票外形：底边始终是切刀留下的锯齿，顶边撕下后也变成锯齿。
+
+/// 小票外形：底边始终是切刀留下的锯齿；顶边撕开的那段也是锯齿，其余仍是直边。
 struct ReceiptEdge: Shape {
-    var topTeeth = false
+    var torn: CGFloat = 0
+    var fromRight = false
     var tooth: CGFloat = 6
+
+    var animatableData: CGFloat {
+        get { torn }
+        set { torn = newValue }
+    }
+
+    /// 沿切刀的那条线，从左到右。撕开的部分是锯齿（峰在 0、谷在齿深），
+    /// 没撕开的部分取 `untornY`。纸身和留在出纸口的残边共用这条线，齿正好咬合。
+    static func cutLine(width: CGFloat, torn: CGFloat, fromRight: Bool,
+                        tooth: CGFloat, untornY: CGFloat) -> [CGPoint] {
+        let count = max(1, Int(width / tooth))
+        let step = width / CGFloat(count)
+        let depth = tooth * 0.6
+        let tip = fromRight ? width * (1 - torn) : width * torn
+        return (0...(2 * count)).map { i in
+            let x = step * CGFloat(i) / 2
+            let isTorn = torn > 0 && (fromRight ? x >= tip : x <= tip)
+            return CGPoint(x: x, y: isTorn ? (i.isMultiple(of: 2) ? depth : 0) : untornY)
+        }
+    }
 
     func path(in rect: CGRect) -> Path {
         let count = max(1, Int(rect.width / tooth))
         let step = rect.width / CGFloat(count)
         let depth = tooth * 0.6
+        let top = Self.cutLine(width: rect.width, torn: torn, fromRight: fromRight,
+                               tooth: tooth, untornY: 0)
         return Path { p in
-            p.move(to: CGPoint(x: 0, y: topTeeth ? depth : 0))
-            if topTeeth {
-                for i in 0..<count {
-                    p.addLine(to: CGPoint(x: step * (CGFloat(i) + 0.5), y: 0))
-                    p.addLine(to: CGPoint(x: step * CGFloat(i + 1), y: depth))
-                }
-            } else {
-                p.addLine(to: CGPoint(x: rect.maxX, y: 0))
-            }
+            p.addLines(top)
             p.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY - depth))
             for i in (0..<count).reversed() {
                 p.addLine(to: CGPoint(x: step * (CGFloat(i) + 0.5), y: rect.maxY))
@@ -233,29 +251,25 @@ struct ReceiptEdge: Shape {
     }
 }
 
-/// 撕到一半的裂口：从拉扯的那一侧沿切刀向另一侧推进的一道锯齿线。
-private struct TearCrack: Shape {
-    var progress: CGFloat
+/// 撕下后留在出纸口里的那一截：上边贴着切刀，下边在撕开的地方是锯齿。
+private struct ReceiptStub: Shape {
+    var torn: CGFloat
     var fromRight: Bool
+    var tooth: CGFloat = 6
 
     var animatableData: CGFloat {
-        get { progress }
-        set { progress = newValue }
+        get { torn }
+        set { torn = newValue }
     }
 
     func path(in rect: CGRect) -> Path {
-        let length = rect.width * min(1, max(0, progress))
-        let step: CGFloat = 6
+        let bottom = ReceiptEdge.cutLine(width: rect.width, torn: torn, fromRight: fromRight,
+                                         tooth: tooth, untornY: tooth * 0.6)
         return Path { p in
-            var x: CGFloat = 0
-            var up = true
-            p.move(to: CGPoint(x: fromRight ? rect.maxX : 0, y: rect.midY))
-            while x < length {
-                x = min(length, x + step / 2)
-                let px = fromRight ? rect.maxX - x : x
-                p.addLine(to: CGPoint(x: px, y: up ? rect.minY : rect.maxY))
-                up.toggle()
-            }
+            p.move(to: .zero)
+            p.addLine(to: CGPoint(x: rect.maxX, y: 0))
+            p.addLines(bottom.reversed())
+            p.closeSubpath()
         }
     }
 }
@@ -266,30 +280,51 @@ struct ReceiptView: View {
     var store: UsageStore = .shared
     let onBack: () -> Void
 
+    private enum Phase { case printing, ready, detached, flying, shared }
+
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var range: StatsRange = .day
     @State private var receipt: UsageReceipt?
     @State private var paperHeight: CGFloat = 520
-    @State private var printProgress: CGFloat = 0
+    @State private var phase: Phase = .printing
     @State private var printTask: Task<Void, Never>?
-    @State private var pull: CGSize = .zero
-    @State private var torn = false
-    @State private var tornOffset: CGSize = .zero
-    @State private var tornAngle: Double = 0
-    @State private var tornDrag: CGSize = .zero
-    @State private var tornReceipt: UsageReceipt?
+    @State private var tear = TearState()
+    @State private var shareImage: NSImage?
+    @State private var sharePNG: Data?
     @State private var savedURL: URL?
     @State private var exportFailed = false
+    @State private var copied = false
 
-    /// 向下拉多远算撕断
-    private static let tearDistance: CGFloat = 90
-    private static let slotHeight: CGFloat = 14
+    /// 拉多远撕断
+    static let tearDistance: CGFloat = 130
+    /// 撕到底时纸绕撕口转过的角度
+    static let maxTearAngle: Double = 14
+    /// 撕开的比例：往下或斜着往一侧拉的距离；往上推不算
+    static func tearProgress(_ drag: CGSize) -> CGFloat {
+        min(1, hypot(drag.width, max(0, drag.height)) / tearDistance)
+    }
+
+    /// 撕口推进到的位置。往右拉时左侧先受力，从左边撕起；往左拉则反过来
+    static func tearTip(progress: CGFloat, fromRight: Bool,
+                        width: CGFloat = ReceiptPaper.width) -> CGFloat {
+        fromRight ? width * (1 - progress) : width * progress
+    }
+
+    /// 纸绕撕口转动的角度（顺时针为正）。从左撕时左边先掉下去，是逆时针
+    static func tearAngle(progress: CGFloat, fromRight: Bool) -> Double {
+        (fromRight ? 1 : -1) * Double(progress) * maxTearAngle
+    }
 
     var body: some View {
         VStack(spacing: 10) {
             header
             GeometryReader { geo in
-                stage(size: geo.size)
+                if phase == .shared {
+                    sharePage(size: geo.size)
+                        .transition(.opacity.combined(with: .scale(scale: 0.96)))
+                } else {
+                    stage(size: geo.size)
+                }
             }
             footer
         }
@@ -325,25 +360,19 @@ struct ReceiptView: View {
     @ViewBuilder
     private var footer: some View {
         HStack(spacing: 8) {
-            if torn {
-                if let savedURL {
+            if phase == .shared {
+                if savedURL != nil {
                     Image(systemName: "checkmark.circle.fill")
                         .foregroundStyle(theme.statusHealthy)
                     Text(tr("已复制到剪贴板，并保存到「下载」", "Copied to clipboard and saved to Downloads"))
                         .foregroundStyle(theme.textSecondary)
-                    Spacer()
-                    PillButton(title: tr("在访达中显示", "Show in Finder"), icon: "folder", theme: theme) {
-                        NSWorkspace.shared.activateFileViewerSelecting([savedURL])
-                    }
                 } else if exportFailed {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .foregroundStyle(theme.statusWarning)
                     Text(tr("小票图片保存失败", "Couldn't save the receipt image"))
                         .foregroundStyle(theme.textSecondary)
-                    Spacer()
-                } else {
-                    Spacer()
                 }
+                Spacer()
                 PillButton(title: tr("再出一张", "Print again"), icon: "printer", theme: theme) {
                     Log.user("reprint usage receipt")
                     startPrint()
@@ -351,10 +380,10 @@ struct ReceiptView: View {
             } else {
                 Image(systemName: "hand.draw")
                     .foregroundStyle(theme.textTertiary)
-                Text(printProgress < 1
+                Text(phase == .printing
                      ? tr("正在出票…", "Printing…")
-                     : tr("按住小票向下拉，撕下后自动复制并保存为图片",
-                          "Pull the receipt down to tear it off — it's copied and saved as an image"))
+                     : tr("按住小票往下或斜着往一侧拉，沿切刀撕下来",
+                          "Pull the receipt down or off to one side to tear it along the cutter"))
                     .foregroundStyle(theme.textTertiary)
                 Spacer()
             }
@@ -363,142 +392,182 @@ struct ReceiptView: View {
         .frame(height: 24)
     }
 
+    // MARK: 出纸与撕拉
+
     private func stage(size: CGSize) -> some View {
-        // 出纸口下方的可用高度装不下整张时整体缩小，保证撕之前能看到全貌
-        let available = max(120, size.height - Self.slotHeight - 12)
-        let scale = min(1, available / max(1, paperHeight))
-        let shown = paperHeight * scale
-        let tear = min(1, max(0, pull.height) / Self.tearDistance)
-        return ZStack(alignment: .top) {
-            if let receipt, !torn {
-                ReceiptPaper(receipt: receipt, sessionsLocalOnly: clusterEnabled)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .background(GeometryReader { paper in
-                        Color.clear.preference(key: PaperHeightKey.self, value: paper.size.height)
-                    })
-                    .scaleEffect(scale, anchor: .top)
-                    .frame(height: shown, alignment: .top)
-                    .overlay(alignment: .top) {
-                        // 裂口贴着切刀，随拉扯进度从拉的那一侧推进
-                        TearCrack(progress: tear, fromRight: pull.width < 0)
-                            .stroke(ReceiptPaper.faint, lineWidth: 1)
-                            .frame(width: ReceiptPaper.width * scale, height: 4)
-                            .padding(.top, 3)
-                            .opacity(tear > 0 ? 1 : 0)
-                    }
-                    .shadow(color: .black.opacity(0.18), radius: 6, y: 3)
-                    // 还连在机器上：纸被拉长一点、跟着手歪一点，但不会跟手走
-                    .rotationEffect(.degrees(Double(max(-6, min(6, pull.width / 20))) * Double(tear)),
-                                    anchor: .top)
-                    .offset(x: pull.width * 0.12,
-                            y: -(1 - printProgress) * shown + max(0, pull.height) * 0.3)
-                    .gesture(printProgress >= 1 ? pullGesture : nil)
-                    .onHover { inside in
-                        guard printProgress >= 1 else { return }
-                        (inside ? NSCursor.openHand : NSCursor.arrow).set()
-                    }
-                    .frame(width: size.width, height: size.height - Self.slotHeight / 2, alignment: .top)
-                    .clipped()
-                    .padding(.top, Self.slotHeight / 2)
-            }
-            if let tornReceipt, torn {
-                ReceiptPaper(receipt: tornReceipt, sessionsLocalOnly: clusterEnabled, tornTop: true)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .scaleEffect(scale * 0.92, anchor: .top)
-                    .frame(height: shown * 0.92, alignment: .top)
-                    .shadow(color: .black.opacity(0.28), radius: 10, y: 6)
-                    .rotationEffect(.degrees(tornAngle))
-                    .offset(x: tornOffset.width + tornDrag.width,
-                            y: tornOffset.height + tornDrag.height)
-                    .gesture(
-                        DragGesture()
-                            .onChanged { tornDrag = $0.translation; NSCursor.closedHand.set() }
-                            .onEnded { value in
-                                tornOffset.width += value.translation.width
-                                tornOffset.height += value.translation.height
-                                tornDrag = .zero
-                                NSCursor.openHand.set()
-                            }
-                    )
-                    .onHover { ($0 ? NSCursor.openHand : NSCursor.arrow).set() }
-                    .transition(.identity)
-                    .zIndex(1)
-            }
-            slot
-                .zIndex(2)
+        ReceiptTearStage(receipt: receipt, sessionsLocalOnly: clusterEnabled, state: tear,
+                         attached: phase == .printing || phase == .ready,
+                         showStub: phase != .printing, size: size,
+                         paperHeight: $paperHeight, gesture: tearGesture) { inside in
+            guard phase == .ready else { return }
+            (inside ? NSCursor.openHand : NSCursor.arrow).set()
         }
-        .frame(width: size.width, height: size.height, alignment: .top)
-        .onPreferenceChange(PaperHeightKey.self) { paperHeight = $0 }
     }
 
-    /// 出纸口：深色机身上的一道缝，纸从缝里出来
-    private var slot: some View {
-        RoundedRectangle(cornerRadius: 5)
-            .fill(Color(white: 0.12))
-            .overlay(
-                Capsule()
-                    .fill(Color.black)
-                    .frame(width: ReceiptPaper.width + 8, height: 3)
-            )
-            .frame(width: ReceiptPaper.width + 32, height: Self.slotHeight)
-            .shadow(color: .black.opacity(0.3), radius: 3, y: 2)
-    }
-
-    private var pullGesture: some Gesture {
-        DragGesture(minimumDistance: 2)
+    /// 手势始终挂着、由阶段决定怎么处理：中途换掉手势会打断正在进行的拖拽
+    private var tearGesture: some Gesture {
+        DragGesture(minimumDistance: 1)
             .onChanged { value in
-                pull = value.translation
-                NSCursor.closedHand.set()
+                switch phase {
+                case .ready:
+                    // 撕口还没成形时才定方向，撕开以后不再左右翻转
+                    if Self.tearProgress(tear.drag) < 0.1 { tear.fromRight = value.translation.width < -2 }
+                    tear.drag = value.translation
+                    NSCursor.closedHand.set()
+                    if Self.tearProgress(value.translation) >= 1 { detach(at: value.translation) }
+                case .detached:
+                    tear.drag = value.translation
+                default:
+                    break
+                }
             }
             .onEnded { value in
-                let flung = value.predictedEndTranslation.height > Self.tearDistance * 1.6
-                if value.translation.height >= Self.tearDistance || flung {
-                    tearOff(at: value.translation)
-                } else {
-                    withAnimation(.spring(response: 0.35, dampingFraction: 0.55)) { pull = .zero }
-                    NSCursor.openHand.set()
+                switch phase {
+                case .ready:
+                    let throwDistance = hypot(value.predictedEndTranslation.width - value.translation.width,
+                                              value.predictedEndTranslation.height - value.translation.height)
+                    if Self.tearProgress(value.predictedEndTranslation) >= 1, throwDistance > 60 {
+                        // 一甩就断
+                        detach(at: value.translation)
+                        flyAway(value)
+                    } else {
+                        withAnimation(.spring(response: 0.4, dampingFraction: 0.6)) { tear.drag = .zero }
+                        NSCursor.openHand.set()
+                    }
+                case .detached:
+                    flyAway(value)
+                default:
+                    break
                 }
             }
     }
 
-    private func tearOff(at translation: CGSize) {
-        guard let receipt else { return }
+    private func detach(at translation: CGSize) {
         Log.user("tear off usage receipt (\(range.rawValue))")
         NSHapticFeedbackManager.defaultPerformer.perform(.generic, performanceTime: .now)
-        // 从手松开的位置接着落下，再歪着停住，像被随手扔在桌上
-        tornOffset = CGSize(width: translation.width * 0.12, height: translation.height * 0.3)
-        tornAngle = Double(max(-6, min(6, translation.width / 20)))
-        tornReceipt = receipt
-        torn = true
-        pull = .zero
-        savedURL = nil
-        exportFailed = false
-        let direction: Double = translation.width < 0 ? 1 : -1
-        withAnimation(.spring(response: 0.55, dampingFraction: 0.62)) {
-            tornOffset = CGSize(width: max(-30, min(30, translation.width * 0.3)), height: 24)
-            tornAngle = direction * 7 + Double(max(-5, min(5, translation.width / 25)))
-        }
-        NSCursor.arrow.set()
-        export(receipt)
+        tear.detachDrag = translation
+        tear.detachAngle = Self.tearAngle(progress: 1, fromRight: tear.fromRight)
+        tear.drag = translation
+        phase = .detached
+        deliver()
     }
 
-    private func export(_ receipt: UsageReceipt) {
-        let paper = ReceiptPaper(receipt: receipt, sessionsLocalOnly: clusterEnabled, tornTop: true)
+    /// 按松手时的速度和方向甩出去；几乎没甩就顺着往下掉
+    private func flyAway(_ value: DragGesture.Value) {
+        NSCursor.arrow.set()
+        guard !reduceMotion else {
+            phase = .shared
+            return
+        }
+        var dx = value.predictedEndTranslation.width - value.translation.width
+        var dy = value.predictedEndTranslation.height - value.translation.height
+        if hypot(dx, dy) < 80 {
+            dx = tear.fromRight ? -0.3 : 0.3
+            dy = 1
+        }
+        let length = hypot(dx, dy)
+        phase = .flying
+        withAnimation(.easeIn(duration: 0.38)) {
+            tear.fly = CGSize(width: dx / length * 560, height: dy / length * 560)
+            tear.flySpin = dx >= 0 ? 28 : -28
+            tear.flyOpacity = 0
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+            guard phase == .flying else { return }
+            withAnimation(.easeOut(duration: 0.25)) { phase = .shared }
+        }
+    }
+
+    // MARK: 分享页
+
+    private func sharePage(size: CGSize) -> some View {
+        VStack(spacing: 12) {
+            VStack(spacing: 2) {
+                Text(tr("撕好了！", "Torn off!"))
+                    .font(.system(size: 15, weight: .bold, design: .rounded))
+                    .foregroundStyle(theme.textPrimary)
+                Text(tr("把这张 AI 对账单分享出去吧", "Share your AI receipt"))
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(theme.textSecondary)
+            }
+            if let shareImage {
+                Image(nsImage: shareImage)
+                    .resizable()
+                    .interpolation(.high)
+                    .aspectRatio(contentMode: .fit)
+                    .frame(maxHeight: max(120, size.height - 110))
+                    .rotationEffect(.degrees(-2))
+                    .shadow(color: .black.opacity(0.25), radius: 10, y: 6)
+            }
+            HStack(spacing: 8) {
+                shareButton
+                PillButton(title: copied ? tr("已复制", "Copied") : tr("复制图片", "Copy Image"),
+                           icon: copied ? "checkmark" : "doc.on.doc", theme: theme) {
+                    Log.user("copy usage receipt image")
+                    copied = copyToPasteboard()
+                }
+                if let savedURL {
+                    PillButton(title: tr("在访达中显示", "Show in Finder"), icon: "folder", theme: theme) {
+                        NSWorkspace.shared.activateFileViewerSelecting([savedURL])
+                    }
+                }
+            }
+        }
+        .frame(width: size.width, height: size.height)
+    }
+
+    @ViewBuilder
+    private var shareButton: some View {
+        let title = ReceiptPaper.title(range)
+        if let shareImage {
+            let preview = SharePreview(title, image: Image(nsImage: shareImage))
+            // 有文件就分享文件：隔空投送、邮件附件都要文件，拿到的也是原分辨率
+            if let savedURL {
+                ShareLink(item: savedURL, preview: preview) { shareLabel }
+                    .buttonStyle(.plain)
+            } else {
+                ShareLink(item: Image(nsImage: shareImage), preview: preview) { shareLabel }
+                    .buttonStyle(.plain)
+            }
+        }
+    }
+
+    private var shareLabel: some View {
+        HStack(spacing: 4) {
+            Image(systemName: "square.and.arrow.up").font(.system(size: 9, weight: .semibold))
+            Text(tr("分享…", "Share…")).font(.system(size: 10, weight: .semibold, design: .rounded))
+        }
+        .foregroundStyle(theme.accentForeground)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 5)
+        .background(Capsule().fill(theme.accentGradient))
+    }
+
+    // MARK: 导出
+
+    /// 出纸完成就先渲染好：撕断那一下只剩写剪贴板和落盘，不会卡住手势
+    private func prepareImage() {
+        guard let receipt else { return }
+        let paper = ReceiptPaper(receipt: receipt, sessionsLocalOnly: clusterEnabled, torn: 1)
             .padding(24)
         let renderer = ImageRenderer(content: paper)
         renderer.scale = 2
         guard let image = renderer.nsImage,
               let tiff = image.tiffRepresentation,
               let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:])
-        else {
+        else { return }
+        shareImage = image
+        sharePNG = png
+    }
+
+    /// 撕下即交付：复制到剪贴板，并存一份到「下载」
+    private func deliver() {
+        guard let receipt else { return }
+        if sharePNG == nil { prepareImage() }
+        guard let png = sharePNG, copyToPasteboard() else {
             exportFailed = true
             return
         }
-        let pasteboard = NSPasteboard.general
-        pasteboard.clearContents()
-        pasteboard.declareTypes([.png, .tiff], owner: nil)
-        pasteboard.setData(png, forType: .png)
-        pasteboard.setData(tiff, forType: .tiff)
         let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0]
         let url = downloads.appendingPathComponent(
             "elink-ai-receipt-\(ReceiptPaper.serial(receipt.issuedAt)).png")
@@ -509,6 +578,16 @@ struct ReceiptView: View {
             Log.warning("save receipt image failed: \(error.localizedDescription)", category: "receipt")
             exportFailed = true
         }
+    }
+
+    private func copyToPasteboard() -> Bool {
+        guard let png = sharePNG, let tiff = shareImage?.tiffRepresentation else { return false }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.declareTypes([.png, .tiff], owner: nil)
+        pasteboard.setData(png, forType: .png)
+        pasteboard.setData(tiff, forType: .tiff)
+        return true
     }
 
     private func load() {
@@ -542,13 +621,22 @@ struct ReceiptView: View {
     /// 走纸：一顿一顿地往外吐，像热敏打印机逐行出纸
     private func startPrint() {
         printTask?.cancel()
-        torn = false
-        tornReceipt = nil
-        tornDrag = .zero
-        pull = .zero
-        printProgress = 0
+        phase = .printing
+        tear.drag = .zero
+        tear.fromRight = false
+        tear.fly = .zero
+        tear.flySpin = 0
+        tear.flyOpacity = 1
+        shareImage = nil
+        sharePNG = nil
+        savedURL = nil
+        exportFailed = false
+        copied = false
+        tear.printProgress = 0
         guard !reduceMotion else {
-            printProgress = 1
+            tear.printProgress = 1
+            phase = .ready
+            prepareImage()
             return
         }
         printTask = Task { @MainActor in
@@ -557,10 +645,130 @@ struct ReceiptView: View {
                 try? await Task.sleep(nanoseconds: 85_000_000)
                 if Task.isCancelled { return }
                 withAnimation(.easeOut(duration: 0.06)) {
-                    printProgress = CGFloat(step) / CGFloat(steps)
+                    tear.printProgress = CGFloat(step) / CGFloat(steps)
                 }
             }
+            phase = .ready
+            prepareImage()
         }
+    }
+}
+
+/// 出纸与撕拉的全部可变状态。手势只改它，画面只读它——出纸区因此是
+/// 这份状态的纯函数，测试可以直接摆出「撕到一半」来截图核对。
+struct TearState: Equatable {
+    var printProgress: CGFloat = 0
+    var drag: CGSize = .zero
+    var fromRight = false
+    /// 撕断那一刻的手势位移与倾角：之后纸完全跟手，从这里接着走
+    var detachDrag: CGSize = .zero
+    var detachAngle: Double = 0
+    var fly: CGSize = .zero
+    var flySpin: Double = 0
+    var flyOpacity: Double = 1
+}
+
+/// 出纸口 + 小票。整个区域按同一比例缩放，里面一律用未缩放的坐标：
+/// 撕口的转轴、手势位移和纸的位置才能对得上。
+struct ReceiptTearStage<G: Gesture>: View {
+    let receipt: UsageReceipt?
+    let sessionsLocalOnly: Bool
+    let state: TearState
+    /// 还连在出纸口上（出纸中或待撕）
+    let attached: Bool
+    let showStub: Bool
+    let size: CGSize
+    @Binding var paperHeight: CGFloat
+    let gesture: G
+    var onHoverPaper: (Bool) -> Void = { _ in }
+
+    static var slotHeight: CGFloat { 14 }
+    /// 切刀在出纸口下沿（多压 1pt 盖住接缝），残边和撕口都露在外面
+    static var cutterY: CGFloat { slotHeight - 1 }
+
+    var body: some View {
+        let scale = min(1, max(0.5, (size.height - Self.cutterY - 8) / max(1, paperHeight)))
+        let width = size.width / scale
+        let height = size.height / scale
+        return ZStack(alignment: .top) {
+            paperLayer(width: width, height: height)
+            slot
+        }
+        .frame(width: width, height: height, alignment: .top)
+        .scaleEffect(scale, anchor: .top)
+        .frame(width: size.width, height: size.height, alignment: .top)
+        .onPreferenceChange(PaperHeightKey.self) { if $0 > 0 { paperHeight = $0 } }
+    }
+
+    private func paperLayer(width: CGFloat, height: CGFloat) -> some View {
+        let progress = attached ? ReceiptView.tearProgress(state.drag) : 1
+        return ZStack(alignment: .top) {
+            if showStub {
+                // 米白纸在浅色面板上几乎看不出来，靠一道描边和一点投影把残边勾出来
+                ReceiptStub(torn: progress, fromRight: state.fromRight)
+                    .fill(ReceiptPaper.paper)
+                    .overlay(ReceiptStub(torn: progress, fromRight: state.fromRight)
+                        .stroke(ReceiptPaper.faint.opacity(0.45), lineWidth: 0.6))
+                    .shadow(color: .black.opacity(0.18), radius: 1.5, y: 1)
+                    .frame(width: ReceiptPaper.width, height: 7)
+            }
+            if let receipt {
+                paper(receipt, progress: progress)
+            }
+        }
+        .padding(.top, Self.cutterY)
+        .frame(width: width, height: height, alignment: .top)
+        // 只遮掉切刀以上：纸在机器里的部分看不见，往两侧歪、往下甩都不会被裁掉
+        .mask(alignment: .top) {
+            Rectangle()
+                .frame(width: width + 1600, height: height + 3000)
+                .offset(y: Self.cutterY)
+        }
+    }
+
+    private func paper(_ receipt: UsageReceipt, progress: CGFloat) -> some View {
+        let angle: Double
+        let anchor: UnitPoint
+        var offset = CGSize.zero
+        if attached {
+            // 还连着：绕撕口推进到的那一点转，撕开的一侧往下掉，裂口张开
+            angle = ReceiptView.tearAngle(progress: progress, fromRight: state.fromRight)
+            anchor = UnitPoint(x: ReceiptView.tearTip(progress: progress, fromRight: state.fromRight)
+                                   / ReceiptPaper.width, y: 0)
+        } else {
+            // 已撕断：从断开的那一角接着走，完全跟手
+            let dx = state.drag.width - state.detachDrag.width
+            angle = state.detachAngle + max(-12, min(12, Double(dx) / 25)) + state.flySpin
+            anchor = UnitPoint(x: state.fromRight ? 0 : 1, y: 0)
+            offset = CGSize(width: dx + state.fly.width,
+                            height: state.drag.height - state.detachDrag.height + state.fly.height)
+        }
+        return ReceiptPaper(receipt: receipt, sessionsLocalOnly: sessionsLocalOnly,
+                            torn: progress, tearFromRight: state.fromRight)
+            .fixedSize(horizontal: false, vertical: true)
+            .background(GeometryReader { paper in
+                Color.clear.preference(key: PaperHeightKey.self, value: paper.size.height)
+            })
+            .shadow(color: .black.opacity(attached ? 0.16 : 0.3), radius: attached ? 5 : 12,
+                    y: attached ? 3 : 8)
+            .rotationEffect(.degrees(angle), anchor: anchor)
+            .offset(x: offset.width, y: offset.height - (1 - state.printProgress) * paperHeight)
+            .opacity(state.flyOpacity)
+            .gesture(gesture)
+            .onHover(perform: onHoverPaper)
+    }
+
+    /// 出纸口：深色机身上的一道缝，纸从缝里出来
+    private var slot: some View {
+        RoundedRectangle(cornerRadius: 5)
+            .fill(Color(white: 0.12))
+            .overlay(
+                Capsule()
+                    .fill(Color.black)
+                    .frame(width: ReceiptPaper.width + 8, height: 3)
+            )
+            .frame(width: ReceiptPaper.width + 32, height: Self.slotHeight)
+            .shadow(color: .black.opacity(0.3), radius: 3, y: 2)
     }
 }
 
