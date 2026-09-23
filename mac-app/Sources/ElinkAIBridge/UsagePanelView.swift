@@ -25,6 +25,7 @@ final class PanelModel: ObservableObject {
     @Published var refreshingUsage = false
     @Published var showSettings = false
     @Published var statsProvider: String?
+    @Published var showReceipt = false
     /// 本机出口的 NAT 观测，由 LinkMonitor 经 PreviewPopoverController 同步过来
     @Published var natObservation: StunObservation?
     @Published var natUnavailable = false
@@ -159,6 +160,13 @@ struct UsagePanelView: View {
                 } else if let provider = model.statsProvider {
                     statsCard(provider, theme)
                         .transition(.opacity)
+                } else if model.showReceipt {
+                    ReceiptView(theme: theme, clusterEnabled: cluster.enabled) {
+                        Log.user("close usage receipt")
+                        withAnimation(.easeOut(duration: 0.2)) { model.showReceipt = false }
+                    }
+                    .glassCard(theme)
+                    .transition(.opacity)
                 } else if model.showMesh {
                     meshDetail(theme)
                         .transition(.opacity)
@@ -178,9 +186,10 @@ struct UsagePanelView: View {
         .background(theme.backgroundGradient)
     }
 
-    /// 设置、用量统计、Nebula、VPS 四页互斥，都盖在主列表上。
+    /// 设置、用量统计、对账单、Nebula、VPS 几页互斥，都盖在主列表上。
     private var overlayVisible: Bool {
-        model.showSettings || model.statsProvider != nil || model.showMesh || model.showVPS
+        model.showSettings || model.statsProvider != nil || model.showReceipt
+            || model.showMesh || model.showVPS
     }
 
     private func header(_ theme: PanelTheme) -> some View {
@@ -213,6 +222,11 @@ struct UsagePanelView: View {
                         ? theme.statusHealthy : theme.statusWarning
                 )
             }
+            PillButton(title: tr("对账单", "Receipt"), icon: "printer", theme: theme) {
+                Log.user("open usage receipt")
+                withAnimation(.easeOut(duration: 0.2)) { model.showReceipt = true }
+            }
+            .disabled(overlayVisible)
             PillButton(title: model.refreshingUsage ? tr("刷新中", "Refreshing") : tr("刷新", "Refresh"),
                        icon: "arrow.clockwise", theme: theme) {
                 model.onRefreshAll?()
