@@ -6,6 +6,22 @@ and `Removed`.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## 0.1.21-rc12
+
+### Added
+
+- After tearing off a usage receipt, a share page shows the receipt image
+  with buttons to share it through the system share sheet, copy it again,
+  show it in Finder, or print another.
+
+### Changed
+
+- Tearing the receipt now looks like tearing real paper: pull down and to one
+  side and the tear runs along the cutter from the opposite edge, leaving a
+  jagged stub in the printer. Once it comes loose the receipt follows the
+  pointer and flies off when released, and it is no longer clipped while it
+  tilts.
+
 ## 0.1.21-rc11
 
 ### Added
