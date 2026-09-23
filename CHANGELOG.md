@@ -6,6 +6,25 @@ and `Removed`.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## 0.1.21-rc9
+
+### Added
+
+- Each agent session and subagent row in the menu-bar panel shows the output
+  rate of its recent model responses (for example `62 tok/s`), so slow models
+  are easy to spot.
+- The e-paper device can show an instant feedback toast in its top-right
+  corner through `POST /v1/display/toast`, so input no longer looks ignored
+  while a multi-second full refresh is pending.
+
+### Fixed
+
+- The menu-bar app no longer uses sustained CPU in the background. Session
+  scans skip transcripts that are too old to show and reuse parsed results
+  for files that have not changed, and Codex usage rereads only the log files
+  that actually changed instead of every file written that day.
+- Status requests and hook events no longer stall behind usage-log parsing.
+
 ## 0.1.21-rc8
 
 ### Changed
