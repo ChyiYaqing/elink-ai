@@ -142,7 +142,9 @@ jobs:
           UNIVERSAL="$RUNNER_TEMP/ElinkAIBridge"
           chmod 0755 "$ARM64" "$X86_64"
           lipo -create "$ARM64" "$X86_64" -output "$UNIVERSAL"
-          lipo "$UNIVERSAL" -verify_arch arm64 x86_64
+          # Xcode 27 的 lipo 把 -verify_arch 之后多出来的架构当成输入文件，逐个检查
+          lipo "$UNIVERSAL" -verify_arch arm64
+          lipo "$UNIVERSAL" -verify_arch x86_64
           file "$UNIVERSAL"
 
       - name: Build DMG
