@@ -494,6 +494,19 @@ final class ModelsTests: XCTestCase {
         ])
     }
 
+    /// 逐文件缓存的是这份结果：事件与整份解析一致，rate_limits 取时间戳最大的一条。
+    func testCodexFileUsageKeepsEventsAndLatestRateLimits() {
+        let later = #"{"timestamp":"1970-01-01T00:20:02.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":140},"last_token_usage":{"total_tokens":140}},"rate_limits":{"tag":"later"}}}"#
+        let earlier = #"{"timestamp":"1970-01-01T00:20:01.000Z","type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"tag":"earlier"}}}"#
+
+        let usage = StatusService.codexFileUsage(lines: [later, earlier])
+
+        XCTAssertEqual(usage.events.map(\.tokens),
+                       StatusService.codexUsageEvents(lines: [later, earlier]).map(\.tokens))
+        XCTAssertEqual(usage.rateLimits?["tag"] as? String, "later")
+        XCTAssertEqual(usage.rateLimitsTimestamp, "1970-01-01T00:20:02.000Z")
+    }
+
     func testCategoryTotalsFollowRangeWindows() throws {
         let calendar = StatusService.aggregationCalendar
         let now = Date()

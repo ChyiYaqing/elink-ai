@@ -264,6 +264,29 @@ final class AgentSessionMonitorTests: XCTestCase {
         XCTAssertTrue(scanner().scan(live: [], claudeCwdCounts: [:]).isEmpty)
     }
 
+    // MARK: - 解析缓存
+
+    /// 大小与 mtime 都没变的文件不重读；任一变化都重新解析。
+    func testUnchangedTranscriptReusesParsedTail() throws {
+        let mtime = Date().addingTimeInterval(-60)
+        let rel = "-Users-me-myproj/sess.jsonl"
+        try write([#"{"type":"user","message":{"content":"第一版"}}"#],
+                  to: rel, under: claudeRoot, mtime: mtime)
+        let s = scanner()
+        XCTAssertEqual(s.scan(live: [], claudeCwdCounts: [:]).first?.prompt, "第一版")
+
+        // 同样字节数、同样 mtime：命中缓存，仍是旧内容
+        try write([#"{"type":"user","message":{"content":"第二版"}}"#],
+                  to: rel, under: claudeRoot, mtime: mtime)
+        XCTAssertEqual(s.scan(live: [], claudeCwdCounts: [:]).first?.prompt, "第一版")
+
+        // 追加内容：大小变了，重新解析
+        try write([#"{"type":"user","message":{"content":"第二版"}}"#,
+                   #"{"type":"user","message":{"content":"第三版"}}"#],
+                  to: rel, under: claudeRoot, mtime: mtime)
+        XCTAssertEqual(s.scan(live: [], claudeCwdCounts: [:]).first?.prompt, "第三版")
+    }
+
     // MARK: - busy/live 派生
 
     func testBusyLiveDerivation() {

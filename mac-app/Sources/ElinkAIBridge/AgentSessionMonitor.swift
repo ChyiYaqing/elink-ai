@@ -228,6 +228,17 @@ final class SessionScanner {
     private let fm = FileManager.default
     private let claudeRoot: URL
     private let codexRoot: URL
+    /// 按文件缓存的 `tailInfo` 结果，键为路径，大小或 mtime 变了才重读。
+    ///
+    /// 每轮 poll 都要重新判活，但活跃会话之外的 transcript 大多一个字节都没动，
+    /// 以前仍每 3～5 秒各读一遍 128KB 尾部并逐行 JSON 解析。结果里的
+    /// activity/rate 都来自文件内容，busy 在读取时才拿它和当前时间比，所以
+    /// 内容不变就可以原样复用。只在所属监视器的串行队列上访问。
+    private typealias TailInfo = (snippet: String, model: String, prompt: String,
+                                  transcript: [TranscriptEntry], activity: Date?, rate: Double?)
+    private var tailCache: [String: (size: Int, mtime: Date, info: TailInfo)] = [:]
+    /// 本轮 scan 用到的路径；scan 结束时据此丢掉已不再扫描的文件
+    private var touched = Set<String>()
 
     init(claudeRoot: URL = FileManager.default.homeDirectoryForCurrentUser
              .appendingPathComponent(".claude/projects"),
@@ -242,8 +253,10 @@ final class SessionScanner {
     /// （claude 不持有 transcript fd 时的回退）。两者是判活的唯一依据。
     func scan(live: Set<String>, claudeCwdCounts: [String: Int]) -> [AgentSession] {
         let recent: (AgentSession) -> Bool = { $0.isLive || Date().timeIntervalSince($0.lastModified) < 6 * 3600 }
+        touched = []
         var sessions = scanClaude(live: live, cwdCounts: claudeCwdCounts).filter(recent)
             + groupCodex(scanCodex(live: live).filter(recent))
+        tailCache = tailCache.filter { touched.contains($0.key) }
         sessions.sort { $0.effectiveLastModified > $1.effectiveLastModified }
         return sessions
     }
@@ -297,7 +310,7 @@ final class SessionScanner {
                 // 与 scan() 的过滤条件一致：反正会被丢弃的旧文件不读内容
                 if !isLive && Date().timeIntervalSince(mtime) >= 6 * 3600 { continue }
                 let projName = proj.lastPathComponent.split(separator: "-").last.map(String.init) ?? proj.lastPathComponent
-                let info = tailInfo(of: f)
+                let info = cachedTailInfo(of: f, mtime: mtime)
                 var sess = AgentSession(id: f.path, kind: .claude, title: projName,
                                         snippet: info.snippet, model: info.model, lastModified: mtime)
                 sess.prompt = info.prompt
@@ -320,7 +333,7 @@ final class SessionScanner {
             // 旧文件提前跳过，避免读内容
             if Date().timeIntervalSince(mtime) > 6 * 3600 { continue }
             let meta = codexMeta(of: f)
-            let info = tailInfo(of: f)
+            let info = cachedTailInfo(of: f, mtime: mtime)
             var sess = AgentSession(id: f.path, kind: .codex, title: meta.title,
                                     snippet: info.snippet, model: info.model, lastModified: mtime)
             sess.prompt = info.prompt
@@ -343,7 +356,7 @@ final class SessionScanner {
         for c in files where c.pathExtension == "jsonl" {
             guard let mtime = (try? c.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate,
                   Date().timeIntervalSince(mtime) < 6 * 3600 else { continue }
-            let info = tailInfo(of: c)
+            let info = cachedTailInfo(of: c, mtime: mtime)
             var kid = AgentSession(id: c.path, kind: .claude, title: "subagent",
                                    snippet: info.snippet, model: info.model, lastModified: mtime)
             // 这里没有昵称 —— 用它接到的任务做标签
@@ -381,6 +394,16 @@ final class SessionScanner {
     /// 展开区最多保留的条目数。倒序扫到这个数就停，因此长 transcript 反而
     /// 比原来更早退出，128KB 窗口是上界而非每次都要读满。
     static let maxTranscriptEntries = 40
+
+    private func cachedTailInfo(of file: URL, mtime: Date) -> TailInfo {
+        let path = file.path
+        touched.insert(path)
+        let size = (try? file.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? -1
+        if let hit = tailCache[path], hit.size == size, hit.mtime == mtime { return hit.info }
+        let info = tailInfo(of: file)
+        tailCache[path] = (size, mtime, info)
+        return info
+    }
 
     /// 读 jsonl transcript 末尾：最后一段可读文本 + 模型名 + 最后一条
     /// 对话（user/assistant）条目的时间戳，以及展开区滚动用的条目列表。

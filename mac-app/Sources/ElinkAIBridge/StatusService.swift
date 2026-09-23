@@ -10,6 +10,10 @@ final class StatusService {
     private let store: UsageStore?
     private weak var cluster: ClusterManager?
     private let lock = NSLock()
+    /// 只保护日志解析与其缓存（`cached`、Claude 偏移量、Codex 逐文件缓存）。
+    /// 与 `lock` 分开：解析可能要几百毫秒，期间 hook 事件和主线程的
+    /// `updateSessions` 不该跟着排队。先取 logsLock 再取 lock，顺序固定。
+    private let logsLock = NSLock()
     private var cached: BridgeSnapshot?
     private var cachedAt = Date.distantPast
     private var hooks: [String: HookState] = [:]
@@ -32,6 +36,12 @@ final class StatusService {
     /// Codex 的解析器跨行有状态（从累计值算增量），不适合切成片段喂。这里只做
     /// 「文件没动过就不重解析」，随时间变化的 state 仍然每轮重算。
     private var codexCache: (latest: Date?, status: AgentStatus)?
+    /// 逐文件的 Codex 解析结果，大小或 mtime 变了才整份重读该文件。
+    ///
+    /// 以前任一文件变化就把当天所有文件整批重读（实测 11 个文件 5.5MB），而通常
+    /// 只有正在跑的那一两个会话在追加。事件与时区无关，按天/小时分桶每轮现做。
+    /// 仍是整份文件解析而非续读：跨行状态见 `codexUsageEvents`，截断续读会重复计数。
+    private var codexFiles: [String: (size: Int, mtime: Date, usage: CodexFileUsage)] = [:]
 
     private static let claudeRoot = URL(
         fileURLWithPath: ("~/.claude/projects" as NSString).expandingTildeInPath)
@@ -50,15 +60,14 @@ final class StatusService {
     }
 
     func localSnapshotForSync() -> BridgeSnapshot {
-        lock.holding {
-            var value: BridgeSnapshot
-            if let cached, Date().timeIntervalSince(cachedAt) < 5 {
-                value = cached
-            } else {
-                value = readLogs()
-                cached = value
-                cachedAt = Date()
-            }
+        var value = logsLock.holding { () -> BridgeSnapshot in
+            if let cached, Date().timeIntervalSince(cachedAt) < 5 { return cached }
+            let value = readLogs()
+            cached = value
+            cachedAt = Date()
+            return value
+        }
+        return lock.holding {
             value.generatedAt = Date()
             value.claude = overlay(value.claude, provider: "claude", usage: usage.claude)
             value.codex = overlay(value.codex, provider: "codex", usage: usage.codex)
@@ -316,30 +325,34 @@ final class StatusService {
         var dailyModelCategories: [String: [String: [String: Int]]] = [:]
         var latestRateLimits: [String: Any]?
         var latestRateLimitsTimestamp = ""
-        for file in files where (modification(file) ?? .distantPast) >= start {
-            guard let text = try? String(contentsOf: file, encoding: .utf8) else { continue }
-            let lines = text.split(separator: "\n").map(String.init)
+        var seen = Set<String>()
+        for file in files {
+            guard let mtime = modification(file), mtime >= start else { continue }
+            let path = file.path
+            let size = (try? file.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? -1
+            let usage: CodexFileUsage
+            if let hit = codexFiles[path], hit.size == size, hit.mtime == mtime {
+                usage = hit.usage
+            } else {
+                guard let text = try? String(contentsOf: file, encoding: .utf8) else { continue }
+                usage = Self.codexFileUsage(lines: text.split(separator: "\n").map(String.init))
+                codexFiles[path] = (size, mtime, usage)
+            }
+            seen.insert(path)
             // 事件解析一次，按天/按小时/按分类/按模型×分类各分桶一遍
-            let events = Self.codexUsageEvents(lines: lines)
+            let events = usage.events
             Self.merge(Self.bucketCodexEvents(events, dayKey: dayKey), into: &daily)
             Self.merge(Self.bucketCodexEvents(events, dayKey: hourKey), into: &hourlyKeyed)
             Self.merge(Self.bucketCodexCategories(events, dayKey: dayKey), into: &dailyCategories)
             Self.merge(Self.bucketCodexModelCategories(events, dayKey: dayKey),
                        into: &dailyModelCategories)
-            for line in lines where line.contains("\"token_count\"") {
-                guard let data = line.data(using: .utf8),
-                      let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                      let payload = object["payload"] as? [String: Any],
-                      payload["type"] as? String == "token_count" else { continue }
-                if let limits = payload["rate_limits"] as? [String: Any] {
-                    let timestamp = object["timestamp"] as? String ?? ""
-                    if timestamp >= latestRateLimitsTimestamp {
-                        latestRateLimitsTimestamp = timestamp
-                        latestRateLimits = limits
-                    }
-                }
+            if let limits = usage.rateLimits, usage.rateLimitsTimestamp >= latestRateLimitsTimestamp {
+                latestRateLimitsTimestamp = usage.rateLimitsTimestamp
+                latestRateLimits = limits
             }
         }
+        // 跨天后昨天的文件不再参与，缓存随之清掉
+        codexFiles = codexFiles.filter { seen.contains($0.key) }
         let today = dayKey(Date())
         let totals = daily[today] ?? [:]
         store?.record(
@@ -716,6 +729,33 @@ final class StatusService {
             }
             return totals
         }
+    }
+
+    typealias CodexUsageEvent = (date: Date, model: String, tokens: Int, categories: [String: Int])
+
+    /// 单个 Codex 会话文件解析一次得到的全部结果：用量事件，以及文件里时间戳
+    /// 最大的那条 rate_limits（同一时间戳取较后出现的）。
+    struct CodexFileUsage {
+        var events: [CodexUsageEvent]
+        var rateLimits: [String: Any]?
+        var rateLimitsTimestamp = ""
+    }
+
+    static func codexFileUsage(lines: [String]) -> CodexFileUsage {
+        var usage = CodexFileUsage(events: codexUsageEvents(lines: lines))
+        for line in lines where line.contains("\"token_count\"") {
+            guard let data = line.data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let payload = object["payload"] as? [String: Any],
+                  payload["type"] as? String == "token_count",
+                  let limits = payload["rate_limits"] as? [String: Any] else { continue }
+            let timestamp = object["timestamp"] as? String ?? ""
+            if timestamp >= usage.rateLimitsTimestamp {
+                usage.rateLimitsTimestamp = timestamp
+                usage.rateLimits = limits
+            }
+        }
+        return usage
     }
 
     /// 单个 Codex 会话文件的行 -> (时间戳, 模型, token 增量, 分类增量) 事件序列。
