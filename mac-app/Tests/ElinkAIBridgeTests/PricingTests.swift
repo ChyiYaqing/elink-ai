@@ -13,10 +13,18 @@ final class PricingTests: XCTestCase {
                        ModelPricing(input: 10, output: 50, cacheRead: 1.0, cacheWrite: 12.5))
         XCTAssertEqual(table["claude-opus-5"],
                        ModelPricing(input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25))
+        XCTAssertEqual(table["claude-opus-5-5"],
+                       ModelPricing(input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5))
         XCTAssertEqual(table["claude-sonnet-5"],
-                       ModelPricing(input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75))
+                       ModelPricing(input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5))
+        XCTAssertEqual(table["gpt-6-astra"],
+                       ModelPricing(input: 10, output: 50, cacheRead: 1.0, cacheWrite: 12.5))
+        XCTAssertEqual(table["gpt-6-sol"],
+                       ModelPricing(input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5))
         XCTAssertEqual(table["gpt-5.6-sol"],
-                       ModelPricing(input: 5, output: 30, cacheRead: 0.5, cacheWrite: 6.25))
+                       ModelPricing(input: 4, output: 20, cacheRead: 0.4, cacheWrite: 5))
+        XCTAssertEqual(table["gpt-5.6-luna"],
+                       ModelPricing(input: 0.2, output: 1.2, cacheRead: 0.02, cacheWrite: 0.25))
     }
 
     /// 缓存读远比输入便宜，缓存写更贵。分类单价搞混会让总额差一个数量级
@@ -37,7 +45,7 @@ final class PricingTests: XCTestCase {
         let cost = Pricing.cost(model: "gpt-5.6-sol",
                                 categories: ["reasoning": 1_000_000],
                                 table: Pricing.builtIn)
-        XCTAssertEqual(cost ?? 0, 30, accuracy: 0.000_001)
+        XCTAssertEqual(cost ?? 0, 20, accuracy: 0.000_001)
     }
 
     func testCostSumsCategoriesAtTheirOwnRates() {
@@ -77,14 +85,14 @@ final class PricingTests: XCTestCase {
         let path = temporaryPath()
         defer { try? FileManager.default.removeItem(atPath: path) }
         let json = """
-        {"claude-sonnet-5": {"input": 2, "output": 10, "cache_read": 0.2, "cache_write": 2.5}}
+        {"claude-sonnet-5": {"input": 1, "output": 5, "cache_read": 0.1, "cache_write": 1.25}}
         """
         try? json.write(toFile: path, atomically: true, encoding: .utf8)
 
         let table = Pricing.table(overridePath: path)
         // 覆盖生效
         XCTAssertEqual(table["claude-sonnet-5"],
-                       ModelPricing(input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5))
+                       ModelPricing(input: 1, output: 5, cacheRead: 0.1, cacheWrite: 1.25))
         // 未被覆盖的仍是内置价
         XCTAssertEqual(table["claude-opus-5"], Pricing.builtIn["claude-opus-5"])
     }

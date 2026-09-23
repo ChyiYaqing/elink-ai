@@ -40,14 +40,14 @@ final class UsageCostTests: XCTestCase {
         let rows = [
             // fable 输出 100 万 = $50
             row(day: today, model: "claude-fable-5", category: "output", tokens: 1_000_000),
-            // sonnet 输入 100 万 = $3
+            // sonnet 输入 100 万 = $2
             row(day: today, model: "claude-sonnet-5", category: "input", tokens: 1_000_000),
             // opus 缓存读 100 万 = $0.5
             row(day: today, model: "claude-opus-5", category: "cache_read", tokens: 1_000_000),
         ]
         let result = UsageStats.costTotal(rows: rows, range: .day, now: now,
                                           table: Pricing.builtIn)
-        XCTAssertEqual(result.cost, 53.5, accuracy: 0.000_001)
+        XCTAssertEqual(result.cost, 52.5, accuracy: 0.000_001)
         XCTAssertTrue(result.unpriced.isEmpty)
     }
 

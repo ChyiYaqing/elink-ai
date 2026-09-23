@@ -196,7 +196,7 @@ final class ModelCategoryUsageTests: XCTestCase {
         let rows = store.modelCategoryUsage(provider: "codex", since: "2026-07-01")
         XCTAssertEqual(rows.count, 1, "回填的历史必须能从集群口径读到")
         XCTAssertEqual(rows[0].tokens, 1_000_000)
-        XCTAssertEqual(Pricing.total(rows: rows, table: Pricing.builtIn).cost, 5,
+        XCTAssertEqual(Pricing.total(rows: rows, table: Pricing.builtIn).cost, 4,
                        accuracy: 0.000_001)
     }
 

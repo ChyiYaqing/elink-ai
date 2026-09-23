@@ -28,21 +28,26 @@ struct ModelPricing: Equatable {
 /// 未知模型一律返回 nil 而不是当成 0：静默算成 0 会让总额看着正常却少算一截，
 /// 比缺一个数更难发现。调用方负责把「无定价」显式说出来。
 enum Pricing {
-    /// 官方公布价，2026-07-31 核对。
+    /// 官方公布价，2026-09-23 核对。
     ///
-    /// Anthropic 不单独公布缓存价，按其规则推导：缓存读 0.1×input，
-    /// 缓存写取 5 分钟 TTL 的 1.25×input（1 小时 TTL 是 2×，日志里区分不出来，
-    /// 取常用的那档）。OpenAI 则是逐档公布的原值。
+    /// Anthropic 不单独公布缓存价，按其规则推导：缓存写取 5 分钟 TTL 的 1.25×input
+    /// （1 小时 TTL 是 2×，日志里区分不出来，取常用的那档）；缓存读一般是 0.1×input，
+    /// 但 Opus 5.5 是 0.05×。claude-sonnet-5 的 2/10 原是首发优惠价，官方已改为正式价。
     ///
-    /// claude-sonnet-5 用的是标准价 3/15。它到 2026-08-31 前有 2/10 的优惠价，
-    /// 这里不内置：优惠一过标准价自动正确，期间会略微高估。要按优惠价算就用
-    /// pricing.json 覆盖。
+    /// OpenAI 是逐档公布的原值，这里取短上下文档。单次输入超过 272K token 的请求
+    /// 官方按 2× 输入/缓存、1.5× 输出计费，而日志只有按天的分类汇总、看不出单次
+    /// 请求多长，长上下文用得多时会少算。gpt-5.6-sol 是促销价，官方称至少持续到
+    /// 2026-11-21，到期后要按官网回调。codex-auto-review 没有官方公布价，不收录。
     static let builtIn: [String: ModelPricing] = [
         "claude-fable-5": ModelPricing(input: 10, output: 50, cacheRead: 1.0, cacheWrite: 12.5),
+        "claude-opus-5-5": ModelPricing(input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5),
         "claude-opus-5": ModelPricing(input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25),
         "claude-opus-4-8": ModelPricing(input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25),
-        "claude-sonnet-5": ModelPricing(input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75),
-        "gpt-5.6-sol": ModelPricing(input: 5, output: 30, cacheRead: 0.5, cacheWrite: 6.25),
+        "claude-sonnet-5": ModelPricing(input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5),
+        "gpt-6-astra": ModelPricing(input: 10, output: 50, cacheRead: 1.0, cacheWrite: 12.5),
+        "gpt-6-sol": ModelPricing(input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5),
+        "gpt-5.6-sol": ModelPricing(input: 4, output: 20, cacheRead: 0.4, cacheWrite: 5),
+        "gpt-5.6-luna": ModelPricing(input: 0.2, output: 1.2, cacheRead: 0.02, cacheWrite: 0.25),
     ]
 
     /// 用户覆盖表所在位置，与 usage.db 同目录。
