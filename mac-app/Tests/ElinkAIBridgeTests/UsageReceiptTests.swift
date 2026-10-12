@@ -151,17 +151,81 @@ final class UsageReceiptTests: XCTestCase {
         XCTAssertEqual(ReceiptView.tearAngle(progress: 0, fromRight: false), 0)
     }
 
-    /// 撕开的那段是锯齿、没撕开的仍是直线；纸身与残边共用同一条线，齿才咬得上
-    func testCutLineIsJaggedOnlyWhereTorn() {
-        let line = ReceiptEdge.cutLine(width: 60, torn: 0.5, fromRight: false, tooth: 6, untornY: 0)
-        let left = line.filter { $0.x < 29 }
-        let right = line.filter { $0.x > 31 }
-        XCTAssertTrue(left.contains { $0.y > 0 }, "左半边已撕开，应有齿")
-        XCTAssertTrue(right.allSatisfy { $0.y == 0 }, "右半边还连着，应是直边")
+    /// 手撕毛边：同一个种子画出同一条线（纸身与残边才对得上），深浅落在范围内，
+    /// 齿距不等——等距等高的锯齿看起来就是机器切的
+    func testTornEdgeIsIrregularButReproducible() {
+        let line = TornEdge.line(width: 300, seed: 42)
+        XCTAssertEqual(line, TornEdge.line(width: 300, seed: 42))
+        XCTAssertNotEqual(line, TornEdge.line(width: 300, seed: 43))
+        XCTAssertEqual(line.first?.x, 0)
+        XCTAssertEqual(line.last?.x, 300)
+        XCTAssertTrue(line.allSatisfy { $0.y >= 0 && $0.y <= TornEdge.depth })
 
-        let whole = ReceiptEdge.cutLine(width: 60, torn: 1, fromRight: true, tooth: 6, untornY: 9)
-        XCTAssertFalse(whole.contains { $0.y == 9 }, "整条撕开后不应再有直边")
-        XCTAssertEqual(ReceiptEdge.cutLine(width: 60, torn: 0, fromRight: false, tooth: 6, untornY: 2)
-                           .map(\.y), Array(repeating: 2, count: 21))
+        let gaps = zip(line, line.dropFirst()).map { ($1.x - $0.x).rounded(toPlaces: 1) }
+        XCTAssertGreaterThan(Set(gaps).count, 10, "齿距应当参差不齐")
+        XCTAssertGreaterThan(Set(line.map { $0.y.rounded(toPlaces: 1) }).count, 10, "深浅应当参差不齐")
+    }
+
+    /// 撕到一半：撕开的一侧跟撕口走，另一侧仍是直边
+    func testPartialTearKeepsTheUntornSideStraight() {
+        let line = TornEdge.line(width: 300, seed: 7)
+        let half = TornEdge.partial(line, width: 300, torn: 0.5, fromRight: true, untornY: -1)
+        XCTAssertTrue(half.filter { $0.x < 149 }.allSatisfy { $0.y == -1 })
+        XCTAssertFalse(half.filter { $0.x > 151 }.contains { $0.y == -1 })
+        XCTAssertTrue(TornEdge.partial(line, width: 300, torn: 0, fromRight: false, untornY: 3)
+                          .allSatisfy { $0.y == 3 })
+    }
+
+    private typealias Stage = ReceiptTearStage<DragGesture>
+
+    /// 撕下后落定：先以中心缩放、再绕断角转、再平移，四个角都必须留在出纸区里
+    func testRestingPaperStaysInsideThePanel() {
+        let paper = CGSize(width: ReceiptPaper.width, height: 560)
+        for stage in [CGSize(width: 408, height: 520), CGSize(width: 480, height: 700),
+                      CGSize(width: 408, height: 380)] {
+            for fromRight in [false, true] {
+                let pose = Stage.restPose(stage: stage, paperSize: paper, fromRight: fromRight)
+                let origin = CGPoint(x: (stage.width - paper.width) / 2,
+                                     y: Stage.cutterY + Stage.stubLength)
+                let anchor = CGPoint(x: fromRight ? 0 : paper.width, y: 0)
+                let radians = pose.angle * .pi / 180
+                for corner in [CGPoint(x: 0, y: 0), CGPoint(x: paper.width, y: 0),
+                               CGPoint(x: 0, y: paper.height), CGPoint(x: paper.width, y: paper.height)] {
+                    let scaled = CGPoint(x: paper.width / 2 + (corner.x - paper.width / 2) * pose.scale,
+                                         y: paper.height / 2 + (corner.y - paper.height / 2) * pose.scale)
+                    let dx = scaled.x - anchor.x, dy = scaled.y - anchor.y
+                    let x = origin.x + anchor.x + dx * cos(radians) - dy * sin(radians) + pose.offset.width
+                    let y = origin.y + anchor.y + dx * sin(radians) + dy * cos(radians) + pose.offset.height
+                    XCTAssertGreaterThanOrEqual(x, 0, "\(stage) fromRight=\(fromRight)")
+                    XCTAssertLessThanOrEqual(x, stage.width, "\(stage) fromRight=\(fromRight)")
+                    XCTAssertGreaterThanOrEqual(y, Stage.cutterY, "\(stage) fromRight=\(fromRight)")
+                    XCTAssertLessThanOrEqual(y, stage.height - Stage.restBottomReserve,
+                                             "\(stage) fromRight=\(fromRight)")
+                }
+            }
+        }
+    }
+
+    /// 捏着纸往面板外拖很远，中心只越界一小截
+    func testHeldPaperIsHeldBackAtThePanelEdge() {
+        let stage = CGSize(width: 408, height: 520), paper = CGSize(width: 300, height: 480)
+        let offset = Stage.heldOffset(CGSize(width: 2000, height: 2000), angle: -14,
+                                      stage: stage, paperSize: paper, fromRight: false)
+        let center = Stage.paperCenter(stage: stage, paperSize: paper, fromRight: false,
+                                       angle: -14, offset: offset)
+        XCTAssertLessThanOrEqual(center.x - (stage.width - paper.width / 2), Stage.maxOvershoot + 0.001)
+        XCTAssertLessThanOrEqual(center.y - (stage.height - paper.height / 2), Stage.maxOvershoot + 0.001)
+
+        // 面板内的小幅拖动不受影响
+        let small = CGSize(width: 10, height: 20)
+        XCTAssertEqual(Stage.heldOffset(small, angle: 0, stage: CGSize(width: 408, height: 900),
+                                        paperSize: paper, fromRight: false), small)
+    }
+}
+
+private extension CGFloat {
+    func rounded(toPlaces places: Int) -> CGFloat {
+        let factor = pow(10, CGFloat(places))
+        return (self * factor).rounded() / factor
     }
 }
