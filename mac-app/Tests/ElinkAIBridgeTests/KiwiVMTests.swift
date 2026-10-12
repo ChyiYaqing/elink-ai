@@ -389,6 +389,25 @@ final class KiwiVMTests: XCTestCase {
         XCTAssertTrue(store.load().isEmpty)
     }
 
+    /// 改名只动名字：api_key 和顺序都要原样留着，否则改个名就得重新验证一遍。
+    func testRenameKeepsTheKeyAndOrder() throws {
+        let (store, path) = credentialStore()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+
+        let first = VpsCredential(veid: "111", label: "one", apiKey: String(repeating: "a", count: 32))
+        let second = VpsCredential(veid: "222", label: "two", apiKey: String(repeating: "b", count: 32))
+        try store.save(first)
+        try store.save(second)
+
+        XCTAssertEqual(try store.rename(veid: "111", to: "  VPS-US-1 "), "VPS-US-1")
+        var renamed = first
+        renamed.label = "VPS-US-1"
+        XCTAssertEqual(store.load(), [renamed, second])
+
+        XCTAssertEqual(try store.rename(veid: "222", to: ""), "VPS 222", "清空名字回落到 VM ID")
+        XCTAssertEqual(store.servers().map(\.label), ["VPS-US-1", "VPS 222"])
+    }
+
     /// 删到一台不剩要真的清空，而不是留下一份空记录。
     func testRemovingTheLastServerClearsStorage() throws {
         let (store, path) = credentialStore()
@@ -485,6 +504,27 @@ final class KiwiVMTests: XCTestCase {
         }
         XCTAssertEqual(KiwiVMMonitor.ordered(snapshots, by: credentials).map(\.veid),
                        ["333", "111", "222"])
+    }
+
+    /// 改名立刻上屏，但不花一次计量调用；下一轮读数也要沿用新名字。
+    func testRelabelUpdatesTheCardWithoutFetching() {
+        var calls = 0
+        let monitor = KiwiVMMonitor(credentials: [credential]) { _ in
+            calls += 1
+            return self.liveKVM()
+        }
+        monitor.runOnce()
+        XCTAssertEqual(calls, 1)
+
+        monitor.relabel(veid: "1575322", to: "VPS-US-2")
+        let drained = expectation(description: "queue drained")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { drained.fulfill() }
+        wait(for: [drained], timeout: 2)
+        XCTAssertEqual(calls, 1, "名字是本地的，不该为它去问 KiwiVM")
+        XCTAssertEqual(monitor.servers.first?.label, "VPS-US-2")
+
+        monitor.runOnce()
+        XCTAssertEqual(monitor.servers.first?.label, "VPS-US-2", "下一轮不能把旧名字写回来")
     }
 
     func testRefreshIfStaleSkipsWhileTheReadingIsFresh() {

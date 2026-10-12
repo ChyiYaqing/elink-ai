@@ -220,6 +220,9 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
                                     completion: completion)
         }
         model.onRemoveVPS = { [weak self] veid in self?.removeVPSCredential(veid: veid) }
+        model.onRenameVPS = { [weak self] veid, label in
+            self?.renameVPSCredential(veid: veid, label: label)
+        }
         let hosting = NSHostingController(
             rootView: UsagePanelView(model: model, updater: updater, cluster: cluster,
                                      mesh: mesh, kiwi: kiwi)
@@ -354,6 +357,20 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
             return tr("连不上 KiwiVM，请稍后重试", "Cannot reach KiwiVM; try again shortly")
         case .malformed:
             return tr("KiwiVM 返回了看不懂的内容", "KiwiVM returned something unreadable")
+        }
+    }
+
+    private func renameVPSCredential(veid: String, label: String) {
+        do {
+            let label = try KiwiVMCredentialStore.shared.rename(veid: veid, to: label)
+            model.vpsServers = KiwiVMCredentialStore.shared.servers()
+            kiwi.relabel(veid: veid, to: label)
+            model.settingsMessage = tr("已改名为 \(label)", "Renamed to \(label)")
+            Log.user("rename kiwivm credential veid=\(veid)")
+        } catch {
+            model.settingsMessage = error.localizedDescription
+            Log.warning("rename kiwivm credential veid=\(veid) failed: \(error.localizedDescription)",
+                        category: "kiwivm")
         }
     }
 

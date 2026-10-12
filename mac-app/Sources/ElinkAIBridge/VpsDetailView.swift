@@ -7,7 +7,12 @@ import SwiftUI
 struct VpsDetailView: View {
     @ObservedObject var monitor: KiwiVMMonitor
     let theme: PanelTheme
+    /// (veid, 新名字)。名字只存在本机，改它不需要再问 KiwiVM。
+    let onRename: (String, String) -> Void
     let onBack: () -> Void
+    @State private var renamingVeid: String?
+    @State private var labelDraft = ""
+    @FocusState private var labelFocused: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -54,9 +59,36 @@ struct VpsDetailView: View {
     private func serverBlock(_ server: VpsSnapshot) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 6) {
-                Text(server.label)
-                    .font(.system(size: 12, weight: .bold, design: .rounded))
-                    .foregroundStyle(theme.textPrimary)
+                if renamingVeid == server.veid {
+                    TextField(tr("名称", "Name"), text: $labelDraft)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 11, weight: .semibold, design: .rounded))
+                        .frame(maxWidth: 160)
+                        .focused($labelFocused)
+                        .onSubmit { commitRename(server.veid) }
+                        .onExitCommand { renamingVeid = nil }
+                        // 点到别处也算确认：留着一个没人管的输入框比悄悄保存更让人困惑。
+                        .onChange(of: labelFocused) { focused in
+                            if !focused { commitRename(server.veid) }
+                        }
+                } else {
+                    Text(server.label)
+                        .font(.system(size: 12, weight: .bold, design: .rounded))
+                        .foregroundStyle(theme.textPrimary)
+                    Button {
+                        labelDraft = server.label
+                        renamingVeid = server.veid
+                        labelFocused = true
+                    } label: {
+                        Image(systemName: "pencil")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundStyle(theme.textTertiary)
+                            .frame(width: 16, height: 16)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(tr("重命名 \(server.label)", "Rename \(server.label)"))
+                }
                 Text(server.plan)
                     .font(.system(size: 9, weight: .medium))
                     .foregroundStyle(theme.textTertiary)
@@ -96,6 +128,16 @@ struct VpsDetailView: View {
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
         .glassCard(theme)
+    }
+
+    /// 先清掉编辑态再回调：失焦也会走到这里，守卫保证回车 + 失焦只保存一次，
+    /// Esc 取消后的那次失焦什么也不做。
+    private func commitRename(_ veid: String) {
+        guard renamingVeid == veid else { return }
+        renamingVeid = nil
+        let current = monitor.servers.first { $0.veid == veid }?.label
+        guard labelDraft.trimmingCharacters(in: .whitespacesAndNewlines) != current else { return }
+        onRename(veid, labelDraft)
     }
 
     @ViewBuilder

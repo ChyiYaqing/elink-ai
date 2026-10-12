@@ -144,6 +144,22 @@ final class KiwiVMMonitor: ObservableObject {
         queue.async { [weak self] in self?.runOnce() }
     }
 
+    /// 只换显示名，不发请求：名字是本地的，KiwiVM 那边什么都没变。
+    /// `reconfigure` 会立刻补一轮，用在这里就是白花一次计量调用。
+    func relabel(veid: String, to label: String) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            if let index = self.credentials.firstIndex(where: { $0.veid == veid }) {
+                self.credentials[index].label = label
+            }
+            DispatchQueue.main.async {
+                if let index = self.servers.firstIndex(where: { $0.veid == veid }) {
+                    self.servers[index].label = label
+                }
+            }
+        }
+    }
+
     /// 面板打开时补一轮，但只在数据确实旧了才补。
     ///
     /// 两分钟远宽于 mesh 那边的十秒，因为这些读数以分钟为尺度变化——两分钟内再问一次，

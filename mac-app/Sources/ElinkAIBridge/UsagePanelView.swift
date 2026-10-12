@@ -38,6 +38,7 @@ final class PanelModel: ObservableObject {
     @Published var vpsSaving = false
     var onSaveVPS: ((String, String, String, @escaping (Bool) -> Void) -> Void)?
     var onRemoveVPS: ((String) -> Void)?
+    var onRenameVPS: ((String, String) -> Void)?
     @Published var launchAtLogin = false
     @Published var deviceHost = ""
     @Published var bridgeAddress = ""
@@ -92,6 +93,9 @@ struct UsagePanelView: View {
     @State private var vpsLabelInput = ""
     @State private var vpsKeyInput = ""
     @State private var vpsPendingRemoval: String?
+    @State private var vpsEditingVeid: String?
+    @State private var vpsEditLabel = ""
+    @State private var vpsEditKey = ""
 
     init(model: PanelModel, updater: UpdateChecker, cluster: ClusterManager,
          mesh: MeshMonitor, kiwi: KiwiVMMonitor,
@@ -171,7 +175,8 @@ struct UsagePanelView: View {
                     meshDetail(theme)
                         .transition(.opacity)
                 } else if model.showVPS {
-                    VpsDetailView(monitor: kiwi, theme: theme) {
+                    VpsDetailView(monitor: kiwi, theme: theme,
+                                  onRename: { veid, label in model.onRenameVPS?(veid, label) }) {
                         Log.user("close vps detail")
                         withAnimation(.easeOut(duration: 0.2)) { model.showVPS = false }
                     }
@@ -714,22 +719,37 @@ struct UsagePanelView: View {
                         .fixedSize(horizontal: false, vertical: true)
 
                     ForEach(model.vpsServers, id: \.veid) { server in
-                        HStack(spacing: 8) {
-                            Text(server.label)
-                                .font(.system(size: 10, weight: .semibold))
-                                .foregroundStyle(theme.textPrimary)
-                                .lineLimit(1)
-                            Text(server.veid)
-                                .font(.system(size: 9, design: .monospaced))
-                                .foregroundStyle(theme.textTertiary)
-                            Spacer(minLength: 0)
-                            RowIconButton(
-                                icon: "trash", theme: theme,
-                                label: tr("移除 \(server.label)", "Remove \(server.label)"),
-                                hint: tr("删除这台的 API key 并停止读取它",
-                                         "Deletes this server's API key and stops reading it")
-                            ) { vpsPendingRemoval = server.veid }
-                            .disabled(model.vpsSaving)
+                        if vpsEditingVeid == server.veid {
+                            vpsEditor(server, theme)
+                        } else {
+                            HStack(spacing: 8) {
+                                Text(server.label)
+                                    .font(.system(size: 10, weight: .semibold))
+                                    .foregroundStyle(theme.textPrimary)
+                                    .lineLimit(1)
+                                Text(server.veid)
+                                    .font(.system(size: 9, design: .monospaced))
+                                    .foregroundStyle(theme.textTertiary)
+                                Spacer(minLength: 0)
+                                RowIconButton(
+                                    icon: "pencil", theme: theme,
+                                    label: tr("编辑 \(server.label)", "Edit \(server.label)"),
+                                    hint: tr("修改名称或更换 API key", "Rename it or replace its API key"),
+                                    hoverColor: theme.statusInfo
+                                ) {
+                                    vpsEditLabel = server.label
+                                    vpsEditKey = ""
+                                    vpsEditingVeid = server.veid
+                                }
+                                .disabled(model.vpsSaving)
+                                RowIconButton(
+                                    icon: "trash", theme: theme,
+                                    label: tr("移除 \(server.label)", "Remove \(server.label)"),
+                                    hint: tr("删除这台的 API key 并停止读取它",
+                                             "Deletes this server's API key and stops reading it")
+                                ) { vpsPendingRemoval = server.veid }
+                                .disabled(model.vpsSaving)
+                            }
                         }
                     }
 
@@ -786,6 +806,53 @@ struct UsagePanelView: View {
             ? tr("未添加服务器 · 添加后在主页显示", "No servers yet · they appear on the main page once added")
             : tr("\(count) 台 · 面板打开时每 5 分钟读取一次",
                  "\(count) server(s) · read every 5 minutes while the panel is open")
+    }
+
+    /// VM ID 不给改：它是这台的身份，换 VM ID 就是换一台，走删除再添加。
+    private func vpsEditor(_ server: (veid: String, label: String), _ theme: PanelTheme) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Text(server.veid)
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(theme.textTertiary)
+                    .frame(width: 76, alignment: .leading)
+                TextField(tr("名称", "Name"), text: $vpsEditLabel)
+                    .frame(width: 96)
+                SecureField(tr("新 API key（留空不换）", "New API key (blank keeps it)"),
+                            text: $vpsEditKey)
+                    .onSubmit { saveVPSEdit(server.veid) }
+            }
+            .textFieldStyle(.roundedBorder)
+            .font(.system(size: 10, design: .monospaced))
+            .disabled(model.vpsSaving)
+
+            HStack(spacing: 6) {
+                PillButton(title: model.vpsSaving ? tr("验证中", "Validating") : tr("保存", "Save"),
+                           icon: model.vpsSaving ? "hourglass" : "checkmark",
+                           theme: theme) { saveVPSEdit(server.veid) }
+                    .disabled(model.vpsSaving)
+                PillButton(title: tr("取消", "Cancel"), icon: "xmark", theme: theme) {
+                    vpsEditingVeid = nil
+                }
+                .disabled(model.vpsSaving)
+            }
+        }
+    }
+
+    /// 只改名不碰网络；换了 key 就和添加一样，先向 KiwiVM 验证再落盘。
+    private func saveVPSEdit(_ veid: String) {
+        guard !model.vpsSaving else { return }
+        if vpsEditKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            model.onRenameVPS?(veid, vpsEditLabel)
+            vpsEditingVeid = nil
+            return
+        }
+        model.onSaveVPS?(veid, vpsEditLabel, vpsEditKey) { saved in
+            if saved {
+                vpsEditKey = ""
+                vpsEditingVeid = nil
+            }
+        }
     }
 
     private func saveVPS() {
@@ -2160,17 +2227,19 @@ private struct RowIconButton: View {
     let theme: PanelTheme
     let label: String
     let hint: String
+    var hoverColor: Color?
     let action: () -> Void
     @State private var hovering = false
 
     var body: some View {
+        let accent = hoverColor ?? theme.statusCritical
         Button(action: action) {
             Image(systemName: icon)
                 .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(hovering ? theme.statusCritical : theme.textTertiary)
+                .foregroundStyle(hovering ? accent : theme.textTertiary)
                 .frame(width: 20, height: 20)
                 .background(
-                    Circle().fill(hovering ? theme.statusCritical.opacity(0.12) : .clear)
+                    Circle().fill(hovering ? accent.opacity(0.12) : .clear)
                 )
                 .contentShape(Rectangle())
         }

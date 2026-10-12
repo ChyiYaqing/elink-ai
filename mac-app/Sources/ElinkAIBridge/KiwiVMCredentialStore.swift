@@ -82,6 +82,18 @@ struct KiwiVMCredentialStore {
         try write(rows)
     }
 
+    /// 改名不重新验证：api_key 没变，再打一次计量调用换不回任何新信息。
+    /// 返回规整后的名字，调用方拿它上屏，免得卡片和存下来的不一致。
+    @discardableResult
+    func rename(veid: String, to label: String) throws -> String {
+        let label = Self.normalizedLabel(label, veid: veid)
+        var rows = load()
+        guard let index = rows.firstIndex(where: { $0.veid == veid }) else { return label }
+        rows[index].label = label
+        try write(rows)
+        return label
+    }
+
     func remove(veid: String) throws {
         try write(load().filter { $0.veid != veid })
     }
