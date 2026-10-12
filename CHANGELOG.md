@@ -6,6 +6,26 @@ and `Removed`.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## 0.1.21-rc13
+
+### Added
+
+- Servers can be edited after they are added. Rename a server from the pencil
+  next to its name on the Servers page or in VPS Monitoring settings, and
+  replace its API key in settings; a new key is validated with KiwiVM before
+  it is saved. Renaming never calls KiwiVM.
+
+### Changed
+
+- The receipt's top edge now tears like real paper, with an irregular edge
+  that matches the stub left in the printer. A torn-off receipt stays inside
+  the panel while you hold it and when you let go.
+
+### Fixed
+
+- Printing a receipt is smooth instead of feeding out in jerky steps, and
+  dragging to tear it no longer stutters.
+
 ## 0.1.21-rc12
 
 ### Added
