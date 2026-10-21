@@ -25,6 +25,66 @@ final class ModelsTests: XCTestCase {
         XCTAssertEqual(tr("中文文案", "English copy"), "中文文案")
     }
 
+    func testUsageWindowCountdownAdvancesWithoutRefetching() throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let window = UsageWindow(percent: 1, resetMinutes: 7 * 24 * 60,
+                                 resetAt: now.addingTimeInterval(7 * 24 * 60 * 60))
+
+        let later = window.discardingIfExpired(at: now.addingTimeInterval(3_600))
+        XCTAssertEqual(later.percent, 1)
+        XCTAssertEqual(later.resetMinutes, 7 * 24 * 60 - 60)
+        XCTAssertEqual(later.resetAt, window.resetAt)
+        let expired = window.discardingIfExpired(at: try XCTUnwrap(window.resetAt))
+        XCTAssertNil(expired.percent)
+        XCTAssertNil(expired.resetMinutes)
+        XCTAssertEqual(UsageWindow(percent: 0, resetMinutes: 90).discardingIfExpired(at: now),
+                       UsageWindow(percent: 0, resetMinutes: 90))
+    }
+
+    func testCodexUnusedWindowsHaveNoActiveResetCountdown() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let windows = UsageFetcher.codexWindows([
+            "primary_window": ["used_percent": 0, "limit_window_seconds": 18_000,
+                               "reset_after_seconds": 18_000,
+                               "reset_at": now.timeIntervalSince1970 + 18_000],
+            "secondary_window": ["used_percent": 0, "limit_window_seconds": 604_800,
+                                 "reset_after_seconds": 604_800,
+                                 "reset_at": now.timeIntervalSince1970 + 604_800],
+        ], now: now)
+
+        for window in [windows.primary, windows.weekly] {
+            XCTAssertEqual(window.percent, 0)
+            XCTAssertNil(window.resetAt)
+            XCTAssertNil(window.resetMinutes)
+        }
+    }
+
+    func testCodexRoundedZeroUsageKeepsAnActiveResetCountdown() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let windows = UsageFetcher.codexWindows([
+            "secondary_window": ["used_percent": 0, "limit_window_seconds": 604_800,
+                                 "reset_after_seconds": 601_200,
+                                 "reset_at": now.timeIntervalSince1970 + 601_200],
+        ], now: now)
+
+        XCTAssertEqual(windows.weekly.percent, 0)
+        XCTAssertEqual(windows.weekly.resetMinutes, 10_020)
+        XCTAssertEqual(windows.weekly.resetAt, now.addingTimeInterval(601_200))
+    }
+
+    func testClusterUsageCountdownAdvancesFromRemoteResetTime() throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let remote = AgentStatus(
+            weekly: UsageWindow(percent: 1, resetMinutes: 10_080,
+                                resetAt: now.addingTimeInterval(604_800)),
+            usageFetchedAt: now
+        )
+        let preferred = try XCTUnwrap(ClusterManager.preferredUsageStatus(
+            [(now, remote)], now: now.addingTimeInterval(7_200)))
+
+        XCTAssertEqual(preferred.weekly.resetMinutes, 9_960)
+    }
+
     func testSnapshotHasVersionedShape() throws {
         var snapshot = BridgeSnapshot()
         snapshot.claude.state = "working"
