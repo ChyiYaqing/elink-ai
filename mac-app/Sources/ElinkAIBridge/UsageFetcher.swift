@@ -862,6 +862,13 @@ final class UsageFetcher {
     private static func epochWindow(_ value: Any?, now: Date = Date()) -> UsageWindow {
         guard let object = value as? [String: Any] else { return UsageWindow() }
         let percent = (object["used_percent"] as? NSNumber)?.doubleValue
+        // 未启用的窗口返回完整周期，reset_at 会随每次请求后移，不是真正的重置时间。
+        if percent == 0,
+           let duration = (object["limit_window_seconds"] as? NSNumber)?.doubleValue, duration > 0,
+           let remaining = (object["reset_after_seconds"] as? NSNumber)?.doubleValue,
+           remaining >= duration {
+            return UsageWindow(percent: percent)
+        }
         let resetAt = (object["reset_at"] as? NSNumber).map {
             Date(timeIntervalSince1970: $0.doubleValue)
         }

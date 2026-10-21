@@ -6,10 +6,14 @@ struct UsageWindow: Codable, Equatable {
     var resetAt: Date?
 
     func discardingIfExpired(at now: Date = Date()) -> UsageWindow {
-        guard let resetAt, resetAt <= now else { return self }
+        guard let resetAt else { return self }
         var value = self
-        value.percent = nil
-        value.resetMinutes = nil
+        if resetAt <= now {
+            value.percent = nil
+            value.resetMinutes = nil
+        } else {
+            value.resetMinutes = Int(resetAt.timeIntervalSince(now) / 60)
+        }
         return value
     }
 }
