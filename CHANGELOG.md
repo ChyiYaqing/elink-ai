@@ -6,6 +6,16 @@ and `Removed`.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## 0.1.21-rc14
+
+### Fixed
+
+- Codex quota windows that have not started now show “No active window”
+  instead of a reset countdown that returns to nearly seven days on every
+  refresh. Active windows still show their reset time when usage rounds to 0%.
+- Reset countdowns from cached usage and other hosts now decrease with time,
+  even between quota refreshes.
+
 ## 0.1.21-rc13
 
 ### Added
