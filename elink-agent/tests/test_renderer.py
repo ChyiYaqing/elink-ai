@@ -94,6 +94,21 @@ def test_dual_panel_overage_percentage_fits_before_usage_label():
     assert draw.textbbox((0, 0), percentage, font=font)[2] <= 140
 
 
+def test_primary_percentage_stays_above_its_progress_bar():
+    # 0% 时进度条是空心的：大号数字只要伸到条上，条内和条上方的间隙就会出现黑像素
+    renderer = DashboardRenderer()
+    for mode, label_offset in (("claude", 250), ("dashboard", 168)):
+        snapshot = _snapshot(claude=replace(_snapshot().claude, primary_pct=0))
+        image = renderer.render(snapshot, mode=mode, updated_at=FIXED_TIME).convert("L")
+        x0, y0 = DashboardRenderer.CLAUDE_BOX[:2]
+        bar_y = y0 + 156
+        left, right = x0 + 30, x0 + label_offset - 12
+        # 跳过进度条 2px 的上边框，只看条上方的间隙和条内部
+        for top, bottom in ((bar_y - 4, bar_y), (bar_y + 2, bar_y + 16)):
+            region = image.crop((left, top, right, bottom))
+            assert region.getextrema()[0] == 255, f"percentage reaches the bar in {mode} mode"
+
+
 def test_overage_percentage_does_not_overfill_progress_bar():
     draw = Mock()
 
