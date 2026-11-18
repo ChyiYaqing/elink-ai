@@ -6,6 +6,14 @@ and `Removed`.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## 0.1.21-rc15
+
+### Fixed
+
+- In single-provider mode, the e-paper dashboard's large five-hour usage
+  percentage now stays fully above its progress bar instead of having its
+  lower edge covered by the bar.
+
 ## 0.1.21-rc14
 
 ### Fixed
