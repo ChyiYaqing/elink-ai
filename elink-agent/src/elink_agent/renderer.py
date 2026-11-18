@@ -168,16 +168,18 @@ class DashboardRenderer:
         label_x = x0 + (250 if large else 168)
         draw.text((x0 + 16, y0 + 67), "5 HOUR WINDOW",
                   font=self._font(12, bold=True), fill=0)
+        bar_y = y0 + 156
+        # 字号同时受宽度和高度约束，大号数字的底边要停在进度条上方
         pct_font = self._fit_font(draw, pct, preferred=92 if large else 68,
                                   minimum=54 if large else 42,
-                                  max_width=label_x - (x0 + 16) - 12, bold=True)
+                                  max_width=label_x - (x0 + 16) - 12,
+                                  max_height=bar_y - 6 - (y0 + 79), bold=True)
         draw.text((x0 + 16, y0 + 79), pct, font=pct_font, fill=0)
         draw.text((label_x, y0 + 91), "USED", font=self._font(15, bold=True), fill=0)
         reset = self._reset(provider.primary_reset_min).replace("reset ", "")
         draw.text((label_x, y0 + 115), f"RESET {reset.upper()}",
                   font=self._font(12), fill=0)
 
-        bar_y = y0 + 156
         self._progress(draw, x0 + 16, bar_y, x1 - 16, provider.primary_pct)
 
         weekly_y = bar_y + 45
@@ -390,11 +392,12 @@ class DashboardRenderer:
         return path
 
     def _fit_font(self, draw: ImageDraw.ImageDraw, text: str, *, preferred: int,
-                  minimum: int, max_width: int,
+                  minimum: int, max_width: int, max_height: int | None = None,
                   bold: bool = True) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
         for size in range(preferred, minimum - 1, -2):
             font = self._font(size, bold=bold)
-            if draw.textbbox((0, 0), text, font=font)[2] <= max_width:
+            _, _, right, bottom = draw.textbbox((0, 0), text, font=font)
+            if right <= max_width and (max_height is None or bottom <= max_height):
                 return font
         return self._font(minimum, bold=bold)
 
