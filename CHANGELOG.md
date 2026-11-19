@@ -6,6 +6,22 @@ and `Removed`.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## 0.1.21-rc16
+
+### Packaging
+
+- Each release now includes `elink-ai-vX.Y.Z.dmg.sig`, an Ed25519 signature
+  of the DMG used by in-app updates.
+
+### Added
+
+- Software Update can now install a new version in place: click
+  “Update to vX and Relaunch” and Elink AI downloads the release, verifies its
+  signature, replaces the app and reopens it. If the update cannot be installed
+  automatically, the reason is shown and the DMG download remains available.
+  This version must be installed manually once; later versions can update
+  from within the app.
+
 ## 0.1.21-rc15
 
 ### Fixed
