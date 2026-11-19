@@ -8,7 +8,7 @@ version = "0.1.13"
 description = "Claude and Codex usage dashboard for a Raspberry Pi e-paper display"
 requires-python = ">=3.11"
 license = { text = "GPL-3.0-only" }
-dependencies = ["Pillow>=10.0"]
+dependencies = ["Pillow>=10.0", "cryptography>=38"]
 
 [project.optional-dependencies]
 hardware = ["gpiozero>=2.0", "spidev>=3.6"]
@@ -16,6 +16,7 @@ test = ["pytest>=8.0"]
 
 [project.scripts]
 elink-agent = "elink_agent.main:main"
+elink-agent-update = "elink_agent.updater:main"
 
 [tool.setuptools]
 package-dir = {"" = "elink-agent/src"}

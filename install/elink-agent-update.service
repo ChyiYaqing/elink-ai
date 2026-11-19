@@ -1,0 +1,12 @@
+[Unit]
+Description=Update Elink AI agent from GitHub Releases
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# 仓库开源前在这里写 GITHUB_TOKEN=...（root 所有，权限 0600）；开源后删掉即可匿名更新。
+EnvironmentFile=-/etc/elink-ai/update.env
+ExecStart=/opt/elink-ai/.venv/bin/elink-agent-update --config /etc/elink-ai/config.toml
+StandardOutput=journal
+StandardError=journal
