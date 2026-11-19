@@ -160,7 +160,19 @@ jobs:
             sh build-dmg.sh
         working-directory: mac-app
 
-      # 软件更新签名：App 只自动安装与内置公钥匹配的压缩包。私钥只经环境变量传给脚本。
+      - name: Package agent
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          AGENT_VERSION=$(sed -n 's/^__version__ = "\([^"]*\)"$/\1/p' elink-agent/src/elink_agent/__init__.py)
+          PROJECT_VERSION=$(sed -n 's/^version = "\([^"]*\)"$/\1/p' pyproject.toml)
+          if [ "$VERSION" != "$AGENT_VERSION" ] || [ "$VERSION" != "$PROJECT_VERSION" ]; then
+            echo "Tag version $VERSION does not match agent $AGENT_VERSION / pyproject $PROJECT_VERSION" >&2
+            exit 1
+          fi
+          git archive --format=tar.gz -o "$RUNNER_TEMP/elink-agent-${GITHUB_REF_NAME}.tar.gz" \
+            HEAD pyproject.toml elink-agent
+
+      # 软件更新签名：App 和设备只安装与内置公钥匹配的包。私钥只经环境变量传给脚本。
       - name: Sign update archive
         env:
           ELINK_UPDATE_SIGNING_KEY: ${{ secrets.ELINK_UPDATE_SIGNING_KEY }}
@@ -168,7 +180,9 @@ jobs:
           ZIP=".build/elink-ai-${GITHUB_REF_NAME}.zip"
           # 已安装的客户端信任的公钥；轮换密钥的过渡版本里它与 Info.plist 中的新公钥不同。
           PUBLIC_KEY=$(tr -d '[:space:]' < update-signing-public-key)
+          AGENT="$RUNNER_TEMP/elink-agent-${GITHUB_REF_NAME}.tar.gz"
           swift scripts/sign-update.swift "$ZIP" "$PUBLIC_KEY" > "$ZIP.sig"
+          swift scripts/sign-update.swift "$AGENT" "$PUBLIC_KEY" > "$AGENT.sig"
         working-directory: mac-app
 
       - name: Prepare release notes
@@ -202,7 +216,8 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           DMG="mac-app/.build/elink-ai-${GITHUB_REF_NAME}.dmg"
           ZIP="mac-app/.build/elink-ai-${GITHUB_REF_NAME}.zip"
-          ASSETS=("$DMG" "$ZIP" "$ZIP.sig" "$RUNNER_TEMP"/tui/*.tar.gz)
+          AGENT="$RUNNER_TEMP/elink-agent-${GITHUB_REF_NAME}.tar.gz"
+          ASSETS=("$DMG" "$ZIP" "$ZIP.sig" "$AGENT" "$AGENT.sig" "$RUNNER_TEMP"/tui/*.tar.gz)
           NOTES="$RUNNER_TEMP/release-notes.md"
           TITLE="elink-ai Version $VERSION"
           IS_PRERELEASE=false

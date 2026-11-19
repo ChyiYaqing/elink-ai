@@ -312,7 +312,23 @@ sudo systemctl restart elink-agent
 journalctl -u elink-agent -f
 ```
 
-The installer enables SPI and installs a root systemd service. Start with the
+The installer enables SPI and installs a root systemd service. It also enables
+`elink-agent-update.timer`, which checks GitHub Releases 10 minutes after boot
+and then every 6 hours. When a newer signed `elink-agent` package is available,
+the timer installs it, restarts the agent, and rolls back if the new version
+does not come up. A version that was rolled back is not retried until you delete
+`/var/lib/elink-ai/update-failed`, and no update runs while `elink-agent` is
+stopped. If the rollback cannot be confirmed either, the journal shows
+`RollbackFailed` and nothing is recorded; recover by hand by re-running
+`sudo sh install/install-pi.sh` from a checkout of the version you want, then
+`sudo systemctl reset-failed elink-agent && sudo systemctl restart elink-agent`. For maintenance, first run
+`sudo systemctl stop elink-agent-update.timer`, then wait until
+`systemctl list-jobs elink-agent-update.service` shows no jobs and
+`systemctl is-active elink-agent-update` no longer reports `activating` before
+stopping `elink-agent`. Run `sudo systemctl start elink-agent-update` to check right away, and
+`journalctl -u elink-agent-update` to see the result. While the
+repository is private, put `GITHUB_TOKEN=<token with read access>` in
+`/etc/elink-ai/update.env` (owner root, mode 0600). Start with the
 mock driver if the exact panel revision or wiring is uncertain. Hardware wiring
 and partial-refresh cautions are in [docs/hardware.md](docs/hardware.md).
 

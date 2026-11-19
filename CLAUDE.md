@@ -47,6 +47,10 @@ version. At minimum, check these locations:
   `elink-tui/Cargo.lock` (any cargo command rewrites it). The workflow rejects a
   tag whose version differs from this one, and both Linux TUI jobs fail before
   building anything.
+- `pyproject.toml` (`version`) and `elink-agent/src/elink_agent/__init__.py`
+  (`__version__`): set both to `X.Y.Z`. The device agent follows the release
+  version and updates itself from `elink-agent-vX.Y.Z.tar.gz`; the workflow
+  rejects a tag whose version differs from either.
 - Swift tests: update hard-coded current-version fixtures such as
   `UpdateChecker(currentVersion:)` where they represent the app's current
   version.
@@ -57,11 +61,6 @@ Searching for the previous version string is not enough on its own: run
 set of files. v0.1.17-rc8 failed because a search restricted to `*.swift`,
 `*.md` and `*.plist` never looked at `.toml`, and the missing Cargo bump was
 only caught by CI after the tag was already pushed.
-
-Do not change `pyproject.toml` merely for the macOS DMG release: its version is
-for the separately packaged Python project and is not read by the Release
-workflow. Change it only when the Python package itself is intentionally being
-released.
 
 Review the complete diff and use the release commit message:
 
@@ -82,13 +81,15 @@ All of the following must pass:
 git diff --check
 ```
 
-Replay the workflow's two version gates locally before tagging; both reject the
+Replay the workflow's version gates locally before tagging; each rejects the
 tag outright, so a mismatch costs a whole release cycle:
 
 ```bash
 VERSION=X.Y.Z
 [ "$VERSION" = "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' mac-app/Info.plist)" ]
 [ "$VERSION" = "$(sed -n 's/^version = "\([^"]*\)"$/\1/p' elink-tui/Cargo.toml)" ]
+[ "$VERSION" = "$(sed -n 's/^version = "\([^"]*\)"$/\1/p' pyproject.toml)" ]
+[ "$VERSION" = "$(sed -n 's/^__version__ = "\([^"]*\)"$/\1/p' elink-agent/src/elink_agent/__init__.py)" ]
 ```
 
 Also verify that:
@@ -137,7 +138,7 @@ The successful run must have all of these results:
 - Swift tests pass in both architecture build jobs on the self-hosted runner;
 - the `arm64` and `x86_64` release binaries build successfully;
 - the Universal Binary and DMG steps succeed;
-- the `Sign update archive` step succeeds;
+- the `Package agent` and `Sign update archive` steps succeed;
 - release notes are extracted from `CHANGELOG.md`; and
 - the `Publish DMG` step succeeds.
 
@@ -150,8 +151,9 @@ gh release view vX.Y.Z \
 
 The release must be published (not a draft or prerelease unless explicitly
 requested) and must contain exactly the expected versioned installer
-`elink-ai-vX.Y.Z.dmg`, the in-app update archive `elink-ai-vX.Y.Z.zip`, and its
-signature `elink-ai-vX.Y.Z.zip.sig`.
+`elink-ai-vX.Y.Z.dmg`, the in-app update archive `elink-ai-vX.Y.Z.zip`, its
+signature `elink-ai-vX.Y.Z.zip.sig`, the device agent package
+`elink-agent-vX.Y.Z.tar.gz`, and its signature `elink-agent-vX.Y.Z.tar.gz.sig`.
 
 Only then tell the user that the release succeeded, and include links to both
 the GitHub Release and the DMG asset. If the workflow fails, report the failing
@@ -159,6 +161,9 @@ job and step, fix the underlying issue when it is in scope, and rerun the
 workflow. Do not rewrite an already-published tag to hide a failure.
 
 ### Update signing key
+
+The device agent's updater (`elink_agent/updater.py`, `UPDATE_PUBLIC_KEY`)
+trusts the same key and rotates together with `ElinkUpdatePublicKey`.
 
 In-app updates download `elink-ai-vX.Y.Z.zip`, not the DMG: macOS denies
 unauthorized apps read access to mounted disk images. They only install an
@@ -173,7 +178,7 @@ that installed apps currently trust. Normally that file and
 To rotate the key, publish a transition release that is still signed with the
 old secret and `update-signing-public-key`, but whose `ElinkUpdatePublicKey` is
 the new public key. After that release, switch the secret and
-`update-signing-public-key` to the new key. Apps always offer the newest
-release, so clients that never installed the transition release fail signature
-verification and must install manually once, the same as when the private key
+`update-signing-public-key` to the new key. Apps and devices always
+offer the newest release, so clients that never installed the transition
+release fail signature verification and must install manually once, the same as when the private key
 is lost. Rotate only when necessary.
