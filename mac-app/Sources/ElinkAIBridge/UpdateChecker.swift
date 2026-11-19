@@ -36,12 +36,38 @@ struct GitHubRelease: Decodable, Equatable {
         return assets.first { $0.name.caseInsensitiveCompare(expectedName) == .orderedSame }?.browserDownloadURL
             ?? assets.first { $0.name.lowercased().hasSuffix(".dmg") }?.browserDownloadURL
     }
+
+    struct InstallAssets: Equatable {
+        let dmgName: String
+        let dmg: URL
+        let signature: URL
+    }
+
+    /// 自动安装只接受名字完全匹配、且都在 github.com 上的 DMG 与签名。
+    var installAssets: InstallAssets? {
+        let name = "elink-ai-v\(version).dmg"
+        func trusted(_ name: String) -> URL? {
+            guard let url = assets.first(where: { $0.name == name })?.browserDownloadURL,
+                  url.scheme == "https", url.host == "github.com" else { return nil }
+            return url
+        }
+        guard let dmg = trusted(name), let signature = trusted(name + ".sig") else { return nil }
+        return InstallAssets(dmgName: name, dmg: dmg, signature: signature)
+    }
 }
 
 enum UpdateCheckState: Equatable {
     case idle
     case upToDate
     case updateAvailable
+    case failed(String)
+}
+
+enum UpdateInstallState: Equatable {
+    case idle
+    case downloading
+    case verifying
+    case installing
     case failed(String)
 }
 
@@ -64,19 +90,24 @@ final class UpdateChecker: ObservableObject {
     @Published private(set) var lastCheckedAt: Date?
     @Published private(set) var automaticallyChecks: Bool
     @Published private(set) var includesPrereleases: Bool
+    @Published private(set) var installState: UpdateInstallState = .idle
 
     let currentVersion: String
 
     private let session: URLSession
     private let defaults: UserDefaults
+    private let bundle: Bundle
     private var lastAttemptAt: Date?
+    private var availableRelease: GitHubRelease?
 
     init(currentVersion: String = AppInfo.version,
          session: URLSession = .shared,
-         defaults: UserDefaults = .standard) {
+         defaults: UserDefaults = .standard,
+         bundle: Bundle = .main) {
         self.currentVersion = currentVersion
         self.session = session
         self.defaults = defaults
+        self.bundle = bundle
         self.automaticallyChecks = defaults.object(forKey: DefaultsKey.automaticallyChecks) == nil
             ? true
             : defaults.bool(forKey: DefaultsKey.automaticallyChecks)
@@ -109,7 +140,8 @@ final class UpdateChecker: ObservableObject {
     }
 
     func check() {
-        guard !isChecking else { return }
+        // 安装期间不重新检查，否则结果会覆盖正在安装的版本和进度。
+        guard !isChecking, !isInstalling else { return }
         lastAttemptAt = Date()
         isChecking = true
         state = .idle
@@ -145,13 +177,134 @@ final class UpdateChecker: ObservableObject {
         NSWorkspace.shared.open(updateURL)
     }
 
+    var isInstalling: Bool {
+        switch installState {
+        case .downloading, .verifying, .installing: return true
+        case .idle, .failed: return false
+        }
+    }
+
+    /// 新版本带签名，且当前 App 内置了公钥；能否原地替换要到安装时才检查。
+    var canInstallAvailableUpdate: Bool {
+        let key = bundle.object(forInfoDictionaryKey: UpdateInstaller.publicKeyInfoKey) as? String ?? ""
+        return availableRelease?.installAssets != nil
+            && !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// 下载 → 验签 → 从 DMG 取出 App 并校验 → 原地替换 → 退出并重新打开。
+    func installAvailableUpdate() {
+        guard let release = availableRelease, !isInstalling else { return }
+        Log.user("install application update v\(release.version)")
+        installState = .downloading
+        let bundleURL = bundle.bundleURL
+        let info = bundle.infoDictionary ?? [:]
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            do {
+                try self.install(release, bundleURL: bundleURL, info: info)
+                Log.info("update v\(release.version) installed, relaunching")
+                DispatchQueue.main.async {
+                    do { try UpdateInstaller.relaunch(bundleURL) } catch {
+                        Log.warning("relaunch after update failed", category: "update")
+                        self.installState = .failed(error.localizedDescription)
+                    }
+                }
+            } catch {
+                Log.warning("update install failed: \(error.localizedDescription)", category: "update")
+                DispatchQueue.main.async { self.installState = .failed(error.localizedDescription) }
+            }
+        }
+    }
+
+    private func install(_ release: GitHubRelease, bundleURL: URL, info: [String: Any]) throws {
+        let key = info[UpdateInstaller.publicKeyInfoKey] as? String ?? ""
+        guard !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw UpdateInstallError.keyMissing }
+        guard let assets = release.installAssets else { throw UpdateInstallError.notInstallable }
+        if let problem = UpdateInstaller.locationProblem(bundleURL) { throw problem }
+        guard let identifier = info["CFBundleIdentifier"] as? String,
+              let executable = info["CFBundleExecutable"] as? String else {
+            throw UpdateInstallError.packageInvalid(tr("无法确认当前 App 的标识", "cannot identify the running app"))
+        }
+
+        let staging = try UpdateInstaller.stagingDirectory(for: bundleURL)
+        defer { try? FileManager.default.removeItem(at: staging) }
+        let dmg = staging.appendingPathComponent(assets.dmgName)
+        let signature = staging.appendingPathComponent(assets.dmgName + ".sig")
+        try download(release, assets: assets, dmg: dmg, signature: signature)
+
+        DispatchQueue.main.async { self.installState = .verifying }
+        try UpdateInstaller.verifySignature(of: dmg, signature: UpdateInstaller.readSignature(signature), publicKey: key)
+        let app = try UpdateInstaller.extractApp(fromDMG: dmg, into: staging)
+        try UpdateInstaller.validate(app, expectedVersion: release.version,
+                                     bundleIdentifier: identifier, executable: executable)
+
+        DispatchQueue.main.async { self.installState = .installing }
+        try UpdateInstaller.replace(bundleURL, with: app)
+    }
+
+    /// 公开仓库直接匿名下载；私有仓库匿名请求会 404，退回用户已登录的 gh。
+    private func download(_ release: GitHubRelease, assets: GitHubRelease.InstallAssets,
+                          dmg: URL, signature: URL) throws {
+        do {
+            try fetch(assets.signature, to: signature)
+            try fetch(assets.dmg, to: dmg)
+        } catch {
+            guard let executable = Self.githubCLIURL() else { throw error }
+            let outcome = try Self.runCLI(executable, arguments: [
+                "release", "download", release.tagName,
+                "--repo", "ChyiYaqing/elink-ai",
+                "--pattern", assets.dmgName,
+                "--pattern", assets.dmgName + ".sig",
+                "--dir", dmg.deletingLastPathComponent().path,
+                "--clobber",
+            ], timeout: 600)
+            guard !outcome.timedOut, outcome.status == 0 else {
+                let detail = outcome.timedOut
+                    ? tr("命令超时", "command timed out")
+                    : String(decoding: outcome.stderr, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+                throw UpdateInstallError.download(detail)
+            }
+        }
+    }
+
+    private func fetch(_ url: URL, to destination: URL) throws {
+        var result: Result<Void, Error> = .failure(UpdateInstallError.download(url.lastPathComponent))
+        let done = DispatchSemaphore(value: 0)
+        var request = URLRequest(url: url)
+        request.setValue("Elink-AI/\(currentVersion)", forHTTPHeaderField: "User-Agent")
+        let task = session.downloadTask(with: request) { location, response, error in
+            defer { done.signal() }
+            if let error {
+                result = .failure(UpdateInstallError.download(error.localizedDescription))
+                return
+            }
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            guard status == 200, let location else {
+                result = .failure(UpdateInstallError.download("HTTP \(status)"))
+                return
+            }
+            // 临时文件在回调返回后即被删除，必须在这里移走。
+            result = Result { try FileManager.default.moveItem(at: location, to: destination) }
+        }
+        task.resume()
+        // 空闲超时挡不住持续慢速传输，这里限定总时长；取消后等回调结束，避免与 result 竞争。
+        if done.wait(timeout: .now() + Self.downloadTimeout) == .timedOut {
+            task.cancel()
+            done.wait()
+            throw UpdateInstallError.download(tr("下载超时", "download timed out"))
+        }
+        try result.get()
+    }
+
     private func finish(_ result: Result<GitHubRelease?, Error>) {
         isChecking = false
+        if !isInstalling { installState = .idle }
         switch result {
         case let .success(release):
             let checkedAt = Date()
             lastCheckedAt = checkedAt
             defaults.set(checkedAt, forKey: DefaultsKey.lastCheckedAt)
+            availableRelease = release
             if let release {
                 latestVersion = release.version
                 updateURL = release.dmgURL ?? release.pageURL
@@ -229,6 +382,7 @@ final class UpdateChecker: ObservableObject {
     }
 
     static let cliTimeout: TimeInterval = 30
+    static let downloadTimeout: TimeInterval = 600
 
     /// 超时收割队列：只发信号，永不阻塞，因此一条串行队列足够。
     private static let cliReaper = DispatchQueue(label: "ai.elink.update-cli-reaper")
