@@ -38,21 +38,21 @@ struct GitHubRelease: Decodable, Equatable {
     }
 
     struct InstallAssets: Equatable {
-        let dmgName: String
-        let dmg: URL
+        let archiveName: String
+        let archive: URL
         let signature: URL
     }
 
-    /// 自动安装只接受名字完全匹配、且都在 github.com 上的 DMG 与签名。
+    /// 自动安装只接受名字完全匹配、且都在 github.com 上的更新压缩包与签名。
     var installAssets: InstallAssets? {
-        let name = "elink-ai-v\(version).dmg"
+        let name = "elink-ai-v\(version).zip"
         func trusted(_ name: String) -> URL? {
             guard let url = assets.first(where: { $0.name == name })?.browserDownloadURL,
                   url.scheme == "https", url.host == "github.com" else { return nil }
             return url
         }
-        guard let dmg = trusted(name), let signature = trusted(name + ".sig") else { return nil }
-        return InstallAssets(dmgName: name, dmg: dmg, signature: signature)
+        guard let archive = trusted(name), let signature = trusted(name + ".sig") else { return nil }
+        return InstallAssets(archiveName: name, archive: archive, signature: signature)
     }
 }
 
@@ -191,7 +191,7 @@ final class UpdateChecker: ObservableObject {
             && !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    /// 下载 → 验签 → 从 DMG 取出 App 并校验 → 原地替换 → 退出并重新打开。
+    /// 下载 → 验签 → 解压取出 App 并校验 → 原地替换 → 退出并重新打开。
     func installAvailableUpdate() {
         guard let release = availableRelease, !isInstalling else { return }
         Log.user("install application update v\(release.version)")
@@ -228,13 +228,13 @@ final class UpdateChecker: ObservableObject {
 
         let staging = try UpdateInstaller.stagingDirectory(for: bundleURL)
         defer { try? FileManager.default.removeItem(at: staging) }
-        let dmg = staging.appendingPathComponent(assets.dmgName)
-        let signature = staging.appendingPathComponent(assets.dmgName + ".sig")
-        try download(release, assets: assets, dmg: dmg, signature: signature)
+        let archive = staging.appendingPathComponent(assets.archiveName)
+        let signature = staging.appendingPathComponent(assets.archiveName + ".sig")
+        try download(release, assets: assets, archive: archive, signature: signature)
 
         DispatchQueue.main.async { self.installState = .verifying }
-        try UpdateInstaller.verifySignature(of: dmg, signature: UpdateInstaller.readSignature(signature), publicKey: key)
-        let app = try UpdateInstaller.extractApp(fromDMG: dmg, into: staging)
+        try UpdateInstaller.verifySignature(of: archive, signature: UpdateInstaller.readSignature(signature), publicKey: key)
+        let app = try UpdateInstaller.extractApp(fromArchive: archive, into: staging)
         try UpdateInstaller.validate(app, expectedVersion: release.version,
                                      bundleIdentifier: identifier, executable: executable)
 
@@ -244,18 +244,18 @@ final class UpdateChecker: ObservableObject {
 
     /// 公开仓库直接匿名下载；私有仓库匿名请求会 404，退回用户已登录的 gh。
     private func download(_ release: GitHubRelease, assets: GitHubRelease.InstallAssets,
-                          dmg: URL, signature: URL) throws {
+                          archive: URL, signature: URL) throws {
         do {
             try fetch(assets.signature, to: signature)
-            try fetch(assets.dmg, to: dmg)
+            try fetch(assets.archive, to: archive)
         } catch {
             guard let executable = Self.githubCLIURL() else { throw error }
             let outcome = try Self.runCLI(executable, arguments: [
                 "release", "download", release.tagName,
                 "--repo", "ChyiYaqing/elink-ai",
-                "--pattern", assets.dmgName,
-                "--pattern", assets.dmgName + ".sig",
-                "--dir", dmg.deletingLastPathComponent().path,
+                "--pattern", assets.archiveName,
+                "--pattern", assets.archiveName + ".sig",
+                "--dir", archive.deletingLastPathComponent().path,
                 "--clobber",
             ], timeout: 600)
             guard !outcome.timedOut, outcome.status == 0 else {

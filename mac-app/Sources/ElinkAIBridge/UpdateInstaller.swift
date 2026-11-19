@@ -46,7 +46,7 @@ enum UpdateInstallError: LocalizedError, Equatable {
     }
 }
 
-/// 自动更新：校验签名、从 DMG 取出 App、原地替换、重启。下载在 UpdateChecker 里。
+/// 自动更新：校验签名、解压取出 App、原地替换、重启。下载在 UpdateChecker 里。
 enum UpdateInstaller {
     static let publicKeyInfoKey = "ElinkUpdatePublicKey"
 
@@ -59,7 +59,7 @@ enum UpdateInstaller {
         return data
     }
 
-    /// Ed25519 签名，签的是 DMG 的原始字节；公钥和签名都是 Base64，公钥为 32 字节原始值。
+    /// Ed25519 签名，签的是更新压缩包的原始字节；公钥和签名都是 Base64，公钥为 32 字节原始值。
     static func verifySignature(of file: URL, signature: Data, publicKey: String) throws {
         let keyText = publicKey.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !keyText.isEmpty else { throw UpdateInstallError.keyMissing }
@@ -96,25 +96,18 @@ enum UpdateInstaller {
                                     appropriateFor: bundle, create: true)
     }
 
-    /// 只读挂载 DMG，把其中唯一的 .app 复制到 `directory`，然后卸载。
-    static func extractApp(fromDMG dmg: URL, into directory: URL) throws -> URL {
-        let mount = directory.appendingPathComponent("mount", isDirectory: true)
-        try FileManager.default.createDirectory(at: mount, withIntermediateDirectories: true)
-        try run("/usr/bin/hdiutil", ["attach", "-nobrowse", "-readonly", "-noautoopen",
-                                     "-mountpoint", mount.path, dmg.path],
-                failure: tr("无法挂载 DMG", "cannot mount the DMG"))
-        defer { _ = try? run("/usr/bin/hdiutil", ["detach", mount.path, "-force"], failure: "") }
-
-        let apps = try FileManager.default.contentsOfDirectory(atPath: mount.path).filter { $0.hasSuffix(".app") }
-        guard apps.count == 1 else {
-            throw UpdateInstallError.packageInvalid(tr("DMG 内容与预期不符", "unexpected DMG contents"))
-        }
+    /// 把压缩包解到 `directory`，返回其中唯一的 .app。不用 DMG：macOS 禁止未授权的 App
+    /// 读取挂载出来的磁盘映像宗卷（Sandbox System Policy deny file-read-data）。
+    static func extractApp(fromArchive archive: URL, into directory: URL) throws -> URL {
         let unpacked = directory.appendingPathComponent("unpacked", isDirectory: true)
         try FileManager.default.createDirectory(at: unpacked, withIntermediateDirectories: true)
-        let app = unpacked.appendingPathComponent(apps[0], isDirectory: true)
-        try run("/usr/bin/ditto", [mount.appendingPathComponent(apps[0]).path, app.path],
-                failure: tr("无法复制 App", "cannot copy the app"))
-        return app
+        try run("/usr/bin/ditto", ["-x", "-k", archive.path, unpacked.path],
+                failure: tr("无法解压更新包", "cannot extract the update archive"))
+        let entries = try FileManager.default.contentsOfDirectory(atPath: unpacked.path).filter { $0 != "__MACOSX" }
+        guard entries.count == 1, entries[0].hasSuffix(".app") else {
+            throw UpdateInstallError.packageInvalid(tr("更新包内容与预期不符", "unexpected archive contents"))
+        }
+        return unpacked.appendingPathComponent(entries[0], isDirectory: true)
     }
 
     /// 新 App 必须是同一个 App（标识与可执行文件名一致）、版本号与 Release 一致，且代码签名完整。

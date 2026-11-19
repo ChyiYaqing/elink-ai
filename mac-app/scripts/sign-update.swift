@@ -1,6 +1,6 @@
-// 给 Release DMG 生成软件更新签名（Ed25519，签的是 DMG 的原始字节）。
+// 给 Release 更新压缩包生成软件更新签名（Ed25519，签的是 zip 的原始字节）。
 //
-// 用法：ELINK_UPDATE_SIGNING_KEY=<私钥> swift scripts/sign-update.swift <DMG> <内置公钥>
+// 用法：ELINK_UPDATE_SIGNING_KEY=<私钥> swift scripts/sign-update.swift <zip> <内置公钥>
 //
 // 私钥是 Base64 编码的 32 字节原始私钥，只经环境变量传入，不出现在命令行里。
 // 签名前确认它与 App 内置公钥（Info.plist 的 ElinkUpdatePublicKey）配对，
@@ -14,7 +14,7 @@ func fail(_ message: String) -> Never {
 }
 
 let arguments = CommandLine.arguments
-guard arguments.count == 3 else { fail("usage: sign-update.swift <dmg> <public-key>") }
+guard arguments.count == 3 else { fail("usage: sign-update.swift <archive> <public-key>") }
 
 let keyText = (ProcessInfo.processInfo.environment["ELINK_UPDATE_SIGNING_KEY"] ?? "")
     .trimmingCharacters(in: .whitespacesAndNewlines)
