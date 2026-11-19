@@ -9,8 +9,8 @@
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
   <key>CFBundleName</key><string>Elink AI Bridge</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.1.21-rc17</string>
-  <key>CFBundleVersion</key><string>53</string>
+  <key>CFBundleShortVersionString</key><string>0.1.21-rc18</string>
+  <key>CFBundleVersion</key><string>54</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>LSUIElement</key><true/>
   <key>ElinkUpdatePublicKey</key><string>X13CG3OCZ3S1jXVpEuQ8K++7mfSFTVL/dD7aH0ARITg=</string>

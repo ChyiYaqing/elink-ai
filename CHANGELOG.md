@@ -6,6 +6,27 @@ and `Removed`.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## 0.1.21-rc18
+
+### Packaging
+
+- Each release now includes the device agent package
+  `elink-agent-vX.Y.Z.tar.gz` and its Ed25519 signature
+  `elink-agent-vX.Y.Z.tar.gz.sig`. The agent version now follows the release
+  version, so the e-paper footer shows the same version as the Mac app.
+
+### Added
+
+- The Raspberry Pi agent can update itself: `elink-agent-update.timer` checks
+  GitHub Releases 10 minutes after boot and every 6 hours, installs a newer
+  signed agent, restarts it, and rolls back if the new version does not come
+  up. A rolled-back version is not retried automatically, and no update runs
+  while the agent is stopped. To enable it, re-run
+  `sudo sh install/install-pi.sh` from this version once, then
+  `sudo systemctl restart elink-agent`. While the repository is private, put
+  `GITHUB_TOKEN=<read-only token>` in `/etc/elink-ai/update.env`, owned by
+  root with mode 0600.
+
 ## 0.1.21-rc17
 
 ### Packaging
