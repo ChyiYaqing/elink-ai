@@ -6,6 +6,23 @@ and `Removed`.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## 0.1.21-rc17
+
+### Packaging
+
+- Each release now includes `elink-ai-vX.Y.Z.zip` and its Ed25519 signature
+  `elink-ai-vX.Y.Z.zip.sig` for in-app updates. The DMG is still provided
+  for manual installation, and `elink-ai-vX.Y.Z.dmg.sig` is no longer
+  published.
+
+### Fixed
+
+- “Update and Relaunch” no longer fails with a permission error on the
+  `mount` folder. macOS does not let the app read a mounted disk image, so
+  updates are now installed from the signed zip. In-app updates did not work
+  in 0.1.21-rc16: install this version manually once, and later versions can
+  update from within the app.
+
 ## 0.1.21-rc16
 
 ### Packaging
