@@ -160,15 +160,15 @@ jobs:
             sh build-dmg.sh
         working-directory: mac-app
 
-      # 软件更新签名：App 只自动安装与内置公钥匹配的 DMG。私钥只经环境变量传给脚本。
-      - name: Sign update DMG
+      # 软件更新签名：App 只自动安装与内置公钥匹配的压缩包。私钥只经环境变量传给脚本。
+      - name: Sign update archive
         env:
           ELINK_UPDATE_SIGNING_KEY: ${{ secrets.ELINK_UPDATE_SIGNING_KEY }}
         run: |
-          DMG=".build/elink-ai-${GITHUB_REF_NAME}.dmg"
+          ZIP=".build/elink-ai-${GITHUB_REF_NAME}.zip"
           # 已安装的客户端信任的公钥；轮换密钥的过渡版本里它与 Info.plist 中的新公钥不同。
           PUBLIC_KEY=$(tr -d '[:space:]' < update-signing-public-key)
-          swift scripts/sign-update.swift "$DMG" "$PUBLIC_KEY" > "$DMG.sig"
+          swift scripts/sign-update.swift "$ZIP" "$PUBLIC_KEY" > "$ZIP.sig"
         working-directory: mac-app
 
       - name: Prepare release notes
@@ -201,7 +201,8 @@ jobs:
           fi
           VERSION="${GITHUB_REF_NAME#v}"
           DMG="mac-app/.build/elink-ai-${GITHUB_REF_NAME}.dmg"
-          ASSETS=("$DMG" "$DMG.sig" "$RUNNER_TEMP"/tui/*.tar.gz)
+          ZIP="mac-app/.build/elink-ai-${GITHUB_REF_NAME}.zip"
+          ASSETS=("$DMG" "$ZIP" "$ZIP.sig" "$RUNNER_TEMP"/tui/*.tar.gz)
           NOTES="$RUNNER_TEMP/release-notes.md"
           TITLE="elink-ai Version $VERSION"
           IS_PRERELEASE=false

@@ -137,7 +137,7 @@ The successful run must have all of these results:
 - Swift tests pass in both architecture build jobs on the self-hosted runner;
 - the `arm64` and `x86_64` release binaries build successfully;
 - the Universal Binary and DMG steps succeed;
-- the `Sign update DMG` step succeeds;
+- the `Sign update archive` step succeeds;
 - release notes are extracted from `CHANGELOG.md`; and
 - the `Publish DMG` step succeeds.
 
@@ -150,7 +150,8 @@ gh release view vX.Y.Z \
 
 The release must be published (not a draft or prerelease unless explicitly
 requested) and must contain exactly the expected versioned installer
-`elink-ai-vX.Y.Z.dmg` and its update signature `elink-ai-vX.Y.Z.dmg.sig`.
+`elink-ai-vX.Y.Z.dmg`, the in-app update archive `elink-ai-vX.Y.Z.zip`, and its
+signature `elink-ai-vX.Y.Z.zip.sig`.
 
 Only then tell the user that the release succeeded, and include links to both
 the GitHub Release and the DMG asset. If the workflow fails, report the failing
@@ -159,10 +160,12 @@ workflow. Do not rewrite an already-published tag to hide a failure.
 
 ### Update signing key
 
-In-app updates only install a DMG whose Ed25519 signature matches
+In-app updates download `elink-ai-vX.Y.Z.zip`, not the DMG: macOS denies
+unauthorized apps read access to mounted disk images. They only install an
+archive whose Ed25519 signature matches
 `ElinkUpdatePublicKey` in the installed app's `mac-app/Info.plist`. The private
 key (Base64 of the raw 32 bytes) is the repository secret
-`ELINK_UPDATE_SIGNING_KEY`. The `Sign update DMG` step fails when the secret is
+`ELINK_UPDATE_SIGNING_KEY`. The `Sign update archive` step fails when the secret is
 missing or does not match `mac-app/update-signing-public-key`, the public key
 that installed apps currently trust. Normally that file and
 `ElinkUpdatePublicKey` hold the same value.

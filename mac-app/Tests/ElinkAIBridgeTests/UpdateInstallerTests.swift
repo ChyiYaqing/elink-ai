@@ -16,7 +16,7 @@ final class UpdateInstallerTests: XCTestCase {
     }
 
     private func signed(_ data: Data, with key: Curve25519.Signing.PrivateKey) throws -> (URL, Data) {
-        let file = directory.appendingPathComponent("update.dmg")
+        let file = directory.appendingPathComponent("update.zip")
         try data.write(to: file)
         return (file, Data(try key.signature(for: data).base64EncodedString().utf8))
     }
@@ -25,14 +25,14 @@ final class UpdateInstallerTests: XCTestCase {
 
     func testValidSignatureIsAccepted() throws {
         let key = Curve25519.Signing.PrivateKey()
-        let (file, signature) = try signed(Data("dmg".utf8), with: key)
+        let (file, signature) = try signed(Data("archive".utf8), with: key)
         XCTAssertNoThrow(try UpdateInstaller.verifySignature(
             of: file, signature: signature, publicKey: key.publicKey.rawRepresentation.base64EncodedString()))
     }
 
     func testTamperedFileIsRejected() throws {
         let key = Curve25519.Signing.PrivateKey()
-        let (file, signature) = try signed(Data("dmg".utf8), with: key)
+        let (file, signature) = try signed(Data("archive".utf8), with: key)
         try Data("evil".utf8).write(to: file)
         XCTAssertThrowsError(try UpdateInstaller.verifySignature(
             of: file, signature: signature, publicKey: key.publicKey.rawRepresentation.base64EncodedString())) {
@@ -41,7 +41,7 @@ final class UpdateInstallerTests: XCTestCase {
     }
 
     func testSignatureFromAnotherKeyIsRejected() throws {
-        let (file, signature) = try signed(Data("dmg".utf8), with: Curve25519.Signing.PrivateKey())
+        let (file, signature) = try signed(Data("archive".utf8), with: Curve25519.Signing.PrivateKey())
         let other = Curve25519.Signing.PrivateKey().publicKey.rawRepresentation.base64EncodedString()
         XCTAssertThrowsError(try UpdateInstaller.verifySignature(of: file, signature: signature, publicKey: other)) {
             XCTAssertEqual($0 as? UpdateInstallError, .signatureInvalid)
@@ -49,7 +49,7 @@ final class UpdateInstallerTests: XCTestCase {
     }
 
     func testMissingPublicKeyIsReported() throws {
-        let (file, signature) = try signed(Data("dmg".utf8), with: Curve25519.Signing.PrivateKey())
+        let (file, signature) = try signed(Data("archive".utf8), with: Curve25519.Signing.PrivateKey())
         XCTAssertThrowsError(try UpdateInstaller.verifySignature(of: file, signature: signature, publicKey: " ")) {
             XCTAssertEqual($0 as? UpdateInstallError, .keyMissing)
         }
@@ -77,17 +77,21 @@ final class UpdateInstallerTests: XCTestCase {
         return try JSONDecoder().decode(GitHubRelease.self, from: JSONSerialization.data(withJSONObject: json))
     }
 
-    func testInstallAssetsRequireDMGAndSignature() throws {
+    func testInstallAssetsRequireArchiveAndSignature() throws {
         let base = "https://github.com/ChyiYaqing/elink-ai/releases/download/v0.2.0/"
         let complete = try release([("elink-ai-v0.2.0.dmg", base + "elink-ai-v0.2.0.dmg"),
-                                    ("elink-ai-v0.2.0.dmg.sig", base + "elink-ai-v0.2.0.dmg.sig")])
-        XCTAssertEqual(complete.installAssets?.dmgName, "elink-ai-v0.2.0.dmg")
-        XCTAssertNil(try release([("elink-ai-v0.2.0.dmg", base + "elink-ai-v0.2.0.dmg")]).installAssets)
+                                    ("elink-ai-v0.2.0.zip", base + "elink-ai-v0.2.0.zip"),
+                                    ("elink-ai-v0.2.0.zip.sig", base + "elink-ai-v0.2.0.zip.sig")])
+        XCTAssertEqual(complete.installAssets?.archiveName, "elink-ai-v0.2.0.zip")
+        // 只有 DMG 和 DMG 签名（v0.1.21-rc16）不能自动安装：App 无权读取挂载的 DMG。
+        XCTAssertNil(try release([("elink-ai-v0.2.0.dmg", base + "elink-ai-v0.2.0.dmg"),
+                                  ("elink-ai-v0.2.0.dmg.sig", base + "elink-ai-v0.2.0.dmg.sig")]).installAssets)
+        XCTAssertNil(try release([("elink-ai-v0.2.0.zip", base + "elink-ai-v0.2.0.zip")]).installAssets)
     }
 
     func testInstallAssetsMustComeFromGitHub() throws {
-        let release = try release([("elink-ai-v0.2.0.dmg", "https://example.com/elink-ai-v0.2.0.dmg"),
-                                   ("elink-ai-v0.2.0.dmg.sig", "https://github.com/x/elink-ai-v0.2.0.dmg.sig")])
+        let release = try release([("elink-ai-v0.2.0.zip", "https://example.com/elink-ai-v0.2.0.zip"),
+                                   ("elink-ai-v0.2.0.zip.sig", "https://github.com/x/elink-ai-v0.2.0.zip.sig")])
         XCTAssertNil(release.installAssets)
     }
 
@@ -124,7 +128,7 @@ final class UpdateInstallerTests: XCTestCase {
     }
 
     func testOversizedSignatureIsRejectedWithoutReadingIt() throws {
-        let file = directory.appendingPathComponent("update.dmg.sig")
+        let file = directory.appendingPathComponent("update.zip.sig")
         try Data(count: 10 * 1024 * 1024).write(to: file)
         XCTAssertThrowsError(try UpdateInstaller.readSignature(file)) {
             XCTAssertEqual($0 as? UpdateInstallError, .signatureInvalid)
@@ -144,10 +148,9 @@ final class UpdateInstallerTests: XCTestCase {
         }
     }
 
-    // MARK: - DMG 端到端：验签 → 挂载取出 → 校验
+    // MARK: - 端到端：与 build-dmg.sh 相同的方式打包 → 验签 → 解压 → 校验
 
-    private func makeDMG(version: String) throws -> URL {
-        let root = directory.appendingPathComponent("dmg-root", isDirectory: true)
+    private func makeApp(version: String, in root: URL) throws -> URL {
         let app = root.appendingPathComponent("Elink AI.app", isDirectory: true)
         let macOS = app.appendingPathComponent("Contents/MacOS", isDirectory: true)
         try FileManager.default.createDirectory(at: macOS, withIntermediateDirectories: true)
@@ -156,13 +159,8 @@ final class UpdateInstallerTests: XCTestCase {
                                    "CFBundleShortVersionString": version, "CFBundlePackageType": "APPL"]
         try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0)
             .write(to: app.appendingPathComponent("Contents/Info.plist"))
-        try FileManager.default.createSymbolicLink(atPath: root.appendingPathComponent("Applications").path,
-                                                   withDestinationPath: "/Applications")
         try shell("/usr/bin/codesign", "--force", "--deep", "--sign", "-", app.path)
-        let dmg = directory.appendingPathComponent("elink-ai-v\(version).dmg")
-        try shell("/usr/bin/hdiutil", "create", "-quiet", "-volname", "Elink AI", "-srcfolder", root.path,
-                  "-format", "UDZO", dmg.path)
-        return dmg
+        return app
     }
 
     private func shell(_ tool: String, _ arguments: String...) throws {
@@ -170,23 +168,35 @@ final class UpdateInstallerTests: XCTestCase {
         XCTAssertEqual(outcome.status, 0, String(decoding: outcome.stderr, as: UTF8.self))
     }
 
-    func testSignedDMGYieldsAValidatedApp() throws {
+    func testSignedArchiveYieldsAValidatedApp() throws {
+        let app = try makeApp(version: "0.2.0", in: directory.appendingPathComponent("build", isDirectory: true))
+        let archive = directory.appendingPathComponent("elink-ai-v0.2.0.zip")
+        try shell("/usr/bin/ditto", "-c", "-k", "--sequesterRsrc", "--keepParent", app.path, archive.path)
         let key = Curve25519.Signing.PrivateKey()
-        let dmg = try makeDMG(version: "0.2.0")
-        let signature = Data(try key.signature(for: Data(contentsOf: dmg)).base64EncodedString().utf8)
-        try UpdateInstaller.verifySignature(of: dmg, signature: signature,
+        let signature = Data(try key.signature(for: Data(contentsOf: archive)).base64EncodedString().utf8)
+        try UpdateInstaller.verifySignature(of: archive, signature: signature,
                                             publicKey: key.publicKey.rawRepresentation.base64EncodedString())
 
         let staging = directory.appendingPathComponent("staging", isDirectory: true)
-        let app = try UpdateInstaller.extractApp(fromDMG: dmg, into: staging)
-        XCTAssertEqual(app.lastPathComponent, "Elink AI.app")
-        XCTAssertNoThrow(try UpdateInstaller.validate(app, expectedVersion: "0.2.0",
+        let extracted = try UpdateInstaller.extractApp(fromArchive: archive, into: staging)
+        XCTAssertEqual(extracted.lastPathComponent, "Elink AI.app")
+        XCTAssertNoThrow(try UpdateInstaller.validate(extracted, expectedVersion: "0.2.0",
                                                       bundleIdentifier: "local.elink-ai.bridge", executable: "ElinkAIBridge"))
-        XCTAssertThrowsError(try UpdateInstaller.validate(app, expectedVersion: "0.3.0",
+        XCTAssertThrowsError(try UpdateInstaller.validate(extracted, expectedVersion: "0.3.0",
                                                           bundleIdentifier: "local.elink-ai.bridge", executable: "ElinkAIBridge"))
-        XCTAssertThrowsError(try UpdateInstaller.validate(app, expectedVersion: "0.2.0",
+        XCTAssertThrowsError(try UpdateInstaller.validate(extracted, expectedVersion: "0.2.0",
                                                           bundleIdentifier: "com.example.other", executable: "ElinkAIBridge"))
-        // 取出后 DMG 已卸载。
-        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: staging.appendingPathComponent("mount").path), [])
+    }
+
+    func testArchiveWithExtraEntriesIsRejected() throws {
+        let root = directory.appendingPathComponent("build", isDirectory: true)
+        _ = try makeApp(version: "0.2.0", in: root)
+        try Data("x".utf8).write(to: root.appendingPathComponent("extra.txt"))
+        let archive = directory.appendingPathComponent("extra.zip")
+        try shell("/usr/bin/ditto", "-c", "-k", root.path, archive.path)
+        XCTAssertThrowsError(try UpdateInstaller.extractApp(fromArchive: archive,
+                                                            into: directory.appendingPathComponent("staging"))) {
+            guard case .packageInvalid = $0 as? UpdateInstallError else { return XCTFail("\($0)") }
+        }
     }
 }
