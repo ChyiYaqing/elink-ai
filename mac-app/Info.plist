@@ -13,6 +13,7 @@
   <key>CFBundleVersion</key><string>51</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>LSUIElement</key><true/>
+  <key>ElinkUpdatePublicKey</key><string>X13CG3OCZ3S1jXVpEuQ8K++7mfSFTVL/dD7aH0ARITg=</string>
   <key>NSLocalNetworkUsageDescription</key>
   <string>发现同一局域网内的 Elink AI Mac 节点和电子墨水屏，并安全同步用量。</string>
   <key>NSBonjourServices</key>

@@ -1609,7 +1609,7 @@ struct UsagePanelView: View {
                         Log.user("check for application updates")
                         updater.check()
                     }
-                    .disabled(updater.isChecking)
+                    .disabled(updater.isChecking || updater.isInstalling)
 
                     HStack(alignment: .firstTextBaseline, spacing: 5) {
                         if updater.isChecking {
@@ -1629,10 +1629,25 @@ struct UsagePanelView: View {
                     .foregroundStyle(updateStatusColor(theme))
 
                     if updater.state == .updateAvailable {
-                        WideButton(title: tr("下载 v\(updater.latestVersion ?? "最新版") DMG",
-                                             "Download v\(updater.latestVersion ?? "latest") DMG"),
-                                   icon: "arrow.down.to.line.compact", theme: theme) {
-                            updater.openAvailableUpdate()
+                        if updater.canInstallAvailableUpdate {
+                            WideButton(title: updateInstallTitle, icon: "arrow.triangle.2.circlepath", theme: theme) {
+                                updater.installAvailableUpdate()
+                            }
+                            .disabled(updater.isInstalling)
+                        }
+                        if case let .failed(message) = updater.installState {
+                            Text(message)
+                                .font(.system(size: 9, weight: .semibold))
+                                .foregroundStyle(theme.statusWarning)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        // 不能自动安装、或自动安装失败时，保留手动下载入口。
+                        if !updater.canInstallAvailableUpdate || updateInstallFailed {
+                            WideButton(title: tr("下载 v\(updater.latestVersion ?? "最新版") DMG",
+                                                 "Download v\(updater.latestVersion ?? "latest") DMG"),
+                                       icon: "arrow.down.to.line.compact", theme: theme) {
+                                updater.openAvailableUpdate()
+                            }
                         }
                     }
 
@@ -1666,6 +1681,8 @@ struct UsagePanelView: View {
                         ),
                         theme: theme
                     )
+                    // 安装期间改偏好不会触发重新检查，失败后会继续推荐已取消订阅的版本。
+                    .disabled(updater.isInstalling)
                 }
                 .padding(.horizontal, 12)
                 .padding(.bottom, 12)
@@ -1703,6 +1720,22 @@ struct UsagePanelView: View {
         case .upToDate: return tr("已是最新版", "Up to date")
         case .updateAvailable: return tr("发现新版本 v\(updater.latestVersion ?? "")", "New version v\(updater.latestVersion ?? "") available")
         case let .failed(message): return tr("检查失败：\(message)", "Check failed: \(message)")
+        }
+    }
+
+    private var updateInstallFailed: Bool {
+        if case .failed = updater.installState { return true }
+        return false
+    }
+
+    private var updateInstallTitle: String {
+        switch updater.installState {
+        case .downloading: return tr("正在下载…", "Downloading…")
+        case .verifying: return tr("正在校验…", "Verifying…")
+        case .installing: return tr("正在安装…", "Installing…")
+        case .idle, .failed:
+            return tr("更新到 v\(updater.latestVersion ?? "最新版") 并重启",
+                      "Update to v\(updater.latestVersion ?? "latest") and Relaunch")
         }
     }
 

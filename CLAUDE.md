@@ -137,6 +137,7 @@ The successful run must have all of these results:
 - Swift tests pass in both architecture build jobs on the self-hosted runner;
 - the `arm64` and `x86_64` release binaries build successfully;
 - the Universal Binary and DMG steps succeed;
+- the `Sign update DMG` step succeeds;
 - release notes are extracted from `CHANGELOG.md`; and
 - the `Publish DMG` step succeeds.
 
@@ -148,10 +149,28 @@ gh release view vX.Y.Z \
 ```
 
 The release must be published (not a draft or prerelease unless explicitly
-requested) and must contain exactly the expected versioned installer:
-`elink-ai-vX.Y.Z.dmg`.
+requested) and must contain exactly the expected versioned installer
+`elink-ai-vX.Y.Z.dmg` and its update signature `elink-ai-vX.Y.Z.dmg.sig`.
 
 Only then tell the user that the release succeeded, and include links to both
 the GitHub Release and the DMG asset. If the workflow fails, report the failing
 job and step, fix the underlying issue when it is in scope, and rerun the
 workflow. Do not rewrite an already-published tag to hide a failure.
+
+### Update signing key
+
+In-app updates only install a DMG whose Ed25519 signature matches
+`ElinkUpdatePublicKey` in the installed app's `mac-app/Info.plist`. The private
+key (Base64 of the raw 32 bytes) is the repository secret
+`ELINK_UPDATE_SIGNING_KEY`. The `Sign update DMG` step fails when the secret is
+missing or does not match `mac-app/update-signing-public-key`, the public key
+that installed apps currently trust. Normally that file and
+`ElinkUpdatePublicKey` hold the same value.
+
+To rotate the key, publish a transition release that is still signed with the
+old secret and `update-signing-public-key`, but whose `ElinkUpdatePublicKey` is
+the new public key. After that release, switch the secret and
+`update-signing-public-key` to the new key. Apps always offer the newest
+release, so clients that never installed the transition release fail signature
+verification and must install manually once, the same as when the private key
+is lost. Rotate only when necessary.
