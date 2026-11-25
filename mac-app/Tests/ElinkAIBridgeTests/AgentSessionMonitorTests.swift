@@ -796,25 +796,54 @@ final class AgentSessionMonitorTests: XCTestCase {
         XCTAssertEqual(staleInsp.steps.count, 2)
         XCTAssertNil(staleInsp.steps[0].contextTokens)
         XCTAssertNil(staleInsp.metrics.contextTokens)
+
+        // 尾部采样（isPartialTail = true）的首条仅含 total_token_usage 时只能作基线、不计入近期步骤
+        let tailLines: [Substring] = [
+            #"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":500000,"cached_input_tokens":0,"output_tokens":10000,"reasoning_output_tokens":0,"total_tokens":510000}}},"timestamp":"\#(at(5))"}"#,
+            #"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":510000,"cached_input_tokens":5000,"output_tokens":10500,"reasoning_output_tokens":0,"total_tokens":520500}}},"timestamp":"\#(at(10))"}"#,
+        ]
+        let tailParsed = SessionScanner.parseCodexSteps(tailLines, pricing: Pricing.builtIn,
+                                                        fallbackModel: "gpt-6-sol", isPartialTail: true)
+        XCTAssertEqual(tailParsed.steps.count, 1)
+        XCTAssertEqual(tailParsed.steps[0].totalTokens, 10_500)
+
+        // 只提供 total_tokens、缺少分类字段的 Codex 日志必须保留步骤与总量
+        let totalOnlyLines: [Substring] = [
+            #"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":12345},"last_token_usage":{"total_tokens":12345}}},"timestamp":"\#(at(5))"}"#,
+        ]
+        let totalOnlyParsed = SessionScanner.parseCodexSteps(totalOnlyLines, pricing: Pricing.builtIn,
+                                                             fallbackModel: "gpt-6-sol")
+        XCTAssertEqual(totalOnlyParsed.steps.count, 1)
+        XCTAssertEqual(totalOnlyParsed.steps[0].totalTokens, 12_345)
+        XCTAssertNil(totalOnlyParsed.steps[0].cost)
     }
 
-    func testGeminiInspectionRetainsRewoundCallsUsage() throws {
+    func testGeminiInspectionRetainsRewoundCallsUsageAndUsesActiveBranchContext() throws {
         let t0 = Date(timeIntervalSince1970: floor(Date().timeIntervalSince1970) - 100)
         func at(_ s: Double) -> String { Self.iso.string(from: t0.addingTimeInterval(s)) }
         let file = try write([
             #"{"sessionId":"sess-rw","projectHash":"h","startTime":"\#(at(0))","kind":"main"}"#,
             #"{"id":"u1","timestamp":"\#(at(0))","type":"user","content":"first"}"#,
             #"{"id":"g1","timestamp":"\#(at(5))","type":"gemini","model":"gemini-3-pro-preview","content":"draft","tokens":{"input":10000,"cached":8000,"output":200,"thoughts":100,"tool":0,"total":10300}}"#,
+            // 同 ID 后续替换若缺少 tokens，不能抹掉已消耗用量
+            #"{"$set":{"messages":[{"id":"u1","timestamp":"\#(at(0))","type":"user","content":"first"},{"id":"g1","timestamp":"\#(at(5))","type":"gemini","content":"draft edited"}]}}"#,
             #"{"id":"u2","timestamp":"\#(at(10))","type":"user","content":"second"}"#,
-            #"{"id":"g2","timestamp":"\#(at(15))","type":"gemini","model":"gemini-3-pro-preview","content":"rewound","tokens":{"input":20000,"cached":15000,"output":300,"thoughts":100,"tool":0,"total":20400}}"#,
+            // 缺少 model 字段的调用应计入 unknown 未定价提示
+            #"{"id":"g2","timestamp":"\#(at(15))","type":"gemini","content":"rewound","tokens":{"input":20000,"cached":15000,"output":300,"thoughts":100,"tool":0,"total":20400}}"#,
             #"{"$rewindTo":"u2"}"#,
         ], to: "proj/chats/session-rewind.jsonl", under: geminiRoot)
 
         let insp = SessionScanner.inspectFile(file, kind: .gemini, pricing: Pricing.builtIn)
-        // g2 虽被 $rewindTo 回退，但 token 已消耗，详情步骤和成本必须保留
+        // g1 保留旧用量、g2 虽被回退也保留用量与成本；但当前上下文来自重放后的活跃分支（g1 替换后无 tokens -> nil，或看未替换的 g1）
         XCTAssertEqual(insp.totalStepCount, 2)
         XCTAssertEqual(insp.steps.count, 2)
         XCTAssertGreaterThan(try XCTUnwrap(insp.metrics.sessionCost), 0)
+        XCTAssertTrue(insp.unpricedModels.contains("unknown"))
+
+        // Gemini 上下文上限：仅对已知系列返回，未知变体返回 nil
+        XCTAssertEqual(SessionScanner.modelContextWindow(for: "gemini-1.5-pro"), 2_000_000)
+        XCTAssertEqual(SessionScanner.modelContextWindow(for: "gemini-4-neon-medium"), 1_000_000)
+        XCTAssertNil(SessionScanner.modelContextWindow(for: "gemini-experimental-unknown"))
     }
 
     func testGeminiAndAntigravityInspectionAndUnknownWindowFallback() throws {

@@ -204,9 +204,9 @@ final class UsageCostTests: XCTestCase {
         XCTAssertEqual(UsageStats.costText(1234.56), "$1235")
     }
 
-    func testCacheEfficiencyComputesHitRateAndSavings() throws {
+    func testCacheEfficiencyComputesHitRateAndNetSavings() throws {
         let today = StatusService.dayKey(now)
-        // claude-opus-5: input=$5/M, cache_read=$0.5/M -> 每 1M cache_read 节省 $4.5
+        // claude-opus-5: input=$5/M, cache_read=$0.5/M (省 $4.5/M), cache_write=$6.25/M (溢价 $1.25/M)
         let rows = [
             row(day: today, model: "claude-opus-5", category: "input", tokens: 200_000),
             row(day: today, model: "claude-opus-5", category: "cache_write", tokens: 300_000),
@@ -218,7 +218,17 @@ final class UsageCostTests: XCTestCase {
         // 1.5M / (0.2M + 0.3M + 1.5M) = 75%
         XCTAssertEqual(eff.hitRate, 0.75, accuracy: 0.000_001)
         XCTAssertEqual(eff.cacheReadTokens, 1_500_000)
-        XCTAssertEqual(eff.savedCost, 6.75, accuracy: 0.000_001)
+        // 净节省 = 1.5 * 4.5 - 0.3 * 1.25 = 6.75 - 0.375 = 6.375
+        XCTAssertEqual(eff.savedCost, 6.375, accuracy: 0.000_001)
+
+        // 写入溢价超过读取折扣时，净节省归零（绝不虚报省钱）
+        let writeHeavy = [
+            row(day: today, model: "claude-opus-5", category: "cache_write", tokens: 1_000_000),
+            row(day: today, model: "claude-opus-5", category: "cache_read", tokens: 100_000),
+        ]
+        let heavyEff = try XCTUnwrap(UsageStats.cacheEfficiency(rows: writeHeavy, range: .day, now: now,
+                                                                table: Pricing.builtIn))
+        XCTAssertEqual(heavyEff.savedCost, 0, accuracy: 0.000_001)
 
         // 没有缓存读取时返回 nil
         let noCache = [row(day: today, model: "claude-opus-5", category: "input", tokens: 500_000)]

@@ -76,11 +76,16 @@ struct SessionStep: Identifiable, Equatable {
     let contextTokens: Int?
     let durationSeconds: TimeInterval?
     let cost: Double?
+    /// 仅提供 total_tokens、缺少分类字段的 Codex 日志保留总量，不丢弃整步
+    var uncategorizedTotalTokens: Int = 0
     var anomalies: [StepAnomaly] = []
 
     var totalPromptTokens: Int { inputTokens + cacheReadTokens + cacheWriteTokens }
     var totalGeneratedTokens: Int { outputTokens + reasoningTokens }
-    var totalTokens: Int { totalPromptTokens + totalGeneratedTokens }
+    var totalTokens: Int {
+        let categorized = totalPromptTokens + totalGeneratedTokens
+        return categorized > 0 ? categorized : uncategorizedTotalTokens
+    }
 
     var cacheHitRate: Double? {
         guard totalPromptTokens > 0 else { return nil }
@@ -578,8 +583,20 @@ final class SessionScanner {
             if record["$patch"] != nil || record["$rewindTo"] != nil { continue }
             for msg in StatusService.geminiRecordMessages(record) {
                 if let id = msg["id"] as? String, !id.isEmpty {
-                    if byID[id] == nil { order.append(id) }
-                    byID[id] = msg
+                    if let existing = byID[id] {
+                        var merged = msg
+                        // 同 ID 后续替换若不带 tokens，保留已记录的有效用量（与 StatusService 口径一致）
+                        if merged["tokens"] == nil, let oldTokens = existing["tokens"] {
+                            merged["tokens"] = oldTokens
+                        }
+                        if (merged["model"] as? String ?? "").isEmpty, let oldModel = existing["model"] {
+                            merged["model"] = oldModel
+                        }
+                        byID[id] = merged
+                    } else {
+                        order.append(id)
+                        byID[id] = msg
+                    }
                 } else if msg["type"] is String {
                     anonymous.append(msg)
                 }
@@ -695,13 +712,22 @@ final class SessionScanner {
             observedEnds = antigravityStepEnds[file.path] ?? [:]
             stateLock.unlock()
         }
-        let rate = Self.geminiOutputRate(usageMessages, antigravity: antigravity,
+        // 实时指标（输出速率、当前上下文）取自重放后的当前对话分支；
+        // 累计用量、缓存命中率与等价成本取自保留回退前记录的完整操作日志。
+        let rate = Self.geminiOutputRate(messages, antigravity: antigravity,
                                          fileModified: stableMtime, observedEnds: observedEnds)
-        let parsed = Self.parseGeminiSteps(usageMessages, antigravity: antigravity,
-                                           fileModified: stableMtime, observedEnds: observedEnds,
-                                           pricing: pricing)
-        let metrics = Self.summarizeMetrics(steps: parsed.steps, fallbackModel: model,
-                                            explicitContextWindow: nil)
+        let activeParsed = Self.parseGeminiSteps(messages, antigravity: antigravity,
+                                                 fileModified: stableMtime, observedEnds: observedEnds,
+                                                 pricing: pricing)
+        let usageParsed = antigravity
+            ? activeParsed
+            : Self.parseGeminiSteps(usageMessages, antigravity: false,
+                                    fileModified: stableMtime, observedEnds: observedEnds,
+                                    pricing: pricing)
+        let metrics = Self.summarizeMetrics(steps: usageParsed.steps, fallbackModel: model,
+                                            explicitContextWindow: nil,
+                                            currentContextOverride: activeParsed.steps.last?.contextTokens,
+                                            hasCurrentContextOverride: !antigravity)
         return (projectName, sessionID, model, snippet, lastActivity, rate, metrics)
     }
 
@@ -993,9 +1019,11 @@ final class SessionScanner {
                     .replacingOccurrences(of: "claude-", with: "")
             }
         }
+        let isPartial = size > readLen
         var metrics: SessionMetrics
         if kind == .codex {
-            let parsed = Self.parseCodexSteps(lines, pricing: pricing, fallbackModel: model)
+            let parsed = Self.parseCodexSteps(lines, pricing: pricing, fallbackModel: model,
+                                              isPartialTail: isPartial)
             metrics = Self.summarizeMetrics(steps: parsed.steps, fallbackModel: model,
                                             explicitContextWindow: parsed.contextWindow)
         } else {
@@ -1003,19 +1031,27 @@ final class SessionScanner {
             metrics = Self.summarizeMetrics(steps: parsed.steps, fallbackModel: model,
                                             explicitContextWindow: nil)
         }
-        metrics.isPartialWindow = size > readLen
+        metrics.isPartialWindow = isPartial
         return (snippet, model, prompt, transcript, activity, outputRate(lines), metrics)
     }
 
     // MARK: - 会话指标与按需步骤明细
 
-    /// 仅返回明确可确认的上下文窗口上限（显式 `[1m]` 标记或 Gemini 1M）；
-    /// Claude / Codex 未在日志或模型名中明确声明窗口大小时返回 nil，避免 200K/1M 混用误报 100%。
+    /// 仅返回明确可确认的上下文窗口上限（显式 `[1m]` 标记或已确认上限的 Gemini 系列）；
+    /// 其他未知模型或变体返回 nil，UI 仅展示绝对 token 数，避免误报占用率与告警颜色。
     static func modelContextWindow(for rawModel: String) -> Int? {
         let m = rawModel.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
         guard !m.isEmpty else { return nil }
         if m.contains("[1m]") { return 1_000_000 }
-        if m.contains("gemini") { return 1_000_000 }
+        if m.hasPrefix("gemini-1.5-pro") { return 2_000_000 }
+        if m.hasPrefix("gemini-1.5-flash")
+            || m.hasPrefix("gemini-2.5-")
+            || m.hasPrefix("gemini-3-")
+            || m.hasPrefix("gemini-3.5-")
+            || m.hasPrefix("gemini-3.8-")
+            || m.hasPrefix("gemini-4-") {
+            return 1_000_000
+        }
         return nil
     }
 
@@ -1067,6 +1103,8 @@ final class SessionScanner {
         var steps: [SessionStep] = []
         var unpriced = Set<String>()
         var explicitWindow: Int?
+        var currentContextOverride: Int?
+        var hasCurrentContextOverride = false
         switch kind {
         case .claude:
             if let text = String(data: data, encoding: .utf8) {
@@ -1084,25 +1122,42 @@ final class SessionScanner {
             }
         case .gemini:
             let antigravity = isAntigravityTranscript(file)
-            var messages: [[String: Any]] = []
+            var activeMessages: [[String: Any]] = []
+            var usageMessages: [[String: Any]] = []
             if file.pathExtension == "json" {
                 let root = (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
-                messages = root["messages"] as? [[String: Any]] ?? []
+                activeMessages = root["messages"] as? [[String: Any]] ?? []
+                usageMessages = activeMessages
             } else if let text = String(data: data, encoding: .utf8) {
                 let records = text.split(separator: "\n").compactMap {
                     try? JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any]
                 }
-                messages = antigravity ? records : allGeminiUsageMessages(from: records)
+                if antigravity {
+                    activeMessages = records
+                    usageMessages = records
+                } else {
+                    activeMessages = replayGeminiLog(records).messages
+                    usageMessages = allGeminiUsageMessages(from: records)
+                }
             }
-            let parsed = parseGeminiSteps(messages, antigravity: antigravity,
+            let parsed = parseGeminiSteps(usageMessages, antigravity: antigravity,
                                           fileModified: stableMtime, observedEnds: observedEnds,
                                           pricing: pricing)
             steps = parsed.steps
             unpriced = parsed.unpriced
+            if !antigravity {
+                let activeParsed = parseGeminiSteps(activeMessages, antigravity: false,
+                                                    fileModified: stableMtime, observedEnds: observedEnds,
+                                                    pricing: pricing)
+                currentContextOverride = activeParsed.steps.last?.contextTokens
+                hasCurrentContextOverride = true
+            }
         }
         annotateAnomalies(&steps)
         let metrics = summarizeMetrics(steps: steps, fallbackModel: fallbackModel,
-                                       explicitContextWindow: explicitWindow)
+                                       explicitContextWindow: explicitWindow,
+                                       currentContextOverride: currentContextOverride,
+                                       hasCurrentContextOverride: hasCurrentContextOverride)
         let recent = Array(steps.suffix(maxInspectionSteps).reversed())
         return SessionInspection(metrics: metrics, steps: recent,
                                  unpricedModels: unpriced.sorted(),
@@ -1110,11 +1165,13 @@ final class SessionScanner {
     }
 
     static func summarizeMetrics(steps: [SessionStep], fallbackModel: String,
-                                 explicitContextWindow: Int?) -> SessionMetrics {
+                                 explicitContextWindow: Int?,
+                                 currentContextOverride: Int? = nil,
+                                 hasCurrentContextOverride: Bool = false) -> SessionMetrics {
         guard !steps.isEmpty else { return SessionMetrics() }
-        // 以最新一步为准：若最新一步缺少可靠的单步上下文（例如老 Codex 累计日志），
+        // 以最新一步（或回退后的当前活跃分支最新一步）为准：缺少可靠的单步上下文时
         // 留空显示未知，不回退更早步骤的旧值冒充当前上下文。
-        let latestContext = steps.last?.contextTokens
+        let latestContext = hasCurrentContextOverride ? currentContextOverride : steps.last?.contextTokens
         let latestModel = steps.last(where: { !$0.model.isEmpty })?.model ?? fallbackModel
         var window = explicitContextWindow ?? modelContextWindow(for: latestModel)
         if let ctx = latestContext, let win = window, ctx > win {
@@ -1178,8 +1235,6 @@ final class SessionScanner {
                                  output: Int, reasoning: Int,
                                  pricing: [String: ModelPricing],
                                  unpriced: inout Set<String>) -> Double? {
-        guard !rawModel.isEmpty else { return nil }
-        let key = pricingModelKey(rawModel, kind: kind, pricing: pricing)
         var categories: [String: Int] = [:]
         if input > 0 { categories["input"] = input }
         if cacheRead > 0 { categories["cache_read"] = cacheRead }
@@ -1187,6 +1242,12 @@ final class SessionScanner {
         if output > 0 { categories["output"] = output }
         if reasoning > 0 { categories["reasoning"] = reasoning }
         guard !categories.isEmpty else { return nil }
+        let trimmed = rawModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            unpriced.insert("unknown")
+            return nil
+        }
+        let key = pricingModelKey(trimmed, kind: kind, pricing: pricing)
         if let cost = Pricing.cost(model: key, categories: categories, table: pricing) {
             return cost
         }
@@ -1276,7 +1337,8 @@ final class SessionScanner {
     }
 
     static func parseCodexSteps(_ lines: [Substring], pricing: [String: ModelPricing],
-                                fallbackModel: String)
+                                fallbackModel: String,
+                                isPartialTail: Bool = false)
         -> (steps: [SessionStep], unpriced: Set<String>, contextWindow: Int?) {
         struct RawCodexStep {
             var id: String
@@ -1286,6 +1348,7 @@ final class SessionScanner {
             var cached: Int
             var output: Int
             var reasoning: Int
+            var uncategorizedTotal: Int
             var contextTokens: Int?
             var duration: TimeInterval?
             var rawInput: Int
@@ -1304,7 +1367,7 @@ final class SessionScanner {
         // 记录刚追加的 token_usage_record 索引，遇到紧随其后的配对 token_count 时合并而非双计。
         var pendingRecordIndex: Int?
 
-        func makeStep(ts: Date?, fields: [String: Int], hasLastUsage: Bool,
+        func makeStep(ts: Date?, fields: [String: Int], totalOnly: Int, hasLastUsage: Bool,
                       suffix: String, index: Int) -> RawCodexStep? {
             let rawInput = max(0, fields["input_tokens"] ?? 0)
             let cached = max(0, fields["cached_input_tokens"] ?? 0)
@@ -1312,7 +1375,9 @@ final class SessionScanner {
             let reasoning = max(0, fields["reasoning_output_tokens"] ?? 0)
             let nonCachedInput = max(0, rawInput - cached)
             let nonReasoningOutput = max(0, rawOutput - reasoning)
-            guard nonCachedInput + cached + nonReasoningOutput + reasoning > 0 else { return nil }
+            let categorized = nonCachedInput + cached + nonReasoningOutput + reasoning
+            let uncategorized = categorized > 0 ? 0 : max(0, totalOnly)
+            guard categorized + uncategorized > 0 else { return nil }
             let duration: TimeInterval? = {
                 guard inResponse, let start = codexStart, let ts else { return nil }
                 let dt = ts.timeIntervalSince(start)
@@ -1329,6 +1394,7 @@ final class SessionScanner {
                 cached: cached,
                 output: nonReasoningOutput,
                 reasoning: reasoning,
+                uncategorizedTotal: uncategorized,
                 contextTokens: contextTokens,
                 duration: duration,
                 rawInput: rawInput,
@@ -1353,7 +1419,8 @@ final class SessionScanner {
                     "output_tokens": (usage["output_tokens"] as? NSNumber)?.intValue ?? 0,
                     "reasoning_output_tokens": (usage["reasoning_output_tokens"] as? NSNumber)?.intValue ?? 0,
                 ]
-                if let step = makeStep(ts: ts, fields: fields,
+                let totalOnly = (usage["total_tokens"] as? NSNumber)?.intValue ?? 0
+                if let step = makeStep(ts: ts, fields: fields, totalOnly: totalOnly,
                                        hasLastUsage: (fields["input_tokens"] ?? 0) > 0,
                                        suffix: "rec", index: rawSteps.count + 1) {
                     pendingRecordIndex = rawSteps.count
@@ -1377,21 +1444,34 @@ final class SessionScanner {
                     ]
                 }
                 let cumulativeFields = extract(total)
+                // 尾部采样（>128 KiB）若首条 token_count 只有累计值且没有 last_token_usage，
+                // 无法得知截断点之前的增量基线，只能记为基线并跳过，不能把历史累计当近期新调用。
+                if isPartialTail, previousTotal == nil, lastUsage == nil {
+                    previousTotal = cumulative
+                    previousFields = cumulativeFields
+                    pendingRecordIndex = nil
+                    continue
+                }
                 let deltaFields: [String: Int]
+                let deltaTotal: Int
                 if let previousTotal, cumulative == previousTotal {
                     deltaFields = [:]
+                    deltaTotal = 0
                 } else if let lastUsage {
                     deltaFields = extract(lastUsage)
-                } else if previousTotal != nil {
+                    deltaTotal = max(0, (lastUsage["total_tokens"] as? NSNumber)?.intValue ?? 0)
+                } else if let previousTotal {
                     deltaFields = cumulativeFields.reduce(into: [:]) { acc, entry in
                         acc[entry.key] = max(0, entry.value - (previousFields[entry.key] ?? 0))
                     }
+                    deltaTotal = max(0, cumulative - previousTotal)
                 } else {
                     deltaFields = cumulativeFields
+                    deltaTotal = max(0, cumulative)
                 }
                 previousTotal = cumulative
                 previousFields = cumulativeFields
-                guard !deltaFields.isEmpty else { continue }
+                guard !deltaFields.isEmpty || deltaTotal > 0 else { continue }
                 if let idx = pendingRecordIndex, rawSteps.indices.contains(idx) {
                     // 合并配对的 token_count 到刚记录的 token_usage_record，保留耗时并补全上下文/细分字段
                     let prev = rawSteps[idx]
@@ -1401,6 +1481,7 @@ final class SessionScanner {
                     let reasoning = max(0, deltaFields["reasoning_output_tokens"] ?? 0)
                     let nonCachedIn = max(0, rawIn - cached)
                     let nonReasoningOut = max(0, rawOut - reasoning)
+                    let categorized = nonCachedIn + cached + nonReasoningOut + reasoning
                     rawSteps[idx] = RawCodexStep(
                         id: prev.id,
                         timestamp: ts ?? prev.timestamp,
@@ -1409,13 +1490,14 @@ final class SessionScanner {
                         cached: cached,
                         output: nonReasoningOut,
                         reasoning: reasoning,
+                        uncategorizedTotal: categorized > 0 ? 0 : max(deltaTotal, prev.uncategorizedTotal),
                         contextTokens: (lastUsage != nil && rawIn > 0) ? rawIn : prev.contextTokens,
                         duration: prev.duration,
                         rawInput: rawIn,
                         rawOutput: rawOut
                     )
                     pendingRecordIndex = nil
-                } else if let step = makeStep(ts: ts, fields: deltaFields,
+                } else if let step = makeStep(ts: ts, fields: deltaFields, totalOnly: deltaTotal,
                                               hasLastUsage: lastUsage != nil,
                                               suffix: "cnt", index: rawSteps.count + 1) {
                     rawSteps.append(step)
@@ -1458,7 +1540,8 @@ final class SessionScanner {
                 reasoningTokens: raw.reasoning,
                 contextTokens: raw.contextTokens,
                 durationSeconds: raw.duration,
-                cost: cost
+                cost: cost,
+                uncategorizedTotalTokens: raw.uncategorizedTotal
             ))
         }
         return (steps, unpriced, contextWindow)

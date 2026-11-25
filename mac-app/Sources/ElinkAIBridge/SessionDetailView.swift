@@ -54,6 +54,7 @@ struct SessionDetailView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .onAppear { refresh() }
         .onChange(of: session.lastModified) { _ in refresh() }
+        .onChange(of: session.metrics) { _ in refresh() }
         .onChange(of: session.id) { _ in
             onlyAnomalies = false
             inspection = nil
@@ -361,6 +362,9 @@ struct SessionDetailView: View {
         let gen = step.totalGeneratedTokens
         if gen > 0 {
             parts.append("out \(UsageFormat.tokens(gen))")
+        }
+        if parts.isEmpty, step.uncategorizedTotalTokens > 0 {
+            parts.append("total \(UsageFormat.tokens(step.uncategorizedTotalTokens))")
         }
         return parts.joined(separator: " · ")
     }

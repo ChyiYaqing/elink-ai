@@ -260,26 +260,32 @@ enum UsageStats {
         windowTokens > 0 ? min(1, Double(pricedTokens) / Double(windowTokens)) : 1
     }
 
-    /// 缓存命中率与按官方 API 单价差估算的缓存节省金额。
-    /// 分母为输入类 token（`input + cache_read + cache_write`），节省金额按每模型
-    /// `cache_read * max(0, inputPrice - cacheReadPrice)` 累加。
+    /// 缓存命中率与按官方 API 单价差估算的缓存净节省金额。
+    /// 分母为输入类 token（`input + cache_read + cache_write`）；净节省金额 =
+    /// `cache_read` 读取折扣减去 `cache_write` 写入溢价，非正值时归零（不虚报省钱）。
     static func cacheEfficiency(rows: [ModelCategoryUsage], range: StatsRange,
                                 now: Date = Date(),
                                 table: [String: ModelPricing] = Pricing.table()) -> CacheEfficiency? {
         let inWindow = windowFilter(range: range, now: now)
         var promptTokens = 0
         var cacheReadTokens = 0
-        var savedCost = 0.0
+        var netSavedCost = 0.0
         for row in rows where inWindow(row.day) && row.tokens > 0 {
             switch row.category {
-            case "input", "cache_write":
+            case "input":
                 promptTokens += row.tokens
+            case "cache_write":
+                promptTokens += row.tokens
+                if let pricing = table[row.model] {
+                    let writePremium = max(0, pricing.cacheWrite - pricing.input)
+                    netSavedCost -= Double(row.tokens) / 1_000_000 * writePremium
+                }
             case "cache_read":
                 promptTokens += row.tokens
                 cacheReadTokens += row.tokens
                 if let pricing = table[row.model] {
-                    let diff = max(0, pricing.input - pricing.cacheRead)
-                    savedCost += Double(row.tokens) / 1_000_000 * diff
+                    let readDiscount = max(0, pricing.input - pricing.cacheRead)
+                    netSavedCost += Double(row.tokens) / 1_000_000 * readDiscount
                 }
             default:
                 break
@@ -289,7 +295,7 @@ enum UsageStats {
         return CacheEfficiency(
             hitRate: Double(cacheReadTokens) / Double(promptTokens),
             cacheReadTokens: cacheReadTokens,
-            savedCost: savedCost
+            savedCost: max(0, netSavedCost)
         )
     }
 
@@ -417,7 +423,8 @@ struct UsageStatsView: View {
     @State private var hourlyRows: [HourlyModelUsage] = []
     @State private var categoryRows: [DailyCategoryUsage] = []
     @State private var modelCategoryRows: [ModelCategoryUsage] = []
-    @State private var selectedNodeModelCategoryRows: [ModelCategoryUsage]?
+    /// 绑定节点 ID 的单主机分类行：渲染与异步提交都校验与 `effectiveNodeID` 一致，避免串台
+    @State private var selectedNodeModelCategories: (nodeID: String, rows: [ModelCategoryUsage])?
     @State private var loaded = false
     @State private var hoveredBucket: String?
     @State private var hoveredHeatmapDay: HeatmapDay?
@@ -442,9 +449,13 @@ struct UsageStatsView: View {
                 ? UsageStats.deviceTotals(hourly: hourlyRows, bucketID: bucket)
                 : UsageStats.deviceTotals(rows: rows, range: range, bucketID: bucket)
         } ?? rangeDevices
-        let activeModelCategories = effectiveNodeID != nil
-            ? (selectedNodeModelCategoryRows ?? [])
-            : modelCategoryRows
+        let activeModelCategories: [ModelCategoryUsage] = {
+            if let nodeID = effectiveNodeID {
+                return selectedNodeModelCategories?.nodeID == nodeID
+                    ? (selectedNodeModelCategories?.rows ?? []) : []
+            }
+            return modelCategoryRows
+        }()
         let yearHeatmapWeeks = range == .year ? UsageStats.heatmapWeeks(rows: chartRows) : []
         let hasHeatmapData = yearHeatmapWeeks.contains { $0.contains { $0.tokens > 0 } }
         return VStack(spacing: 10) {
@@ -1002,7 +1013,11 @@ struct UsageStatsView: View {
                 hourlyRows = hourly
                 categoryRows = categories
                 modelCategoryRows = modelCategories
-                selectedNodeModelCategoryRows = nodeModelCategories
+                if let nodeID, let nodeModelCategories, effectiveNodeID == nodeID {
+                    selectedNodeModelCategories = (nodeID, nodeModelCategories)
+                } else if effectiveNodeID == nil {
+                    selectedNodeModelCategories = nil
+                }
                 loaded = true
             }
         }
@@ -1010,8 +1025,12 @@ struct UsageStatsView: View {
 
     private func loadSelectedNodeModelCategories() {
         guard let nodeID = effectiveNodeID else {
-            selectedNodeModelCategoryRows = nil
+            selectedNodeModelCategories = nil
             return
+        }
+        // 切换主机时立刻清空旧节点分类数据，防止新查询返回前短暂显示上一台机器的成本与缓存率
+        if selectedNodeModelCategories?.nodeID != nodeID {
+            selectedNodeModelCategories = nil
         }
         let since = StatusService.dayKey(
             StatusService.aggregationCalendar.date(byAdding: .day, value: -366, to: Date()) ?? Date())
@@ -1020,7 +1039,7 @@ struct UsageStatsView: View {
             let filtered = store.clusterModelCategoryUsage(provider: provider, since: since, nodeID: nodeID)
             DispatchQueue.main.async {
                 if effectiveNodeID == nodeID {
-                    selectedNodeModelCategoryRows = filtered
+                    selectedNodeModelCategories = (nodeID, filtered)
                 }
             }
         }
