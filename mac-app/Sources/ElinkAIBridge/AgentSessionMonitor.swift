@@ -38,6 +38,8 @@ struct SessionMetrics: Equatable {
     var totalTokens: Int = 0
     /// 是否来自长日志的尾部采样窗口（>128 KiB 时列表只扫尾部，需与详情全量口径区分）
     var isPartialWindow: Bool = false
+    /// 是否存在未定价模型（列表展示成本时需标明仅为部分估算）
+    var hasUnpricedModels: Bool = false
 
     var contextRatio: Double? {
         guard let ctx = contextTokens, let limit = contextWindow, limit > 0, ctx <= limit else {
@@ -726,7 +728,9 @@ final class SessionScanner {
                                     pricing: pricing)
         let metrics = Self.summarizeMetrics(steps: usageParsed.steps, fallbackModel: model,
                                             explicitContextWindow: nil,
+                                            hasUnpricedModels: !usageParsed.unpriced.isEmpty,
                                             currentContextOverride: activeParsed.steps.last?.contextTokens,
+                                            currentModelOverride: activeParsed.steps.last(where: { !$0.model.isEmpty })?.model,
                                             hasCurrentContextOverride: !antigravity)
         return (projectName, sessionID, model, snippet, lastActivity, rate, metrics)
     }
@@ -1025,11 +1029,13 @@ final class SessionScanner {
             let parsed = Self.parseCodexSteps(lines, pricing: pricing, fallbackModel: model,
                                               isPartialTail: isPartial)
             metrics = Self.summarizeMetrics(steps: parsed.steps, fallbackModel: model,
-                                            explicitContextWindow: parsed.contextWindow)
+                                            explicitContextWindow: parsed.contextWindow,
+                                            hasUnpricedModels: !parsed.unpriced.isEmpty)
         } else {
             let parsed = Self.parseClaudeSteps(lines, pricing: pricing)
             metrics = Self.summarizeMetrics(steps: parsed.steps, fallbackModel: model,
-                                            explicitContextWindow: nil)
+                                            explicitContextWindow: nil,
+                                            hasUnpricedModels: !parsed.unpriced.isEmpty)
         }
         metrics.isPartialWindow = isPartial
         return (snippet, model, prompt, transcript, activity, outputRate(lines), metrics)
@@ -1104,6 +1110,7 @@ final class SessionScanner {
         var unpriced = Set<String>()
         var explicitWindow: Int?
         var currentContextOverride: Int?
+        var currentModelOverride: String?
         var hasCurrentContextOverride = false
         switch kind {
         case .claude:
@@ -1150,13 +1157,16 @@ final class SessionScanner {
                                                     fileModified: stableMtime, observedEnds: observedEnds,
                                                     pricing: pricing)
                 currentContextOverride = activeParsed.steps.last?.contextTokens
+                currentModelOverride = activeParsed.steps.last(where: { !$0.model.isEmpty })?.model
                 hasCurrentContextOverride = true
             }
         }
         annotateAnomalies(&steps)
         let metrics = summarizeMetrics(steps: steps, fallbackModel: fallbackModel,
                                        explicitContextWindow: explicitWindow,
+                                       hasUnpricedModels: !unpriced.isEmpty,
                                        currentContextOverride: currentContextOverride,
+                                       currentModelOverride: currentModelOverride,
                                        hasCurrentContextOverride: hasCurrentContextOverride)
         let recent = Array(steps.suffix(maxInspectionSteps).reversed())
         return SessionInspection(metrics: metrics, steps: recent,
@@ -1166,13 +1176,17 @@ final class SessionScanner {
 
     static func summarizeMetrics(steps: [SessionStep], fallbackModel: String,
                                  explicitContextWindow: Int?,
+                                 hasUnpricedModels: Bool = false,
                                  currentContextOverride: Int? = nil,
+                                 currentModelOverride: String? = nil,
                                  hasCurrentContextOverride: Bool = false) -> SessionMetrics {
         guard !steps.isEmpty else { return SessionMetrics() }
         // 以最新一步（或回退后的当前活跃分支最新一步）为准：缺少可靠的单步上下文时
-        // 留空显示未知，不回退更早步骤的旧值冒充当前上下文。
+        // 留空显示未知，不回退更早步骤的旧值冒充当前上下文；窗口上限也取活跃分支模型。
         let latestContext = hasCurrentContextOverride ? currentContextOverride : steps.last?.contextTokens
-        let latestModel = steps.last(where: { !$0.model.isEmpty })?.model ?? fallbackModel
+        let latestModel = hasCurrentContextOverride
+            ? (currentModelOverride ?? fallbackModel)
+            : (steps.last(where: { !$0.model.isEmpty })?.model ?? fallbackModel)
         var window = explicitContextWindow ?? modelContextWindow(for: latestModel)
         if let ctx = latestContext, let win = window, ctx > win {
             window = nil
@@ -1187,7 +1201,8 @@ final class SessionScanner {
                               contextWindow: window,
                               cacheHitRate: cacheHitRate,
                               sessionCost: sessionCost,
-                              totalTokens: totalTokens)
+                              totalTokens: totalTokens,
+                              hasUnpricedModels: hasUnpricedModels)
     }
 
     /// 确定性异常标记：低缓存（输入+缓存 ≥ 10K 且命中 < 50%）、慢响应（≥ 30s）、
@@ -1473,7 +1488,8 @@ final class SessionScanner {
                 previousFields = cumulativeFields
                 guard !deltaFields.isEmpty || deltaTotal > 0 else { continue }
                 if let idx = pendingRecordIndex, rawSteps.indices.contains(idx) {
-                    // 合并配对的 token_count 到刚记录的 token_usage_record，保留耗时并补全上下文/细分字段
+                    // 合并配对的 token_count 到刚记录的 token_usage_record：
+                    // 仅当后续记录实际提供了分类字段时覆盖，避免只有 total_tokens 的记录把已有分类清零。
                     let prev = rawSteps[idx]
                     let rawIn = max(0, deltaFields["input_tokens"] ?? 0)
                     let cached = max(0, deltaFields["cached_input_tokens"] ?? 0)
@@ -1481,20 +1497,22 @@ final class SessionScanner {
                     let reasoning = max(0, deltaFields["reasoning_output_tokens"] ?? 0)
                     let nonCachedIn = max(0, rawIn - cached)
                     let nonReasoningOut = max(0, rawOut - reasoning)
-                    let categorized = nonCachedIn + cached + nonReasoningOut + reasoning
+                    let hasNewCategories = (nonCachedIn + cached + nonReasoningOut + reasoning) > 0
+                    let prevCategorized = prev.input + prev.cached + prev.output + prev.reasoning
                     rawSteps[idx] = RawCodexStep(
                         id: prev.id,
                         timestamp: ts ?? prev.timestamp,
                         model: prev.model ?? currentModel,
-                        input: nonCachedIn,
-                        cached: cached,
-                        output: nonReasoningOut,
-                        reasoning: reasoning,
-                        uncategorizedTotal: categorized > 0 ? 0 : max(deltaTotal, prev.uncategorizedTotal),
+                        input: hasNewCategories ? nonCachedIn : prev.input,
+                        cached: hasNewCategories ? cached : prev.cached,
+                        output: hasNewCategories ? nonReasoningOut : prev.output,
+                        reasoning: hasNewCategories ? reasoning : prev.reasoning,
+                        uncategorizedTotal: (hasNewCategories || prevCategorized > 0)
+                            ? 0 : max(deltaTotal, prev.uncategorizedTotal),
                         contextTokens: (lastUsage != nil && rawIn > 0) ? rawIn : prev.contextTokens,
                         duration: prev.duration,
-                        rawInput: rawIn,
-                        rawOutput: rawOut
+                        rawInput: hasNewCategories ? rawIn : prev.rawInput,
+                        rawOutput: hasNewCategories ? rawOut : prev.rawOutput
                     )
                     pendingRecordIndex = nil
                 } else if let step = makeStep(ts: ts, fields: deltaFields, totalOnly: deltaTotal,
@@ -1518,8 +1536,9 @@ final class SessionScanner {
                 lastInput = ts
             }
         }
-        // 与 StatusService.codexUsageEvents 一致：模型声明前的开头用量归属文件首个声明的模型
-        let defaultModel = firstModel ?? fallbackModel
+        // 全量解析沿用 StatusService.codexUsageEvents：开头用量归属文件首个声明的模型；
+        // 128 KiB 尾部采样无法得知截断点前是否切过模型，不把切换前的步骤错误归给后续新模型。
+        let defaultModel = isPartialTail ? "" : (firstModel ?? fallbackModel)
         var steps: [SessionStep] = []
         var unpriced = Set<String>()
         for (idx, raw) in rawSteps.enumerated() {
@@ -1554,6 +1573,11 @@ final class SessionScanner {
         var steps: [SessionStep] = []
         var unpriced = Set<String>()
         if antigravity {
+            // 与 StatusService.geminiUsageEvents 一致：按 step_index 去重保留最后一份有效 DONE 用量，
+            // 同时避免同一步重复写入导致 SwiftUI ForEach 出现重复 id。
+            var agyOrder: [String] = []
+            var agyByKey: [String: (timestamp: Date?, model: String, input: Int, cacheRead: Int,
+                                    output: Int, context: Int?, duration: TimeInterval?, cost: Double?)] = [:]
             for i in messages.indices {
                 let msg = messages[i]
                 guard msg["type"] as? String == "PLANNER_RESPONSE",
@@ -1594,19 +1618,26 @@ final class SessionScanner {
                                     output: output, reasoning: 0,
                                     pricing: pricing, unpriced: &unpriced)
                 let context = input + cacheRead
+                let key = stepIdx.map { "agy:\($0)" } ?? "agy:line:\(i)"
+                if agyByKey[key] == nil { agyOrder.append(key) }
+                agyByKey[key] = (end ?? start, rawModel, input, cacheRead, output,
+                                 context > 0 ? context : nil, duration, cost)
+            }
+            for key in agyOrder {
+                guard let item = agyByKey[key] else { continue }
                 steps.append(SessionStep(
-                    id: "agy:\(stepIdx ?? i)",
+                    id: key,
                     index: steps.count + 1,
-                    timestamp: end ?? start,
-                    model: rawModel,
-                    inputTokens: input,
-                    cacheReadTokens: cacheRead,
+                    timestamp: item.timestamp,
+                    model: item.model,
+                    inputTokens: item.input,
+                    cacheReadTokens: item.cacheRead,
                     cacheWriteTokens: 0,
-                    outputTokens: output,
+                    outputTokens: item.output,
                     reasoningTokens: 0,
-                    contextTokens: context > 0 ? context : nil,
-                    durationSeconds: duration,
-                    cost: cost
+                    contextTokens: item.context,
+                    durationSeconds: item.duration,
+                    cost: item.cost
                 ))
             }
         } else {

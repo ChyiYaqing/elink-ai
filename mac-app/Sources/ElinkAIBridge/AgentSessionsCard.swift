@@ -309,7 +309,8 @@ struct AgentSessionsCard: View {
             windowParts.append("cache \(Int((hit * 100).rounded()))%")
         }
         if let cost = metrics.sessionCost, cost > 0 {
-            windowParts.append(UsageFormat.money(cost))
+            let formatted = UsageFormat.money(cost)
+            windowParts.append(metrics.hasUnpricedModels ? "\(formatted)+" : formatted)
         }
         if !windowParts.isEmpty {
             let joined = windowParts.joined(separator: " · ")

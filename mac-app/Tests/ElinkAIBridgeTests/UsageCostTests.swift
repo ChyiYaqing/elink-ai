@@ -230,6 +230,19 @@ final class UsageCostTests: XCTestCase {
                                                                 table: Pricing.builtIn))
         XCTAssertEqual(heavyEff.savedCost, 0, accuracy: 0.000_001)
 
+        // 某模型自定义 cacheRead 高于 input 时应按带符号价差抵消其他模型折扣，仅最终合计截零
+        let customTable: [String: ModelPricing] = [
+            "good": ModelPricing(input: 5, output: 10, cacheRead: 1, cacheWrite: 5),   // 1M 省 $4
+            "bad": ModelPricing(input: 5, output: 10, cacheRead: 10, cacheWrite: 5),   // 1M 亏 $5
+        ]
+        let mixedSigned = [
+            row(day: today, model: "good", category: "cache_read", tokens: 1_000_000),
+            row(day: today, model: "bad", category: "cache_read", tokens: 1_000_000),
+        ]
+        let signedEff = try XCTUnwrap(UsageStats.cacheEfficiency(rows: mixedSigned, range: .day, now: now,
+                                                                 table: customTable))
+        XCTAssertEqual(signedEff.savedCost, 0, accuracy: 0.000_001)
+
         // 没有缓存读取时返回 nil
         let noCache = [row(day: today, model: "claude-opus-5", category: "input", tokens: 500_000)]
         XCTAssertNil(UsageStats.cacheEfficiency(rows: noCache, range: .day, now: now,

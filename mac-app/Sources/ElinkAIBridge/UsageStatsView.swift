@@ -277,15 +277,14 @@ enum UsageStats {
             case "cache_write":
                 promptTokens += row.tokens
                 if let pricing = table[row.model] {
-                    let writePremium = max(0, pricing.cacheWrite - pricing.input)
-                    netSavedCost -= Double(row.tokens) / 1_000_000 * writePremium
+                    // 带符号累加价差，仅在最终合计处截零
+                    netSavedCost -= Double(row.tokens) / 1_000_000 * (pricing.cacheWrite - pricing.input)
                 }
             case "cache_read":
                 promptTokens += row.tokens
                 cacheReadTokens += row.tokens
                 if let pricing = table[row.model] {
-                    let readDiscount = max(0, pricing.input - pricing.cacheRead)
-                    netSavedCost += Double(row.tokens) / 1_000_000 * readDiscount
+                    netSavedCost += Double(row.tokens) / 1_000_000 * (pricing.input - pricing.cacheRead)
                 }
             default:
                 break

@@ -816,6 +816,29 @@ final class AgentSessionMonitorTests: XCTestCase {
         XCTAssertEqual(totalOnlyParsed.steps.count, 1)
         XCTAssertEqual(totalOnlyParsed.steps[0].totalTokens, 12_345)
         XCTAssertNil(totalOnlyParsed.steps[0].cost)
+
+        // 先写带分类的 token_usage_record、再写仅含 total_tokens 的 token_count：合并时保留已有分类字段
+        let mixedPairLines: [Substring] = [
+            #"{"type":"turn_context","payload":{"model":"gpt-6-sol"},"timestamp":"\#(at(0))"}"#,
+            #"{"type":"token_usage_record","payload":{"usage":{"input_tokens":50000,"cached_input_tokens":40000,"output_tokens":1000,"reasoning_output_tokens":400}},"timestamp":"\#(at(5))"}"#,
+            #"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":51000},"last_token_usage":{"total_tokens":51000}}},"timestamp":"\#(at(5))"}"#,
+        ]
+        let mixedPair = SessionScanner.parseCodexSteps(mixedPairLines, pricing: Pricing.builtIn,
+                                                       fallbackModel: "gpt-6-sol")
+        XCTAssertEqual(mixedPair.steps.count, 1)
+        XCTAssertEqual(mixedPair.steps[0].cacheReadTokens, 40_000)
+        XCTAssertEqual(mixedPair.steps[0].outputTokens, 600)
+        XCTAssertNotNil(mixedPair.steps[0].cost)
+
+        // 尾部采样中，首条模型声明前的步骤不归给后续切出的新模型
+        let tailSwitchLines: [Substring] = [
+            #"{"type":"token_usage_record","payload":{"usage":{"input_tokens":10000,"cached_input_tokens":0,"output_tokens":500,"reasoning_output_tokens":0}},"timestamp":"\#(at(1))"}"#,
+            #"{"type":"turn_context","payload":{"model":"gpt-6-astra"},"timestamp":"\#(at(2))"}"#,
+        ]
+        let tailSwitched = SessionScanner.parseCodexSteps(tailSwitchLines, pricing: Pricing.builtIn,
+                                                          fallbackModel: "gpt-6-astra", isPartialTail: true)
+        XCTAssertEqual(tailSwitched.steps.first?.model, "")
+        XCTAssertTrue(tailSwitched.unpriced.contains("unknown"))
     }
 
     func testGeminiInspectionRetainsRewoundCallsUsageAndUsesActiveBranchContext() throws {
@@ -844,6 +867,34 @@ final class AgentSessionMonitorTests: XCTestCase {
         XCTAssertEqual(SessionScanner.modelContextWindow(for: "gemini-1.5-pro"), 2_000_000)
         XCTAssertEqual(SessionScanner.modelContextWindow(for: "gemini-4-neon-medium"), 1_000_000)
         XCTAssertNil(SessionScanner.modelContextWindow(for: "gemini-experimental-unknown"))
+
+        // 回退到不同模型分支（gemini-1.5-pro 2M）后，上下文上限取活跃分支模型而非历史步骤（gemini-3-pro 1M）
+        let branchFile = try write([
+            #"{"sessionId":"sess-branch","projectHash":"h","startTime":"\#(at(0))","kind":"main"}"#,
+            #"{"id":"u1","timestamp":"\#(at(0))","type":"user","content":"first"}"#,
+            #"{"id":"g1","timestamp":"\#(at(5))","type":"gemini","model":"gemini-1.5-pro","content":"a","tokens":{"input":800000,"cached":0,"output":100,"thoughts":0,"tool":0,"total":800100}}"#,
+            #"{"id":"u2","timestamp":"\#(at(10))","type":"user","content":"second"}"#,
+            #"{"id":"g2","timestamp":"\#(at(15))","type":"gemini","model":"gemini-3-pro-preview","content":"b","tokens":{"input":100000,"cached":0,"output":100,"thoughts":0,"tool":0,"total":100100}}"#,
+            #"{"$rewindTo":"u2"}"#,
+        ], to: "proj/chats/session-branch.jsonl", under: geminiRoot)
+        let branchInsp = SessionScanner.inspectFile(branchFile, kind: .gemini, pricing: Pricing.builtIn)
+        XCTAssertEqual(branchInsp.metrics.contextTokens, 800_000)
+        XCTAssertEqual(branchInsp.metrics.contextWindow, 2_000_000)
+        XCTAssertEqual(try XCTUnwrap(branchInsp.metrics.contextRatio), 0.4, accuracy: 0.001)
+        // 含未定价模型时列表摘要金额带 "+" 标明为部分估算
+        XCTAssertTrue(branchInsp.metrics.hasUnpricedModels)
+        XCTAssertTrue(try XCTUnwrap(AgentSessionsCard.metricsSummaryText(branchInsp.metrics)).contains("+"))
+
+        // Antigravity 同 step_index 重复写入 DONE 记录应去重保留最后一份，且 id 唯一
+        let dupAgy = SessionScanner.parseGeminiSteps([
+            ["step_index": 1, "type": "PLANNER_RESPONSE", "status": "DONE", "model": "gemini-4-neon-medium",
+             "input_tokens": 1000, "cache_read_tokens": 2000, "output_tokens": 100],
+            ["step_index": 1, "type": "PLANNER_RESPONSE", "status": "DONE", "model": "gemini-4-neon-medium",
+             "input_tokens": 1000, "cache_read_tokens": 4000, "output_tokens": 200],
+        ], antigravity: true, pricing: Pricing.builtIn)
+        XCTAssertEqual(dupAgy.steps.count, 1)
+        XCTAssertEqual(dupAgy.steps[0].cacheReadTokens, 4_000)
+        XCTAssertEqual(dupAgy.steps[0].outputTokens, 200)
     }
 
     func testGeminiAndAntigravityInspectionAndUnknownWindowFallback() throws {
