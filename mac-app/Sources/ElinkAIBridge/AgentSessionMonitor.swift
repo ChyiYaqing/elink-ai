@@ -298,7 +298,7 @@ final class SessionScanner {
     /// Gemini 会话文件的解析结果，同样按大小与 mtime 复用。Gemini CLI 的 `.json`
     /// 会话是整份对话，长会话可达数 MB，不能每轮 poll 都整份重读。
     private typealias GeminiInfo = (title: String, sessionID: String, model: String,
-                                    snippet: String, activity: Date?)
+                                    snippet: String, activity: Date?, rate: Double?)
     private var geminiCache: [String: (size: Int, mtime: Date, info: GeminiInfo)] = [:]
     /// 本轮 scan 用到的路径；scan 结束时据此丢掉已不再扫描的文件
     private var touched = Set<String>()
@@ -377,7 +377,8 @@ final class SessionScanner {
                 lastModified: mtime,
                 threadID: info.sessionID,
                 isLive: isLive,
-                lastActivity: info.activity ?? mtime
+                lastActivity: info.activity ?? mtime,
+                tokensPerSecond: info.rate
             ))
         }
         return out
@@ -506,7 +507,7 @@ final class SessionScanner {
             ? file.deletingLastPathComponent().deletingLastPathComponent()
                 .deletingLastPathComponent().lastPathComponent
             : file.deletingPathExtension().lastPathComponent
-        guard let data = try? Data(contentsOf: file) else { return (projectName, sessionID, "", "", nil) }
+        guard let data = try? Data(contentsOf: file) else { return (projectName, sessionID, "", "", nil, nil) }
         var meta: [String: Any] = [:]
         var messages: [[String: Any]] = []
         // 按扩展名分流：只有一行的 `.jsonl` 也能整份解析成对象，不能拿来判断格式
@@ -545,7 +546,60 @@ final class SessionScanner {
             }
             if !model.isEmpty && lastActivity != nil && !snippet.isEmpty { break }
         }
-        return (projectName, sessionID, model, snippet, lastActivity)
+        let rate = Self.geminiOutputRate(messages, antigravity: antigravity)
+        return (projectName, sessionID, model, snippet, lastActivity, rate)
+    }
+
+    /// 计算 Gemini CLI / Antigravity 会话最近响应的输出速率（output tokens / 秒）。
+    /// - Gemini CLI：`gemini` 消息的 `timestamp` 是响应完成时间，起点取前一条 `user`
+    ///   消息或上一轮 `toolCalls` 的最晚完成时间；输出 token 合并 `output + thoughts`
+    ///   （与 Claude/Codex 把思维链计入 `output_tokens` 的口径一致）。
+    /// - Antigravity：`PLANNER_RESPONSE` 的 `created_at` 是生成起点；紧跟工具/模型
+    ///   步骤时下一条的 `created_at` 是本轮生成结束时间，用户再次输入不计入。
+    static func geminiOutputRate(_ messages: [[String: Any]], antigravity: Bool) -> Double? {
+        var samples: [(tokens: Int, seconds: TimeInterval)] = []
+        if antigravity {
+            for i in messages.indices {
+                let msg = messages[i]
+                guard msg["type"] as? String == "PLANNER_RESPONSE",
+                      let out = (msg["output_tokens"] as? NSNumber)?.intValue, out > 0,
+                      let start = StatusService.timestamp(msg["created_at"]),
+                      messages.indices.contains(i + 1) else { continue }
+                let next = messages[i + 1]
+                guard next["type"] as? String != "USER_INPUT",
+                      next["source"] as? String != "USER_EXPLICIT",
+                      next["source"] as? String != "SYSTEM",
+                      let end = StatusService.timestamp(next["created_at"]) else { continue }
+                let dt = end.timeIntervalSince(start)
+                if dt > 0 { samples.append((out, dt)) }
+            }
+        } else {
+            var lastInput: Date?
+            for msg in messages {
+                let type = msg["type"] as? String
+                if type == "user" {
+                    if let ts = StatusService.timestamp(msg["timestamp"]) { lastInput = ts }
+                } else if type == "gemini" {
+                    let ts = StatusService.timestamp(msg["timestamp"])
+                    if let start = lastInput, let end = ts,
+                       let tokens = msg["tokens"] as? [String: Any] {
+                        let output = max(0, (tokens["output"] as? NSNumber)?.intValue ?? 0)
+                        let thoughts = max(0, (tokens["thoughts"] as? NSNumber)?.intValue ?? 0)
+                        let generated = output + thoughts
+                        let dt = end.timeIntervalSince(start)
+                        if generated > 0 && dt > 0 { samples.append((generated, dt)) }
+                    }
+                    let toolEnd = (msg["toolCalls"] as? [[String: Any]])?
+                        .compactMap { StatusService.timestamp($0["timestamp"]) }
+                        .max()
+                    if let nextStart = toolEnd ?? ts { lastInput = nextStart }
+                }
+            }
+        }
+        let recent = samples.filter { $0.seconds > 0 }.suffix(Self.rateSamples)
+        let tokens = recent.reduce(0) { $0 + $1.tokens }
+        let seconds = recent.reduce(0) { $0 + $1.seconds }
+        return tokens > 0 && seconds > 0 ? Double(tokens) / seconds : nil
     }
 
     /// 把 Codex 子代理 rollout 折叠为根线程的 children。

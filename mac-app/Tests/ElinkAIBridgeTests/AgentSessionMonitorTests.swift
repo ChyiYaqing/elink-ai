@@ -549,6 +549,57 @@ final class AgentSessionMonitorTests: XCTestCase {
         XCTAssertEqual(messages.compactMap { $0["id"] as? String }, ["c", "a"])
     }
 
+    func testGeminiCLIOutputRateCountsOutputAndThoughtsAcrossToolCalls() throws {
+        let t0 = Date().addingTimeInterval(-100)
+        func at(_ s: Double) -> String { Self.iso.string(from: t0.addingTimeInterval(s)) }
+        let json = """
+        {
+          "sessionId": "sess-rate",
+          "messages": [
+            {"id":"u1","type":"user","timestamp":"\(at(0))","content":"code review"},
+            {
+              "id":"g1","type":"gemini","timestamp":"\(at(10))","model":"gemini-3-pro",
+              "content":"checking files",
+              "tokens":{"input":1000,"output":100,"thoughts":300,"cached":0,"tool":0,"total":1400},
+              "toolCalls":[{"id":"t1","name":"read_file","timestamp":"\(at(12))"}]
+            },
+            {
+              "id":"g2","type":"gemini","timestamp":"\(at(22))","model":"gemini-3-pro",
+              "content":"done",
+              "tokens":{"input":2000,"output":200,"thoughts":400,"cached":0,"tool":0,"total":2600}
+            }
+          ]
+        }
+        """
+        try write([json], to: "proj/chats/session-rate.json", under: geminiRoot)
+
+        let s = try XCTUnwrap(scanner().scan(live: [], claudeCwdCounts: [:]).first)
+        // (400 + 600) tokens / (10s + 10s) = 50 tok/s
+        XCTAssertEqual(try XCTUnwrap(s.tokensPerSecond), 50, accuracy: 0.001)
+        XCTAssertTrue(AgentSessionsCard.tagText(s, now: t0.addingTimeInterval(25)).contains("50 tok/s"))
+    }
+
+    func testAntigravityOutputRatePairsPlannerWithNextModelStepAndSkipsUserWait() throws {
+        let t0 = Date().addingTimeInterval(-200)
+        func at(_ s: Double) -> String { ISO8601DateFormatter().string(from: t0.addingTimeInterval(s)) }
+        try write([
+            #"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","created_at":"\#(at(0))","content":"hi"}"#,
+            #"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","created_at":"\#(at(0))","model":"gemini-4-neon-medium","output_tokens":300}"#,
+            #"{"step_index":2,"source":"MODEL","type":"GENERIC","created_at":"\#(at(5))","content":"tool output"}"#,
+            #"{"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","created_at":"\#(at(6))","model":"gemini-4-neon-medium","output_tokens":700}"#,
+            // 后面隔了 120 秒才是用户输入：这段等待不能算进模型生成耗时
+            #"{"step_index":4,"source":"USER_EXPLICIT","type":"USER_INPUT","created_at":"\#(at(126))","content":"next"}"#,
+            #"{"step_index":5,"source":"MODEL","type":"PLANNER_RESPONSE","created_at":"\#(at(126))","model":"gemini-4-neon-medium","output_tokens":500}"#,
+            #"{"step_index":6,"source":"MODEL","type":"GENERIC","created_at":"\#(at(136))","content":"tool output 2"}"#,
+            // 最后一条没有后续步骤，不参与计算
+            #"{"step_index":7,"source":"MODEL","type":"PLANNER_RESPONSE","created_at":"\#(at(138))","model":"gemini-4-neon-medium","output_tokens":400,"content":"done"}"#,
+        ], to: "conv-rate/.system_generated/logs/transcript.jsonl", under: antigravityRoot)
+
+        let s = try XCTUnwrap(scanner().scan(live: [], claudeCwdCounts: [:]).first)
+        // (300 + 500) tokens / (5s + 10s) = 53.333 tok/s
+        XCTAssertEqual(try XCTUnwrap(s.tokensPerSecond), 800.0 / 15.0, accuracy: 0.001)
+    }
+
     func testGeminiSessionReparsedOnlyWhenFileChanges() throws {
         let mtime = Date().addingTimeInterval(-60)
         try write([#"{"sessionId":"s","messages":[{"type":"gemini","content":"第一版"}]}"#],
