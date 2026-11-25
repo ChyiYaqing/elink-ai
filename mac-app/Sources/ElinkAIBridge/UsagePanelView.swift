@@ -124,7 +124,7 @@ struct UsagePanelView: View {
             ZStack(alignment: .top) {
                 ScrollView(.vertical, showsIndicators: false) {
                     VStack(spacing: 12) {
-                        // fixedSize 让 HStack 取最高卡片的高度，两张卡片再撑满对齐
+                        // fixedSize 让 HStack 取最高卡片的高度，卡片再撑满对齐
                         HStack(alignment: .top, spacing: 10) {
                             ProviderCard(name: "Claude", pet: PixelPet.claude,
                                          accent: PanelTheme.claudeColor(dark: theme.dark),
@@ -140,22 +140,17 @@ struct UsagePanelView: View {
                                 Log.user("open Codex usage statistics")
                                 withAnimation(.easeOut(duration: 0.2)) { model.statsProvider = "codex" }
                             }
+                            if showGeminiCard {
+                                ProviderCard(name: "Gemini", pet: PixelPet.gemini,
+                                             accent: PanelTheme.geminiColor(dark: theme.dark),
+                                             status: model.gemini, theme: theme,
+                                             cost: model.geminiCost) {
+                                    Log.user("open Gemini usage statistics")
+                                    withAnimation(.easeOut(duration: 0.2)) { model.statsProvider = "gemini" }
+                                }
+                            }
                         }
                         .fixedSize(horizontal: false, vertical: true)
-                        if model.gemini.state != "offline"
-                            || model.gemini.primary.percent != nil
-                            || model.gemini.weekly.percent != nil
-                            || model.gemini.tokensToday > 0
-                            || model.gemini.error != nil {
-                            ProviderCard(name: "Gemini", pet: PixelPet.gemini,
-                                         accent: PanelTheme.geminiColor(dark: theme.dark),
-                                         status: model.gemini, theme: theme,
-                                         cost: model.geminiCost) {
-                                Log.user("open Gemini usage statistics")
-                                withAnimation(.easeOut(duration: 0.2)) { model.statsProvider = "gemini" }
-                            }
-                            .fixedSize(horizontal: false, vertical: true)
-                        }
                         if model.agentSessionsEnabled && !model.agentSessions.isEmpty {
                             AgentSessionsCard(sessions: model.agentSessions, theme: theme)
                         }
@@ -202,9 +197,17 @@ struct UsagePanelView: View {
             footer(theme)
         }
         .padding(16)
-        .frame(width: 440)
+        .frame(width: showGeminiCard ? 648 : 440)
         .frame(maxHeight: model.panelMaxHeight)
         .background(theme.backgroundGradient)
+    }
+
+    private var showGeminiCard: Bool {
+        model.gemini.state != "offline"
+            || model.gemini.primary.percent != nil
+            || model.gemini.weekly.percent != nil
+            || model.gemini.tokensToday > 0
+            || model.gemini.error != nil
     }
 
     /// 设置、用量统计、对账单、Nebula、VPS 几页互斥，都盖在主列表上。
