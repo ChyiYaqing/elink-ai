@@ -5,6 +5,7 @@ import SwiftUI
 struct AgentSessionsCard: View {
     let sessions: [AgentSession]
     let theme: PanelTheme
+    var onInspect: ((AgentSession) -> Void)? = nil
     @State private var isExpanded = false
     @State private var expandedIDs = Set<String>()
     @State private var outputIDs = Set<String>()
@@ -12,9 +13,10 @@ struct AgentSessionsCard: View {
     private var busyColor: Color { theme.statusInfo }
 
     init(sessions: [AgentSession], theme: PanelTheme, initiallyExpanded: Bool = false,
-         initiallyOpenOutputs: Set<String> = []) {
+         initiallyOpenOutputs: Set<String> = [], onInspect: ((AgentSession) -> Void)? = nil) {
         self.sessions = sessions
         self.theme = theme
+        self.onInspect = onInspect
         _isExpanded = State(initialValue: initiallyExpanded)
         _outputIDs = State(initialValue: initiallyOpenOutputs)
     }
@@ -79,6 +81,26 @@ struct AgentSessionsCard: View {
                     .font(.system(size: 9, weight: .medium, design: .monospaced))
                     .foregroundStyle(tagColor(busy: session.isBusy, live: session.isLive))
                     .lineLimit(1)
+                if let onInspect {
+                    Button {
+                        Log.user("inspect agent session \(session.kind.rawValue)")
+                        onInspect(session)
+                    } label: {
+                        Image(systemName: "chart.bar.doc.horizontal")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundStyle(theme.textTertiary)
+                    }
+                    .buttonStyle(.plain)
+                    .help(tr("查看会话指标与步骤明细", "Inspect session metrics and steps"))
+                    .accessibilityLabel(tr("查看会话详情", "Inspect session"))
+                }
+            }
+            if let summary = Self.metricsSummaryText(session.metrics) {
+                Text(summary)
+                    .font(.system(size: 8, weight: .medium, design: .monospaced))
+                    .foregroundStyle(theme.textTertiary)
+                    .lineLimit(1)
+                    .padding(.leading, 30)
             }
             if !detailText(session).isEmpty {
                 if Self.hasTranscript(session) {
@@ -159,6 +181,18 @@ struct AgentSessionsCard: View {
                     .font(.system(size: 8, weight: .medium, design: .monospaced))
                     .foregroundStyle(tagColor(busy: child.isBusy, live: child.isLive))
                     .lineLimit(1)
+                if let onInspect {
+                    Button {
+                        Log.user("inspect subagent session \(child.kind.rawValue)")
+                        onInspect(child)
+                    } label: {
+                        Image(systemName: "chart.bar.doc.horizontal")
+                            .font(.system(size: 8, weight: .semibold))
+                            .foregroundStyle(theme.textTertiary)
+                    }
+                    .buttonStyle(.plain)
+                    .help(tr("查看子任务指标与步骤明细", "Inspect subagent metrics and steps"))
+                }
             }
         }
         .padding(.leading, 24)
@@ -257,6 +291,32 @@ struct AgentSessionsCard: View {
         let name = session.model.isEmpty ? session.title : session.model
         let rate = session.tokensPerSecond.map { String(format: " · %.0f tok/s", $0) } ?? ""
         return "\(name)\(rate) · \(relativeTime(session.lastActivity ?? session.lastModified, now: now))"
+    }
+
+    /// 会话行下方紧凑的实时监控摘要：上下文占用 · 缓存命中 · 等价成本。
+    /// 超过 128 KiB 的长日志仅扫描尾部样本，此时明确标出「近期」，与详情页全量成本区分。
+    static func metricsSummaryText(_ metrics: SessionMetrics) -> String? {
+        var parts: [String] = []
+        if let ctx = metrics.contextTokens {
+            if let ratio = metrics.contextRatio {
+                parts.append("ctx \(UsageFormat.tokens(ctx)) (\(Int((ratio * 100).rounded()))%)")
+            } else {
+                parts.append("ctx \(UsageFormat.tokens(ctx))")
+            }
+        }
+        var windowParts: [String] = []
+        if let hit = metrics.cacheHitRate {
+            windowParts.append("cache \(Int((hit * 100).rounded()))%")
+        }
+        if let cost = metrics.sessionCost, cost > 0 {
+            let formatted = UsageFormat.money(cost)
+            windowParts.append(metrics.hasUnpricedModels ? "\(formatted)+" : formatted)
+        }
+        if !windowParts.isEmpty {
+            let joined = windowParts.joined(separator: " · ")
+            parts.append(metrics.isPartialWindow ? "\(tr("近期", "recent")) \(joined)" : joined)
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 
     private func tagColor(busy: Bool, live: Bool) -> Color {

@@ -48,6 +48,7 @@ final class PanelModel: ObservableObject {
     @Published var settingsMessage: String?
     @Published var agentSessions: [AgentSession] = []
     @Published var agentSessionsEnabled = true
+    @Published var inspectedSession: AgentSession?
     @Published var claudeCredentialState: ClaudeCredentialState = .automatic
     @Published var claudeCredentialValidating = false
     @Published var language: AppLanguage = AppLanguage.current
@@ -63,6 +64,8 @@ final class PanelModel: ObservableObject {
     var onPointHere: (() -> Void)?
     var onOpenDeviceStatus: (() -> Void)?
     var onSetAgentSessionsEnabled: ((Bool) -> Void)?
+    var onInspectSession: ((AgentSession, @escaping (SessionInspection) -> Void) -> Void)?
+    var onCloseSessionInspection: (() -> Void)?
     var onSaveClaudeToken: ((String, @escaping (Bool) -> Void) -> Void)?
     var onRemoveClaudeToken: (() -> Bool)?
 
@@ -152,7 +155,11 @@ struct UsagePanelView: View {
                         }
                         .fixedSize(horizontal: false, vertical: true)
                         if model.agentSessionsEnabled && !model.agentSessions.isEmpty {
-                            AgentSessionsCard(sessions: model.agentSessions, theme: theme)
+                            AgentSessionsCard(sessions: model.agentSessions, theme: theme) { session in
+                                withAnimation(.easeOut(duration: 0.2)) {
+                                    model.inspectedSession = session
+                                }
+                            }
                         }
                         if kiwi.configured {
                             VpsCard(monitor: kiwi, theme: theme) {
@@ -192,6 +199,33 @@ struct UsagePanelView: View {
                         withAnimation(.easeOut(duration: 0.2)) { model.showVPS = false }
                     }
                     .transition(.opacity)
+                } else if let session = activeInspectedSession {
+                    SessionDetailView(
+                        session: session,
+                        theme: theme,
+                        loadInspection: { target, completion in
+                            if let loader = model.onInspectSession {
+                                loader(target, completion)
+                            } else {
+                                DispatchQueue.global(qos: .userInitiated).async {
+                                    let res = SessionScanner.inspectFile(
+                                        URL(fileURLWithPath: target.id),
+                                        kind: target.kind,
+                                        fallbackModel: target.model,
+                                        mtime: target.lastModified
+                                    )
+                                    DispatchQueue.main.async { completion(res) }
+                                }
+                            }
+                        },
+                        onBack: {
+                            Log.user("close session detail")
+                            model.onCloseSessionInspection?()
+                            withAnimation(.easeOut(duration: 0.2)) { model.inspectedSession = nil }
+                        }
+                    )
+                    .glassCard(theme)
+                    .transition(.opacity)
                 }
             }
             footer(theme)
@@ -202,6 +236,15 @@ struct UsagePanelView: View {
         .background(theme.backgroundGradient)
     }
 
+    private var activeInspectedSession: AgentSession? {
+        guard let current = model.inspectedSession else { return nil }
+        for root in model.agentSessions {
+            if root.id == current.id { return root }
+            if let child = root.children.first(where: { $0.id == current.id }) { return child }
+        }
+        return current
+    }
+
     private var showGeminiCard: Bool {
         model.gemini.state != "offline"
             || model.gemini.primary.percent != nil
@@ -210,10 +253,10 @@ struct UsagePanelView: View {
             || model.gemini.error != nil
     }
 
-    /// 设置、用量统计、对账单、Nebula、VPS 几页互斥，都盖在主列表上。
+    /// 设置、用量统计、对账单、Nebula、VPS、会话详情几页互斥，都盖在主列表上。
     private var overlayVisible: Bool {
         model.showSettings || model.statsProvider != nil || model.showReceipt
-            || model.showMesh || model.showVPS
+            || model.showMesh || model.showVPS || model.inspectedSession != nil
     }
 
     private func header(_ theme: PanelTheme) -> some View {

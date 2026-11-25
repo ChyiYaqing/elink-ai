@@ -143,7 +143,14 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
                 self.reloadAgentSessions()
             } else {
                 self.model.agentSessions = []
+                self.model.inspectedSession = nil
             }
+        }
+        model.onInspectSession = { [weak self] session, completion in
+            self?.sessionMonitor.inspect(session: session, completion: completion)
+        }
+        model.onCloseSessionInspection = { [weak self] in
+            self?.sessionMonitor.clearInspectionCache()
         }
         model.onSaveClaudeToken = { [weak self] value, completion in
             guard let self else { completion(false); return }
@@ -290,6 +297,7 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
     func popoverDidClose(_ notification: Notification) {
         pollTimer?.invalidate()
         pollTimer = nil
+        model.inspectedSession = nil
         sessionMonitor.reset()
         kiwi.stop()
         if let clickMonitor {

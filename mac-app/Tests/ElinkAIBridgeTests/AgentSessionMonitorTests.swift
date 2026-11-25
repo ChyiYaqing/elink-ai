@@ -704,6 +704,245 @@ final class AgentSessionMonitorTests: XCTestCase {
         XCTAssertEqual(AgentSessionsCard.relativeTime(now.addingTimeInterval(-2 * 86_400), now: now), "2d")
     }
 
+    // MARK: - 会话监控指标与步骤明细
+
+    func testClaudeInspectionExtractsMetricsStepsAndAnomalies() throws {
+        let t0 = Date(timeIntervalSince1970: floor(Date().timeIntervalSince1970) - 300)
+        func at(_ s: Double) -> String { Self.iso.string(from: t0.addingTimeInterval(s)) }
+        try write([
+            #"{"type":"user","message":{"content":"start"},"timestamp":"\#(at(0))"}"#,
+            // 第 1 步：正常高缓存（90% cache hit, 100K context）
+            #"{"type":"assistant","message":{"id":"m1","model":"claude-opus-5","stop_reason":"end_turn","usage":{"input_tokens":5000,"cache_creation_input_tokens":5000,"cache_read_input_tokens":90000,"output_tokens":500},"content":[{"type":"text","text":"ok"}]},"timestamp":"\#(at(5))"}"#,
+            #"{"type":"user","message":{"content":"next"},"timestamp":"\#(at(10))"}"#,
+            // 第 2 步：低缓存（20% < 50% 且 prompt >= 10K）+ 慢响应（35s >= 30s）
+            #"{"type":"assistant","message":{"id":"m2","model":"claude-opus-5","stop_reason":"end_turn","usage":{"input_tokens":80000,"cache_creation_input_tokens":0,"cache_read_input_tokens":20000,"output_tokens":1000},"content":[{"type":"text","text":"slow"}]},"timestamp":"\#(at(45))"}"#,
+            #"{"type":"user","message":{"content":"compact"},"timestamp":"\#(at(50))"}"#,
+            // 第 3 步：上下文压缩（100K -> 40K，下降 60% 且 >= 10K）
+            #"{"type":"assistant","message":{"id":"m3","model":"claude-opus-5","stop_reason":"end_turn","usage":{"input_tokens":4000,"cache_creation_input_tokens":0,"cache_read_input_tokens":36000,"output_tokens":400},"content":[{"type":"text","text":"compacted"}]},"timestamp":"\#(at(54))"}"#,
+        ], to: "-Users-me-myproj/inspect.jsonl", under: claudeRoot)
+
+        let s = scanner()
+        let session = try XCTUnwrap(s.scan(live: [], claudeCwdCounts: [:], pricing: Pricing.builtIn).first)
+        XCTAssertEqual(session.metrics.contextTokens, 40_000)
+        // claude-opus-5 无显式 [1m] 标记时不猜测 200K/1M 上限，防止 >200K 误报 100%
+        XCTAssertNil(session.metrics.contextWindow)
+        XCTAssertNil(session.metrics.contextRatio)
+        XCTAssertEqual(SessionScanner.modelContextWindow(for: "claude-opus-5-5[1m]"), 1_000_000)
+        // cache_read = 90k + 20k + 36k = 146k; prompt = 100k + 100k + 40k = 240k
+        XCTAssertEqual(try XCTUnwrap(session.metrics.cacheHitRate), 146.0 / 240.0, accuracy: 0.001)
+        XCTAssertNotNil(session.metrics.sessionCost)
+        XCTAssertNotNil(AgentSessionsCard.metricsSummaryText(session.metrics))
+
+        // 尾部采样标记时，摘要显式标注为近期样本
+        var partial = session.metrics
+        partial.isPartialWindow = true
+        let partialSummary = try XCTUnwrap(AgentSessionsCard.metricsSummaryText(partial))
+        XCTAssertTrue(partialSummary.contains("recent") || partialSummary.contains("近期"))
+
+        // 定价表变更时缓存必须失效并按新单价重新折算
+        let doubledPrice: [String: ModelPricing] = [
+            "claude-opus-5": ModelPricing(input: 10, output: 50, cacheRead: 1.0, cacheWrite: 12.5),
+        ]
+        let updated = try XCTUnwrap(s.scan(live: [], claudeCwdCounts: [:], pricing: doubledPrice).first)
+        XCTAssertEqual(try XCTUnwrap(updated.metrics.sessionCost),
+                       try XCTUnwrap(session.metrics.sessionCost) * 2.0, accuracy: 0.000_1)
+
+        let inspection = s.inspect(session: session, pricing: Pricing.builtIn)
+        XCTAssertEqual(inspection.totalStepCount, 3)
+        // 倒序展示：最新第 3 步在最前
+        XCTAssertEqual(inspection.steps.map(\.index), [3, 2, 1])
+        XCTAssertEqual(inspection.steps[0].anomalies, [.compaction])
+        XCTAssertEqual(Set(inspection.steps[1].anomalies), Set([.lowCache, .slowResponse]))
+        XCTAssertTrue(inspection.steps[2].anomalies.isEmpty)
+    }
+
+    func testCodexInspectionDeduplicatesPairedRecordsAttributesFirstModelAndDoesNotShowStaleContext() throws {
+        let t0 = Date(timeIntervalSince1970: floor(Date().timeIntervalSince1970) - 200)
+        func at(_ s: Double) -> String { Self.iso.string(from: t0.addingTimeInterval(s)) }
+        // 同一调用先写 token_usage_record 再写 token_count，不能双计；
+        // 模型声明前的开头用量应归属文件首个声明的模型（gpt-6-sol），即使后面切到 gpt-6-astra。
+        try write([
+            #"{"payload":{"id":"r1","cwd":"/Users/me/proj"}}"#,
+            #"{"type":"event_msg","payload":{"type":"user_message","message":"hi"},"timestamp":"\#(at(0))"}"#,
+            #"{"type":"response_item","payload":{"type":"reasoning"},"timestamp":"\#(at(2))"}"#,
+            #"{"type":"token_usage_record","payload":{"usage":{"input_tokens":50000,"cached_input_tokens":40000,"output_tokens":1000,"reasoning_output_tokens":400}},"timestamp":"\#(at(10))"}"#,
+            #"{"type":"event_msg","payload":{"type":"token_count","info":{"model_context_window":258400,"total_token_usage":{"input_tokens":50000,"cached_input_tokens":40000,"output_tokens":1000,"reasoning_output_tokens":400,"total_tokens":51000},"last_token_usage":{"input_tokens":50000,"cached_input_tokens":40000,"output_tokens":1000,"reasoning_output_tokens":400,"total_tokens":51000}}},"timestamp":"\#(at(10))"}"#,
+            #"{"type":"turn_context","payload":{"model":"gpt-6-sol"},"timestamp":"\#(at(11))"}"#,
+            #"{"type":"turn_context","payload":{"model":"gpt-6-astra"},"timestamp":"\#(at(12))"}"#,
+        ], to: "rollout-modern.jsonl", under: codexRoot)
+
+        let s = scanner()
+        let modern = try XCTUnwrap(s.scan(live: [], claudeCwdCounts: [:], pricing: Pricing.builtIn).first)
+        XCTAssertEqual(modern.metrics.contextTokens, 50_000)
+        XCTAssertEqual(modern.metrics.contextWindow, 258_400)
+        XCTAssertEqual(try XCTUnwrap(modern.metrics.cacheHitRate), 0.8, accuracy: 0.001)
+
+        let insp = s.inspect(session: modern, pricing: Pricing.builtIn)
+        // 配对的 token_usage_record + token_count 合并为 1 步而非 2 步
+        XCTAssertEqual(insp.steps.count, 1)
+        XCTAssertEqual(insp.steps[0].model, "gpt-6-sol")
+        XCTAssertEqual(insp.steps[0].reasoningTokens, 400)
+        XCTAssertEqual(insp.steps[0].outputTokens, 600)
+        XCTAssertEqual(try XCTUnwrap(insp.steps[0].durationSeconds), 10, accuracy: 0.01)
+
+        // 若最新一步只有累计用量（缺 last_token_usage），汇总必须为 nil，不能回退显示上一步旧值
+        let staleCtxFile = try write([
+            #"{"payload":{"id":"r2","cwd":"/Users/me/proj","model":"gpt-6-sol"}}"#,
+            #"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":50000,"cached_input_tokens":0,"output_tokens":500,"reasoning_output_tokens":0,"total_tokens":50500},"last_token_usage":{"input_tokens":50000,"cached_input_tokens":0,"output_tokens":500,"reasoning_output_tokens":0,"total_tokens":50500}}},"timestamp":"\#(at(5))"}"#,
+            #"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":120000,"cached_input_tokens":0,"output_tokens":1000,"reasoning_output_tokens":0,"total_tokens":121000}}},"timestamp":"\#(at(15))"}"#,
+        ], to: "rollout-stale-ctx.jsonl", under: codexRoot)
+        let staleInsp = SessionScanner.inspectFile(staleCtxFile, kind: .codex, fallbackModel: "gpt-6-sol",
+                                                   pricing: Pricing.builtIn)
+        XCTAssertEqual(staleInsp.steps.count, 2)
+        XCTAssertNil(staleInsp.steps[0].contextTokens)
+        XCTAssertNil(staleInsp.metrics.contextTokens)
+
+        // 尾部采样（isPartialTail = true）的首条仅含 total_token_usage 时只能作基线、不计入近期步骤
+        let tailLines: [Substring] = [
+            #"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":500000,"cached_input_tokens":0,"output_tokens":10000,"reasoning_output_tokens":0,"total_tokens":510000}}},"timestamp":"\#(at(5))"}"#,
+            #"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":510000,"cached_input_tokens":5000,"output_tokens":10500,"reasoning_output_tokens":0,"total_tokens":520500}}},"timestamp":"\#(at(10))"}"#,
+        ]
+        let tailParsed = SessionScanner.parseCodexSteps(tailLines, pricing: Pricing.builtIn,
+                                                        fallbackModel: "gpt-6-sol", isPartialTail: true)
+        XCTAssertEqual(tailParsed.steps.count, 1)
+        XCTAssertEqual(tailParsed.steps[0].totalTokens, 10_500)
+
+        // 只提供 total_tokens、缺少分类字段的 Codex 日志必须保留步骤与总量
+        let totalOnlyLines: [Substring] = [
+            #"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":12345},"last_token_usage":{"total_tokens":12345}}},"timestamp":"\#(at(5))"}"#,
+        ]
+        let totalOnlyParsed = SessionScanner.parseCodexSteps(totalOnlyLines, pricing: Pricing.builtIn,
+                                                             fallbackModel: "gpt-6-sol")
+        XCTAssertEqual(totalOnlyParsed.steps.count, 1)
+        XCTAssertEqual(totalOnlyParsed.steps[0].totalTokens, 12_345)
+        XCTAssertNil(totalOnlyParsed.steps[0].cost)
+
+        // 先写带分类的 token_usage_record、再写仅含 total_tokens 的 token_count：合并时保留已有分类字段
+        let mixedPairLines: [Substring] = [
+            #"{"type":"turn_context","payload":{"model":"gpt-6-sol"},"timestamp":"\#(at(0))"}"#,
+            #"{"type":"token_usage_record","payload":{"usage":{"input_tokens":50000,"cached_input_tokens":40000,"output_tokens":1000,"reasoning_output_tokens":400}},"timestamp":"\#(at(5))"}"#,
+            #"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":51000},"last_token_usage":{"total_tokens":51000}}},"timestamp":"\#(at(5))"}"#,
+        ]
+        let mixedPair = SessionScanner.parseCodexSteps(mixedPairLines, pricing: Pricing.builtIn,
+                                                       fallbackModel: "gpt-6-sol")
+        XCTAssertEqual(mixedPair.steps.count, 1)
+        XCTAssertEqual(mixedPair.steps[0].cacheReadTokens, 40_000)
+        XCTAssertEqual(mixedPair.steps[0].outputTokens, 600)
+        XCTAssertNotNil(mixedPair.steps[0].cost)
+
+        // 尾部采样中，首条模型声明前的步骤不归给后续切出的新模型
+        let tailSwitchLines: [Substring] = [
+            #"{"type":"token_usage_record","payload":{"usage":{"input_tokens":10000,"cached_input_tokens":0,"output_tokens":500,"reasoning_output_tokens":0}},"timestamp":"\#(at(1))"}"#,
+            #"{"type":"turn_context","payload":{"model":"gpt-6-astra"},"timestamp":"\#(at(2))"}"#,
+        ]
+        let tailSwitched = SessionScanner.parseCodexSteps(tailSwitchLines, pricing: Pricing.builtIn,
+                                                          fallbackModel: "gpt-6-astra", isPartialTail: true)
+        XCTAssertEqual(tailSwitched.steps.first?.model, "")
+        XCTAssertTrue(tailSwitched.unpriced.contains("unknown"))
+    }
+
+    func testGeminiInspectionRetainsRewoundCallsUsageAndUsesActiveBranchContext() throws {
+        let t0 = Date(timeIntervalSince1970: floor(Date().timeIntervalSince1970) - 100)
+        func at(_ s: Double) -> String { Self.iso.string(from: t0.addingTimeInterval(s)) }
+        let file = try write([
+            #"{"sessionId":"sess-rw","projectHash":"h","startTime":"\#(at(0))","kind":"main"}"#,
+            #"{"id":"u1","timestamp":"\#(at(0))","type":"user","content":"first"}"#,
+            #"{"id":"g1","timestamp":"\#(at(5))","type":"gemini","model":"gemini-3-pro-preview","content":"draft","tokens":{"input":10000,"cached":8000,"output":200,"thoughts":100,"tool":0,"total":10300}}"#,
+            // 同 ID 后续替换若缺少 tokens，不能抹掉已消耗用量
+            #"{"$set":{"messages":[{"id":"u1","timestamp":"\#(at(0))","type":"user","content":"first"},{"id":"g1","timestamp":"\#(at(5))","type":"gemini","content":"draft edited"}]}}"#,
+            #"{"id":"u2","timestamp":"\#(at(10))","type":"user","content":"second"}"#,
+            // 缺少 model 字段的调用应计入 unknown 未定价提示
+            #"{"id":"g2","timestamp":"\#(at(15))","type":"gemini","content":"rewound","tokens":{"input":20000,"cached":15000,"output":300,"thoughts":100,"tool":0,"total":20400}}"#,
+            #"{"$rewindTo":"u2"}"#,
+        ], to: "proj/chats/session-rewind.jsonl", under: geminiRoot)
+
+        let insp = SessionScanner.inspectFile(file, kind: .gemini, pricing: Pricing.builtIn)
+        // g1 保留旧用量、g2 虽被回退也保留用量与成本；但当前上下文来自重放后的活跃分支（g1 替换后无 tokens -> nil，或看未替换的 g1）
+        XCTAssertEqual(insp.totalStepCount, 2)
+        XCTAssertEqual(insp.steps.count, 2)
+        XCTAssertGreaterThan(try XCTUnwrap(insp.metrics.sessionCost), 0)
+        XCTAssertTrue(insp.unpricedModels.contains("unknown"))
+
+        // Gemini 上下文上限：仅对已知系列返回，未知变体返回 nil
+        XCTAssertEqual(SessionScanner.modelContextWindow(for: "gemini-1.5-pro"), 2_000_000)
+        XCTAssertEqual(SessionScanner.modelContextWindow(for: "gemini-4-neon-medium"), 1_000_000)
+        XCTAssertNil(SessionScanner.modelContextWindow(for: "gemini-experimental-unknown"))
+
+        // 回退到不同模型分支（gemini-1.5-pro 2M）后，上下文上限取活跃分支模型而非历史步骤（gemini-3-pro 1M）
+        let branchFile = try write([
+            #"{"sessionId":"sess-branch","projectHash":"h","startTime":"\#(at(0))","kind":"main"}"#,
+            #"{"id":"u1","timestamp":"\#(at(0))","type":"user","content":"first"}"#,
+            #"{"id":"g1","timestamp":"\#(at(5))","type":"gemini","model":"gemini-1.5-pro","content":"a","tokens":{"input":800000,"cached":0,"output":100,"thoughts":0,"tool":0,"total":800100}}"#,
+            #"{"id":"u2","timestamp":"\#(at(10))","type":"user","content":"second"}"#,
+            #"{"id":"g2","timestamp":"\#(at(15))","type":"gemini","model":"gemini-3-pro-preview","content":"b","tokens":{"input":100000,"cached":0,"output":100,"thoughts":0,"tool":0,"total":100100}}"#,
+            #"{"$rewindTo":"u2"}"#,
+        ], to: "proj/chats/session-branch.jsonl", under: geminiRoot)
+        let branchInsp = SessionScanner.inspectFile(branchFile, kind: .gemini, pricing: Pricing.builtIn)
+        XCTAssertEqual(branchInsp.metrics.contextTokens, 800_000)
+        XCTAssertEqual(branchInsp.metrics.contextWindow, 2_000_000)
+        XCTAssertEqual(try XCTUnwrap(branchInsp.metrics.contextRatio), 0.4, accuracy: 0.001)
+        // 含未定价模型时列表摘要金额带 "+" 标明为部分估算
+        XCTAssertTrue(branchInsp.metrics.hasUnpricedModels)
+        XCTAssertTrue(try XCTUnwrap(AgentSessionsCard.metricsSummaryText(branchInsp.metrics)).contains("+"))
+
+        // Antigravity 同 step_index 重复写入 DONE 记录应去重保留最后一份，且 id 唯一
+        let dupAgy = SessionScanner.parseGeminiSteps([
+            ["step_index": 1, "type": "PLANNER_RESPONSE", "status": "DONE", "model": "gemini-4-neon-medium",
+             "input_tokens": 1000, "cache_read_tokens": 2000, "output_tokens": 100],
+            ["step_index": 1, "type": "PLANNER_RESPONSE", "status": "DONE", "model": "gemini-4-neon-medium",
+             "input_tokens": 1000, "cache_read_tokens": 4000, "output_tokens": 200],
+        ], antigravity: true, pricing: Pricing.builtIn)
+        XCTAssertEqual(dupAgy.steps.count, 1)
+        XCTAssertEqual(dupAgy.steps[0].cacheReadTokens, 4_000)
+        XCTAssertEqual(dupAgy.steps[0].outputTokens, 200)
+    }
+
+    func testGeminiAndAntigravityInspectionAndUnknownWindowFallback() throws {
+        let t0 = Date(timeIntervalSince1970: floor(Date().timeIntervalSince1970) - 200)
+        func at(_ s: Double) -> String { ISO8601DateFormatter().string(from: t0.addingTimeInterval(s)) }
+        try write([
+            #"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","created_at":"\#(at(0))","content":"hi"}"#,
+            #"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"\#(at(0))","model":"gemini-4-neon-medium","input_tokens":20000,"cache_read_tokens":80000,"output_tokens":500}"#,
+            #"{"step_index":2,"source":"MODEL","type":"GENERIC","created_at":"\#(at(10))","content":"ok"}"#,
+        ], to: "conv-insp/.system_generated/logs/transcript.jsonl", under: antigravityRoot,
+           mtime: t0.addingTimeInterval(10))
+
+        let s = scanner()
+        let agy = try XCTUnwrap(s.scan(live: [], claudeCwdCounts: [:], pricing: Pricing.builtIn).first)
+        XCTAssertEqual(agy.metrics.contextTokens, 100_000)
+        XCTAssertEqual(agy.metrics.contextWindow, 1_000_000)
+        XCTAssertEqual(try XCTUnwrap(agy.metrics.cacheHitRate), 0.8, accuracy: 0.001)
+        XCTAssertNotNil(agy.metrics.sessionCost)
+
+        // 未知模型不猜测上下文上限，UI 展示绝对 token 数而不是假百分比
+        XCTAssertNil(SessionScanner.modelContextWindow(for: "custom-mystery-model"))
+        let unknownMetrics = SessionMetrics(contextTokens: 142_000, contextWindow: nil,
+                                            cacheHitRate: nil, sessionCost: nil, totalTokens: 142_000)
+        XCTAssertEqual(SessionDetailView.contextValueText(unknownMetrics), "\(UsageFormat.tokens(142_000)) ctx")
+    }
+
+    func testInspectionCapsStepsToLatestEightyAndReusesCache() throws {
+        let t0 = Date(timeIntervalSince1970: floor(Date().timeIntervalSince1970) - 200)
+        let ts = Self.iso.string(from: t0)
+        let lines = (1...100).map { i in
+            #"{"type":"assistant","message":{"id":"m\#(i)","model":"claude-opus-5","stop_reason":"end_turn","usage":{"input_tokens":1000,"cache_read_input_tokens":4000,"output_tokens":100},"content":[{"type":"text","text":"ok"}]},"timestamp":"\#(ts)"}"#
+        }
+        let mtime = t0.addingTimeInterval(10)
+        let file = try write(lines, to: "-Users-me-big/sess.jsonl", under: claudeRoot, mtime: mtime)
+        let sess = AgentSession(id: file.path, kind: .claude, title: "big", snippet: "",
+                                model: "opus-5", lastModified: mtime)
+        let s = scanner()
+        let first = s.inspect(session: sess, pricing: Pricing.builtIn)
+        XCTAssertEqual(first.totalStepCount, 100)
+        XCTAssertEqual(first.steps.count, SessionScanner.maxInspectionSteps)
+        XCTAssertEqual(first.steps.first?.index, 100)
+        XCTAssertEqual(first.steps.last?.index, 21)
+
+        // 相同 size 与 mtime 命中缓存
+        let second = s.inspect(session: sess, pricing: Pricing.builtIn)
+        XCTAssertEqual(second, first)
+    }
+
     // MARK: - 子进程超时
 
     private func liveThreadCount() -> Int {
