@@ -95,6 +95,7 @@ protocol PanelPaletteSpec {
 
     var claudeColor: Color { get }
     var codexColor: Color { get }
+    var geminiColor: Color { get }
 
     /// 堆叠条按模型着色的色位，按顺序取用
     var dataPalette: [Color] { get }
@@ -182,6 +183,9 @@ struct WashiPalette: PanelPaletteSpec {
     }
     var codexColor: Color {
         dark ? Color(red: 0.52, green: 0.75, blue: 0.72) : Color(red: 0.24, green: 0.45, blue: 0.44)
+    }
+    var geminiColor: Color {
+        dark ? Color(red: 0.56, green: 0.68, blue: 0.90) : Color(red: 0.25, green: 0.39, blue: 0.64)
     }
 
     /// 八个色位排在一起要互相分得开，因此保留通用色轮的八个色相，只统一降到
@@ -278,6 +282,9 @@ struct VioletPalette: PanelPaletteSpec {
     }
     var codexColor: Color {
         dark ? Color(red: 0.35, green: 0.85, blue: 0.78) : Color(red: 0.18, green: 0.72, blue: 0.68)
+    }
+    var geminiColor: Color {
+        dark ? Color(red: 0.48, green: 0.72, blue: 1.00) : Color(red: 0.24, green: 0.50, blue: 0.92)
     }
 
     var dataPalette: [Color] {
@@ -399,4 +406,5 @@ struct PanelTheme {
 
     static func claudeColor(dark: Bool) -> Color { AppTheme.current.palette(dark: dark).claudeColor }
     static func codexColor(dark: Bool) -> Color { AppTheme.current.palette(dark: dark).codexColor }
+    static func geminiColor(dark: Bool) -> Color { AppTheme.current.palette(dark: dark).geminiColor }
 }

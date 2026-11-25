@@ -295,9 +295,11 @@ private struct SessionStatusIcon: View {
     @State private var bob = false
 
     var body: some View {
-        let art = kind == .claude ? PixelPet.claude : PixelPet.codex
-        let accent = kind == .claude ? PanelTheme.claudeColor(dark: theme.dark)
-                                     : PanelTheme.codexColor(dark: theme.dark)
+        let art: [String] = kind == .claude ? PixelPet.claude
+            : kind == .gemini ? PixelPet.gemini : PixelPet.codex
+        let accent: Color = kind == .claude ? PanelTheme.claudeColor(dark: theme.dark)
+            : kind == .gemini ? PanelTheme.geminiColor(dark: theme.dark)
+            : PanelTheme.codexColor(dark: theme.dark)
         Group {
             if busy {
                 PixelPetView(art: art, color: accent)

@@ -56,6 +56,75 @@ pub fn codex_credentials_from(data: &[u8], now: i64) -> Result<(String, Option<S
     Ok((token, account))
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct GeminiCredentials {
+    pub access_token: Option<String>,
+    pub refresh_token: Option<String>,
+    pub expires_at: Option<i64>,
+}
+
+impl GeminiCredentials {
+    pub fn access_token_usable(&self, now: i64) -> Option<&str> {
+        let token = self.access_token.as_deref().filter(|value| !value.is_empty())?;
+        match self.expires_at {
+            Some(expiry) if expiry - now <= 60 => None,
+            _ => Some(token),
+        }
+    }
+}
+
+/// Gemini CLI OAuth credentials from `GOOGLE_CLOUD_ACCESS_TOKEN` or
+/// `<gemini_home>/oauth_creds.json`. Returns `Ok(None)` when Gemini CLI is
+/// not configured on this host so users without Gemini do not see errors.
+pub fn gemini_credentials(gemini_home: &Path) -> Result<Option<GeminiCredentials>, String> {
+    if let Ok(token) = env::var("GOOGLE_CLOUD_ACCESS_TOKEN") {
+        if !token.is_empty() {
+            return Ok(Some(GeminiCredentials {
+                access_token: Some(token),
+                refresh_token: None,
+                expires_at: None,
+            }));
+        }
+    }
+    let path = gemini_home.join("oauth_creds.json");
+    let data = match fs::read(&path) {
+        Ok(data) => data,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => {
+            return Err("gemini oauth_creds.json unreadable; run gemini to log in".to_string())
+        }
+    };
+    gemini_credentials_from(&data).map(Some)
+}
+
+pub fn gemini_credentials_from(data: &[u8]) -> Result<GeminiCredentials, String> {
+    let json: serde_json::Value = serde_json::from_slice(data)
+        .map_err(|_| "gemini credentials invalid; run gemini to log in".to_string())?;
+    let access_token = json["access_token"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let refresh_token = json["refresh_token"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    if access_token.is_none() && refresh_token.is_none() {
+        return Err("gemini credentials invalid; run gemini to log in".to_string());
+    }
+    let expires_at = json["expiry_date"].as_f64().map(|raw| {
+        if raw > 10_000_000_000.0 {
+            (raw / 1000.0) as i64
+        } else {
+            raw as i64
+        }
+    });
+    Ok(GeminiCredentials {
+        access_token,
+        refresh_token,
+        expires_at,
+    })
+}
+
 /// A token without `exp` counts as usable: not every issuer sets the claim, and
 /// discarding the only credential over a missing field helps no one. 60 s of
 /// slack keeps a request from being spent right on the expiry boundary.

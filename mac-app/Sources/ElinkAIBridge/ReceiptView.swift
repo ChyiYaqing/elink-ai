@@ -121,7 +121,9 @@ private struct ReceiptContent: View, Equatable {
                 ForEach(receipt.clients, id: \.provider) { client in
                     VStack(spacing: 3) {
                         HStack(spacing: 6) {
-                            PixelPetView(art: client.provider == "claude" ? PixelPet.claude : PixelPet.codex,
+                            PixelPetView(art: client.provider == "claude" ? PixelPet.claude
+                                              : client.provider == "gemini" ? PixelPet.gemini
+                                              : PixelPet.codex,
                                          color: ReceiptPaper.ink)
                                 .frame(width: 16, height: 12)
                             Text(client.name.uppercased())

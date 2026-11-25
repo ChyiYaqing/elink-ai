@@ -129,6 +129,7 @@ struct FileRefresh {
 struct FilePaths {
     claude_home: Option<String>,
     codex_home: Option<String>,
+    gemini_home: Option<String>,
     statusline_cache: Option<String>,
     usage_db: Option<String>,
     // Legacy JSON paths are still accepted as one-time import sources.
@@ -145,6 +146,7 @@ pub struct Config {
     pub quota_fetch_s: u64,
     pub claude_home: PathBuf,
     pub codex_home: PathBuf,
+    pub gemini_home: PathBuf,
     pub statusline_cache: PathBuf,
     pub usage_db: PathBuf,
     /// Previous JSON stores. They are read only when the corresponding
@@ -223,6 +225,12 @@ impl Config {
                 .as_deref()
                 .map(expand_tilde)
                 .unwrap_or_else(|| expand_tilde("~/.codex")),
+            gemini_home: file
+                .paths
+                .gemini_home
+                .as_deref()
+                .map(expand_tilde)
+                .unwrap_or_else(|| expand_tilde("~/.gemini")),
             statusline_cache: file
                 .paths
                 .statusline_cache

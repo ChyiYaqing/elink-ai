@@ -94,6 +94,96 @@ pub fn built_in() -> HashMap<String, ModelPricing> {
                 cache_write: 6.25,
             },
         ),
+        (
+            "gemini-2.5-pro",
+            ModelPricing {
+                input: 1.25,
+                output: 10.0,
+                cache_read: 0.125,
+                cache_write: 0.0,
+            },
+        ),
+        (
+            "gemini-2.5-flash",
+            ModelPricing {
+                input: 0.30,
+                output: 2.50,
+                cache_read: 0.03,
+                cache_write: 0.0,
+            },
+        ),
+        (
+            "gemini-2.5-flash-lite",
+            ModelPricing {
+                input: 0.10,
+                output: 0.40,
+                cache_read: 0.01,
+                cache_write: 0.0,
+            },
+        ),
+        (
+            "gemini-3-pro-preview",
+            ModelPricing {
+                input: 2.0,
+                output: 12.0,
+                cache_read: 0.2,
+                cache_write: 0.0,
+            },
+        ),
+        (
+            "gemini-3-flash-preview",
+            ModelPricing {
+                input: 0.5,
+                output: 3.0,
+                cache_read: 0.05,
+                cache_write: 0.0,
+            },
+        ),
+        (
+            "gemini-3.5-flash",
+            ModelPricing {
+                input: 1.50,
+                output: 9.0,
+                cache_read: 0.15,
+                cache_write: 0.0,
+            },
+        ),
+        (
+            "gemini-3.5-flash-lite",
+            ModelPricing {
+                input: 0.10,
+                output: 0.40,
+                cache_read: 0.01,
+                cache_write: 0.0,
+            },
+        ),
+        (
+            "gemini-3.8-flash",
+            ModelPricing {
+                input: 0.75,
+                output: 3.75,
+                cache_read: 0.0375,
+                cache_write: 0.0,
+            },
+        ),
+        (
+            "gemini-4-neon",
+            ModelPricing {
+                input: 3.0,
+                output: 15.0,
+                cache_read: 0.15,
+                cache_write: 0.0,
+            },
+        ),
+        (
+            "gemini-4-argon",
+            ModelPricing {
+                input: 2.0,
+                output: 10.0,
+                cache_read: 0.10,
+                cache_write: 0.0,
+            },
+        ),
     ]
     .into_iter()
     .map(|(model, pricing)| (model.to_string(), pricing))

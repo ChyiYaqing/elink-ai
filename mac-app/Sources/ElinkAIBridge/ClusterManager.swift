@@ -341,13 +341,15 @@ final class ClusterManager: ObservableObject {
         let today = StatusService.dayKey(now)
         let rows = store.clusterUsage(provider: "claude", since: today)
             + store.clusterUsage(provider: "codex", since: today)
+            + store.clusterUsage(provider: "gemini", since: today)
         let live = lock.holding { Array(liveStatuses.values) }
             + [ClusterLiveStatus(
                 nodeID: nodeID,
                 nodeName: nodeName,
                 observedAt: now,
                 claude: local.claude,
-                codex: local.codex
+                codex: local.codex,
+                gemini: local.gemini
             )]
         result.claude = aggregateProvider(
             "claude", rows: rows, statuses: live.map { ($0.observedAt, $0.claude) }, now: now
@@ -355,9 +357,15 @@ final class ClusterManager: ObservableObject {
         result.codex = aggregateProvider(
             "codex", rows: rows, statuses: live.map { ($0.observedAt, $0.codex) }, now: now
         )
+        result.gemini = aggregateProvider(
+            "gemini", rows: rows, statuses: live.compactMap { entry in
+                entry.gemini.map { (entry.observedAt, $0) }
+            }, now: now
+        )
         result.usageFetchedAt = StatusService.latestUsageFetchedAt(
             claude: result.claude.usageFetchedAt,
-            codex: result.codex.usageFetchedAt
+            codex: result.codex.usageFetchedAt,
+            gemini: result.gemini.usageFetchedAt
         )
         let records = store.clusterNodes()
         let online = records.filter { $0.isOnline(at: now) }.count
@@ -475,10 +483,16 @@ final class ClusterManager: ObservableObject {
         let local = localStatusProvider?() ?? BridgeSnapshot()
         let localLive = ClusterLiveStatus(
             nodeID: nodeID, nodeName: nodeName, observedAt: Date(),
-            claude: local.claude, codex: local.codex
+            claude: local.claude, codex: local.codex, gemini: local.gemini
         )
         var knownLive = lock.holding { liveStatuses }
         knownLive[nodeID] = localLive
+        let peerProviders = Set(
+            (request.headers["x-elink-providers"] ?? "")
+                .split(separator: ",")
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+        )
+        let includeGemini = peerProviders.contains("gemini")
         let manifest = ClusterManifest(
             protocolVersion: 2,
             clusterID: currentClusterID ?? "",
@@ -487,7 +501,9 @@ final class ClusterManager: ObservableObject {
             liveStatuses: knownLive.values.filter {
                 Date().timeIntervalSince($0.observedAt) < 7 * 24 * 60 * 60
             }.sorted { $0.nodeID < $1.nodeID },
-            snapshots: store.clusterManifest()
+            snapshots: store.clusterManifest().filter {
+                includeGemini || $0.key.provider != "gemini"
+            }
         )
         return secureResponse(manifest, key: auth.key)
     }
@@ -550,6 +566,7 @@ final class ClusterManager: ObservableObject {
             method: "GET", path: "/v2/cluster/manifest", body: Data(),
             nodeID: nodeID, key: key
         ).forEach { request.setValue($0.value, forHTTPHeaderField: $0.key) }
+        request.setValue("claude,codex,gemini", forHTTPHeaderField: "X-Elink-Providers")
         session.dataTask(with: request) { [weak self] data, response, error in
             guard let self else { completion?(BridgeError.message(tr("同步服务已停止", "Sync service stopped"))); return }
             if let error { completion?(error); return }

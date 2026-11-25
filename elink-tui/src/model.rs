@@ -140,6 +140,8 @@ pub struct Snapshot {
     pub cluster: Option<Cluster>,
     pub claude: ProviderStatus,
     pub codex: ProviderStatus,
+    #[serde(default)]
+    pub gemini: ProviderStatus,
 }
 
 #[derive(Serialize)]
@@ -210,6 +212,7 @@ impl Serialize for Snapshot {
             cluster: &'a Option<Cluster>,
             claude: ClaudeProviderWire<'a>,
             codex: CodexProviderWire<'a>,
+            gemini: CodexProviderWire<'a>,
         }
 
         SnapshotWire {
@@ -230,6 +233,13 @@ impl Serialize for Snapshot {
                 primary_reset_min: self.codex.primary_reset_min,
                 weekly_pct: self.codex.weekly_pct,
                 weekly_reset_min: self.codex.weekly_reset_min,
+            },
+            gemini: CodexProviderWire {
+                provider: (&self.gemini).into(),
+                primary_pct: self.gemini.primary_pct,
+                primary_reset_min: self.gemini.primary_reset_min,
+                weekly_pct: self.gemini.weekly_pct,
+                weekly_reset_min: self.gemini.weekly_reset_min,
             },
         }
         .serialize(serializer)

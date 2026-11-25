@@ -5,6 +5,9 @@ final class UsageFetcher {
     private let cacheStore: UsageStore?
     private var storedClaude = ProviderUsage()
     private var storedCodex = ProviderUsage()
+    private var storedGemini = ProviderUsage()
+    private var geminiAccessTokenCache: (token: String, expiresAt: Date)?
+    private var geminiProjectIDCache: String?
     private var fetching = false
     private var pendingForcedRefresh = false
     private var nextAllowed = Date.distantPast
@@ -17,15 +20,18 @@ final class UsageFetcher {
     private let claudeTokenProvider: () -> Result<String, CredentialError>
     /// 入参是「这轮刷新是否由用户主动触发」，返回是否观察到凭据续上。
     private let claudeRefresher: (Bool) -> Bool
+    private let geminiCredentialsProvider: () -> Result<GeminiCredentials, CredentialError>?
     private let requestHandler: (URLRequest) -> HTTPOutcome?
     var onUpdate: (() -> Void)?
 
     var claude: ProviderUsage { lock.holding { Self.discardingExpiredWindows(storedClaude) } }
     var codex: ProviderUsage { lock.holding { Self.discardingExpiredWindows(storedCodex) } }
+    var gemini: ProviderUsage { lock.holding { Self.discardingExpiredWindows(storedGemini) } }
 
     init(cacheStore: UsageStore? = nil,
          claudeTokenProvider: (() -> Result<String, CredentialError>)? = nil,
          claudeRefresher: ((Bool) -> Bool)? = nil,
+         geminiCredentialsProvider: (() -> Result<GeminiCredentials, CredentialError>?)? = nil,
          requestHandler: ((URLRequest) -> HTTPOutcome?)? = nil) {
         self.cacheStore = cacheStore
         self.claudeTokenProvider = claudeTokenProvider ?? Self.claudeToken
@@ -35,9 +41,11 @@ final class UsageFetcher {
                 credentialIsUsable: { Self.claudeKeychainCredentialIsValid() }
             )
         }
+        self.geminiCredentialsProvider = geminiCredentialsProvider ?? Self.defaultGeminiCredentialsFromDisk
         self.requestHandler = requestHandler ?? Self.request
         storedClaude = cacheStore?.cachedUsage(provider: "claude") ?? ProviderUsage()
         storedCodex = cacheStore?.cachedUsage(provider: "codex") ?? ProviderUsage()
+        storedGemini = cacheStore?.cachedUsage(provider: "gemini") ?? ProviderUsage()
     }
 
     func start() {
@@ -76,23 +84,30 @@ final class UsageFetcher {
             guard let self else { return }
             let claude = self.fetchClaude(userInitiated: force)
             let codex = self.fetchCodex()
+            let gemini = self.fetchGemini()
             if claude.error == nil || claude.primary.percent != nil || claude.weekly.percent != nil {
                 self.cacheStore?.cacheUsage(provider: "claude", usage: claude)
             }
             if codex.error == nil || codex.primary.percent != nil || codex.weekly.percent != nil {
                 self.cacheStore?.cacheUsage(provider: "codex", usage: codex)
             }
+            if gemini.error == nil || gemini.primary.percent != nil || gemini.weekly.percent != nil {
+                self.cacheStore?.cacheUsage(provider: "gemini", usage: gemini)
+            }
             let result = self.lock.holding { () -> (completions: [() -> Void], refreshAgain: Bool) in
                 self.storedClaude = Self.keepLastGood(old: self.storedClaude, new: claude)
                 self.storedCodex = Self.keepLastGood(old: self.storedCodex, new: codex)
-                let rateLimited = claude.error?.contains("429") == true || codex.error?.contains("429") == true
+                self.storedGemini = Self.keepLastGood(old: self.storedGemini, new: gemini)
+                let rateLimited = claude.error?.contains("429") == true
+                    || codex.error?.contains("429") == true
+                    || gemini.error?.contains("429") == true
                 self.nextAllowed = Date().addingTimeInterval(
                     Self.backoffInterval(retryAfter: self.pendingRetryAfter, rateLimited: rateLimited))
                 self.pendingRetryAfter = nil
-                let summary = "usage claude=\(Self.describe(claude)) codex=\(Self.describe(codex))"
+                let summary = "usage claude=\(Self.describe(claude)) codex=\(Self.describe(codex)) gemini=\(Self.describe(gemini))"
                 if summary != self.lastLogSummary {
                     self.lastLogSummary = summary
-                    if claude.error != nil || codex.error != nil {
+                    if claude.error != nil || codex.error != nil || gemini.error != nil {
                         Log.warning(summary, category: "usage")
                     } else {
                         Log.info(summary, category: "usage")
@@ -617,6 +632,9 @@ final class UsageFetcher {
         case missingCodexFile
         case invalidCodexCredentials
         case expiredCodexCredentials
+        case missingGeminiFile
+        case invalidGeminiCredentials
+        case expiredGeminiCredentials
 
         var errorDescription: String? {
             switch self {
@@ -646,8 +664,501 @@ final class UsageFetcher {
             case .expiredCodexCredentials:
                 return tr("Codex 凭据已过期，请运行 codex 重新登录",
                           "Codex credentials expired — run codex to sign in again")
+            case .missingGeminiFile:
+                return tr("未找到 ~/.gemini/oauth_creds.json，请运行 gemini 登录",
+                          "~/.gemini/oauth_creds.json not found — run gemini to sign in")
+            case .invalidGeminiCredentials:
+                return tr("Gemini 凭据格式无效，请运行 gemini 重新登录",
+                          "Invalid Gemini credentials — run gemini to sign in again")
+            case .expiredGeminiCredentials:
+                return tr("Gemini 凭据已过期且自动续期失败，请运行 gemini 重新登录",
+                          "Gemini credentials expired; auto-renew failed — run gemini to sign in again")
             }
         }
+    }
+
+    // MARK: - Gemini Code Assist
+
+    private static let geminiCodeAssistBaseURL =
+        "https://cloudcode-pa.googleapis.com/v1internal"
+
+    /// 运行时解析本机 Gemini CLI 的 OAuth desktop client 配置，绝不在仓库中硬编码
+    /// 第三方 client secret。优先读环境变量，其次读本机已安装的 `@google/gemini-cli`
+    /// bundle；取不到则返回 nil，降级为直接使用现有 `access_token`。
+    private static func geminiOAuthClientConfig() -> (id: String, secret: String)? {
+        let env = ProcessInfo.processInfo.environment
+        if let id = env["GEMINI_OAUTH_CLIENT_ID"], !id.isEmpty,
+           let secret = env["GEMINI_OAUTH_CLIENT_SECRET"], !secret.isEmpty {
+            return (id, secret)
+        }
+        let candidates = [
+            "/opt/homebrew/lib/node_modules/@google/gemini-cli/bundle",
+            "/usr/local/lib/node_modules/@google/gemini-cli/bundle",
+        ]
+        let idRegex = try? NSRegularExpression(pattern: #"OAUTH_CLIENT_ID\s*=\s*"([^"]+)""#)
+        let secretRegex = try? NSRegularExpression(pattern: #"OAUTH_CLIENT_SECRET\s*=\s*"([^"]+)""#)
+        for dir in candidates {
+            guard let files = try? FileManager.default.contentsOfDirectory(atPath: dir) else { continue }
+            for name in files where name.hasPrefix("chunk-") && name.hasSuffix(".js") {
+                let path = (dir as NSString).appendingPathComponent(name)
+                guard let text = try? String(contentsOfFile: path, encoding: .utf8),
+                      text.contains("OAUTH_CLIENT_SECRET") else { continue }
+                let ns = text as NSString
+                let range = NSRange(location: 0, length: ns.length)
+                if let idMatch = idRegex?.firstMatch(in: text, range: range),
+                   let secretMatch = secretRegex?.firstMatch(in: text, range: range),
+                   idMatch.numberOfRanges > 1, secretMatch.numberOfRanges > 1 {
+                    let id = ns.substring(with: idMatch.range(at: 1))
+                    let secret = ns.substring(with: secretMatch.range(at: 1))
+                    if !id.isEmpty && !secret.isEmpty { return (id, secret) }
+                }
+            }
+        }
+        return nil
+    }
+
+    struct GeminiCredentials: Equatable {
+        let accessToken: String?
+        let refreshToken: String?
+        let expiresAt: Date?
+
+        func accessTokenIsValid(at now: Date = Date()) -> Bool {
+            guard let accessToken, !accessToken.isEmpty else { return false }
+            guard let expiresAt else { return true }
+            return expiresAt.timeIntervalSince(now) > 60
+        }
+    }
+
+    static func geminiCredentials(fileData: Data) -> Result<GeminiCredentials, CredentialError> {
+        guard let json = try? JSONSerialization.jsonObject(with: fileData) as? [String: Any] else {
+            return .failure(.invalidGeminiCredentials)
+        }
+        let accessToken = (json["access_token"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        let refreshToken = (json["refresh_token"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        guard accessToken != nil || refreshToken != nil else {
+            return .failure(.invalidGeminiCredentials)
+        }
+        var expiresAt: Date?
+        if let rawExpiry = (json["expiry_date"] as? NSNumber)?.doubleValue {
+            let seconds = rawExpiry > 10_000_000_000 ? rawExpiry / 1000 : rawExpiry
+            expiresAt = Date(timeIntervalSince1970: seconds)
+        }
+        return .success(GeminiCredentials(
+            accessToken: accessToken,
+            refreshToken: refreshToken,
+            expiresAt: expiresAt
+        ))
+    }
+
+    /// 返回 nil 表示本机未安装/未配置 Gemini CLI，调用方按「未配置」静默跳过。
+    private static func defaultGeminiCredentialsFromDisk() -> Result<GeminiCredentials, CredentialError>? {
+        if let envToken = ProcessInfo.processInfo.environment["GOOGLE_CLOUD_ACCESS_TOKEN"],
+           !envToken.isEmpty {
+            return .success(GeminiCredentials(accessToken: envToken, refreshToken: nil, expiresAt: nil))
+        }
+        let file = ("~/.gemini/oauth_creds.json" as NSString).expandingTildeInPath
+        guard let data = FileManager.default.contents(atPath: file) else {
+            return nil
+        }
+        return Self.geminiCredentials(fileData: data)
+    }
+
+    private func resolveGeminiAccessToken(forceRefresh: Bool = false) -> Result<String, CredentialError>? {
+        let now = Date()
+        if !forceRefresh, let cached = geminiAccessTokenCache,
+           cached.expiresAt.timeIntervalSince(now) > 60 {
+            return .success(cached.token)
+        }
+        guard let diskResult = geminiCredentialsProvider() else { return nil }
+        switch diskResult {
+        case let .failure(error):
+            return .failure(error)
+        case let .success(creds):
+            if !forceRefresh, creds.accessTokenIsValid(at: now), let token = creds.accessToken {
+                return .success(token)
+            }
+            guard let refreshToken = creds.refreshToken else {
+                return .failure(.expiredGeminiCredentials)
+            }
+            guard let refreshed = refreshGeminiOAuthToken(refreshToken: refreshToken) else {
+                return .failure(.expiredGeminiCredentials)
+            }
+            geminiAccessTokenCache = refreshed
+            return .success(refreshed.token)
+        }
+    }
+
+    private func refreshGeminiOAuthToken(refreshToken: String) -> (token: String, expiresAt: Date)? {
+        guard let client = Self.geminiOAuthClientConfig() else { return nil }
+        var request = URLRequest(url: URL(string: "https://oauth2.googleapis.com/token")!)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 20
+        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        func formEncode(_ value: String) -> String {
+            var allowed = CharacterSet.alphanumerics
+            allowed.insert(charactersIn: "-._~")
+            return value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
+        }
+        let pairs = [
+            ("client_id", client.id),
+            ("client_secret", client.secret),
+            ("refresh_token", refreshToken),
+            ("grant_type", "refresh_token"),
+        ]
+        let body = pairs.map { "\(formEncode($0.0))=\(formEncode($0.1))" }.joined(separator: "&")
+        request.httpBody = Data(body.utf8)
+        guard let outcome = requestHandler(request), outcome.status == 200,
+              let json = try? JSONSerialization.jsonObject(with: outcome.data) as? [String: Any],
+              let token = json["access_token"] as? String, !token.isEmpty else {
+            return nil
+        }
+        let expiresIn = (json["expires_in"] as? NSNumber)?.doubleValue ?? 3600
+        return (token, Date().addingTimeInterval(expiresIn))
+    }
+
+    private func resolveGeminiProjectID(token: String) -> String? {
+        for key in ["GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_PROJECT_ID"] {
+            if let envProject = ProcessInfo.processInfo.environment[key], !envProject.isEmpty {
+                return envProject
+            }
+        }
+        if let cached = geminiProjectIDCache, !cached.isEmpty {
+            return cached
+        }
+        var request = URLRequest(url: URL(string: "\(Self.geminiCodeAssistBaseURL):loadCodeAssist")!)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 20
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        let body: [String: Any] = [
+            "metadata": [
+                "ideType": "IDE_UNSPECIFIED",
+                "platform": "PLATFORM_UNSPECIFIED",
+                "pluginType": "GEMINI",
+            ]
+        ]
+        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        guard let outcome = requestHandler(request), outcome.status == 200,
+              let json = try? JSONSerialization.jsonObject(with: outcome.data) as? [String: Any] else {
+            return nil
+        }
+        if let project = json["cloudaicompanionProject"] as? String, !project.isEmpty {
+            geminiProjectIDCache = project
+            return project
+        }
+        if let projectObj = json["cloudaicompanionProject"] as? [String: Any],
+           let id = projectObj["id"] as? String, !id.isEmpty {
+            geminiProjectIDCache = id
+            return id
+        }
+        return nil
+    }
+
+    private func fetchGemini() -> ProviderUsage {
+        // 优先读 Antigravity CLI statusLine 写入的本地缓存：官方文档化路径，
+        // 直接包含 gemini-5h / gemini-weekly，且不受旧 Gemini CLI 个人账号 403 限制。
+        if let cached = Self.cachedAntigravityGeminiUsage() {
+            return cached
+        }
+        guard let tokenResult = resolveGeminiAccessToken() else {
+            return ProviderUsage()
+        }
+        var token: String
+        switch tokenResult {
+        case let .success(value):
+            token = value
+        case let .failure(error):
+            return ProviderUsage(error: error.localizedDescription)
+        }
+        let projectID = resolveGeminiProjectID(token: token)
+        var outcome = requestHandler(Self.geminiQuotaRequest(token: token, projectID: projectID))
+        if outcome?.status == 401 {
+            if let retryResult = resolveGeminiAccessToken(forceRefresh: true) {
+                switch retryResult {
+                case let .success(refreshed):
+                    token = refreshed
+                    let retryProjectID = projectID ?? resolveGeminiProjectID(token: token)
+                    outcome = requestHandler(Self.geminiQuotaRequest(token: token, projectID: retryProjectID))
+                case let .failure(error):
+                    return ProviderUsage(error: error.localizedDescription)
+                }
+            }
+        }
+        guard let outcome else {
+            return ProviderUsage(error: tr("Gemini 用量请求失败", "Gemini usage request failed"))
+        }
+        if outcome.status == 401 {
+            return ProviderUsage(error: CredentialError.expiredGeminiCredentials.localizedDescription)
+        }
+        guard outcome.status == 200 else {
+            noteRetryAfter(outcome)
+            return ProviderUsage(
+                error: tr("Gemini 用量 HTTP \(outcome.status)", "Gemini usage HTTP \(outcome.status)")
+            )
+        }
+        guard let json = try? JSONSerialization.jsonObject(with: outcome.data) as? [String: Any] else {
+            return ProviderUsage(error: tr("Gemini 用量响应解析失败", "Failed to parse Gemini usage response"))
+        }
+        return Self.geminiUsage(json, fetchedAt: Date())
+    }
+
+    static var antigravityStatuslinePath: String {
+        ("~/.cache/statusline/antigravity.json" as NSString).expandingTildeInPath
+    }
+
+    static func cachedAntigravityGeminiUsage(
+        path: String = antigravityStatuslinePath,
+        now: Date = Date()
+    ) -> ProviderUsage? {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+              let modified = attrs[.modificationDate] as? Date,
+              modified <= now,
+              let data = FileManager.default.contents(atPath: path),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        let usage = antigravityStatuslineGeminiUsage(json, fetchedAt: modified, now: now)
+        guard usage.primary.percent != nil || usage.weekly.percent != nil else { return nil }
+        let hasReset = usage.primary.resetAt != nil || usage.weekly.resetAt != nil
+        if !hasReset && now.timeIntervalSince(modified) > 6 * 3600 { return nil }
+        return usage
+    }
+
+    /// 解析 Antigravity CLI `statusLine` 管道输出的 JSON：
+    /// `quota` 字典映射 bucket ID（如 `gemini-5h`、`gemini-weekly`）到
+    /// `{ remaining_fraction, reset_time, reset_in_seconds }`。
+    static func antigravityStatuslineGeminiUsage(
+        _ json: [String: Any],
+        fetchedAt: Date = Date(),
+        now: Date = Date()
+    ) -> ProviderUsage {
+        guard let quota = json["quota"] as? [String: Any] else { return ProviderUsage() }
+        var primaryWindows: [UsageWindow] = []
+        var weeklyWindows: [UsageWindow] = []
+        var scopedLimits: [ScopedLimit] = []
+
+        for key in quota.keys.sorted() {
+            let lower = key.lowercased()
+            // 只取 Gemini 自己的 bucket（跳过 3p-5h / 3p-weekly / claude / gpt 等第三方池）
+            guard lower.contains("gemini") else { continue }
+            guard let entry = quota[key] as? [String: Any] else { continue }
+            if entry["disabled"] as? Bool == true { continue }
+            guard let remaining = flexibleDouble(entry["remaining_fraction"])
+                ?? flexibleDouble(entry["remainingFraction"]) else { continue }
+            let clampedRemaining = min(1.0, max(0.0, remaining))
+            let usedPercent = min(100.0, max(0.0, (1.0 - clampedRemaining) * 100.0))
+
+            var resetAt = (entry["reset_time"] as? String).flatMap(Self.isoDate)
+                ?? (entry["resetTime"] as? String).flatMap(Self.isoDate)
+            let resetInSeconds = flexibleDouble(entry["reset_in_seconds"])
+                ?? flexibleDouble(entry["resetInSeconds"])
+            if resetAt == nil, let seconds = resetInSeconds, seconds > 0 {
+                resetAt = fetchedAt.addingTimeInterval(seconds)
+            }
+            let window = UsageWindow(
+                percent: usedPercent,
+                resetMinutes: resetAt.flatMap {
+                    Self.remainingMinutes(untilEpoch: $0.timeIntervalSince1970, now: now)
+                },
+                resetAt: resetAt
+            ).discardingIfExpired(at: now)
+            guard window.percent != nil else { continue }
+
+            let isWeekly: Bool
+            if lower.contains("week") || lower.contains("7d") || lower.contains("seven_day") {
+                isWeekly = true
+            } else if lower.contains("5h") || lower.contains("5_hour") || lower.contains("five_hour") {
+                isWeekly = false
+            } else if let resetAt {
+                isWeekly = resetAt.timeIntervalSince(now) > 26 * 3600
+            } else if let seconds = resetInSeconds {
+                isWeekly = seconds > 26 * 3600
+            } else {
+                isWeekly = false
+            }
+
+            if isWeekly {
+                weeklyWindows.append(window)
+            } else {
+                primaryWindows.append(window)
+            }
+
+            // 特定模型子限额写入 scopedLimits（通用 gemini-5h / gemini-weekly 不重复列出）
+            if lower != "gemini-5h" && lower != "gemini-weekly" {
+                scopedLimits.append(ScopedLimit(id: key, title: key, window: window))
+            }
+        }
+
+        func pickWorst(_ windows: [UsageWindow]) -> UsageWindow {
+            windows.max { lhs, rhs in
+                let lp = lhs.percent ?? -1
+                let rp = rhs.percent ?? -1
+                if lp != rp { return lp < rp }
+                let lr = lhs.resetAt ?? .distantFuture
+                let rr = rhs.resetAt ?? .distantFuture
+                return lr > rr
+            } ?? UsageWindow()
+        }
+
+        return ProviderUsage(
+            primary: pickWorst(primaryWindows),
+            weekly: pickWorst(weeklyWindows),
+            scopedLimits: scopedLimits,
+            fetchedAt: fetchedAt,
+            isCached: false
+        )
+    }
+
+    static func geminiQuotaRequest(token: String, projectID: String?) -> URLRequest {
+        var request = URLRequest(url: URL(string: "\(geminiCodeAssistBaseURL):retrieveUserQuota")!)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 20
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        let body: [String: Any] = projectID.map { ["project": $0] } ?? [:]
+        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        return request
+    }
+
+    /// 解析 Gemini Code Assist `retrieveUserQuota` 响应。
+    ///
+    /// 每个 bucket 携带 `modelId`、`remainingFraction`、`resetTime`，可能还带
+    /// `window`/`duration`/`limitWindowSeconds`。按窗口时长拆成 5 小时（`primary`）
+    /// 与周（`weekly`）两类：显式标了周窗口或 `resetTime - now > 26h` 归入 `weekly`，
+    /// 其余归入 `primary`。多模型（Pro / Flash / Flash Lite）的独立额度写入
+    /// `scopedLimits`，主窗口取最紧张的那个 bucket；缺少的窗口保持 nil，绝不伪造 0%。
+    static func geminiUsage(_ json: [String: Any],
+                            fetchedAt: Date = Date(),
+                            now: Date = Date()) -> ProviderUsage {
+        let rawBuckets = (json["buckets"] as? [[String: Any]])
+            ?? (json["quotas"] as? [[String: Any]])
+            ?? []
+
+        struct ParsedBucket {
+            let groupID: String
+            let title: String
+            let isWeekly: Bool
+            let window: UsageWindow
+        }
+
+        var parsed: [ParsedBucket] = []
+        for bucket in rawBuckets {
+            guard let remaining = flexibleDouble(bucket["remainingFraction"]) else { continue }
+            let clampedRemaining = min(1.0, max(0.0, remaining))
+            let usedPercent = min(100.0, max(0.0, (1.0 - clampedRemaining) * 100.0))
+            let resetAt = (bucket["resetTime"] as? String).flatMap(Self.isoDate)
+            let window = UsageWindow(
+                percent: usedPercent,
+                resetMinutes: resetAt.flatMap {
+                    Self.remainingMinutes(untilEpoch: $0.timeIntervalSince1970, now: now)
+                },
+                resetAt: resetAt
+            ).discardingIfExpired(at: now)
+            guard window.percent != nil else { continue }
+
+            let modelID = ((bucket["modelId"] as? String) ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let isWeekly = isGeminiWeeklyBucket(bucket, resetAt: resetAt, now: now)
+            let (groupID, title) = geminiTierGroup(modelID: modelID)
+            parsed.append(ParsedBucket(
+                groupID: groupID,
+                title: title,
+                isWeekly: isWeekly,
+                window: window
+            ))
+        }
+
+        func pickWorst(_ windows: [UsageWindow]) -> UsageWindow {
+            windows.max { lhs, rhs in
+                let lp = lhs.percent ?? -1
+                let rp = rhs.percent ?? -1
+                if lp != rp { return lp < rp }
+                let lr = lhs.resetAt ?? .distantFuture
+                let rr = rhs.resetAt ?? .distantFuture
+                return lr > rr
+            } ?? UsageWindow()
+        }
+
+        let primary = pickWorst(parsed.filter { !$0.isWeekly }.map(\.window))
+        let weekly = pickWorst(parsed.filter { $0.isWeekly }.map(\.window))
+
+        // 按模型分层聚合，保留最紧张的窗口作为 scopedLimits
+        var grouped: [String: (title: String, isWeekly: Bool, window: UsageWindow)] = [:]
+        var order: [String] = []
+        for item in parsed where !item.groupID.isEmpty {
+            let key = "\(item.groupID):\(item.isWeekly ? "w" : "p")"
+            if let existing = grouped[key] {
+                if (item.window.percent ?? -1) > (existing.window.percent ?? -1) {
+                    grouped[key] = (item.title, item.isWeekly, item.window)
+                }
+            } else {
+                order.append(key)
+                grouped[key] = (item.title, item.isWeekly, item.window)
+            }
+        }
+        var scopedLimits: [ScopedLimit] = []
+        if order.count > 1 {
+            for key in order {
+                guard let entry = grouped[key] else { continue }
+                let suffix = entry.isWeekly ? " weekly" : ""
+                scopedLimits.append(ScopedLimit(
+                    id: key,
+                    title: entry.title + suffix,
+                    window: entry.window
+                ))
+            }
+        }
+
+        return ProviderUsage(
+            primary: primary,
+            weekly: weekly,
+            scopedLimits: scopedLimits,
+            fetchedAt: fetchedAt
+        )
+    }
+
+    private static func isGeminiWeeklyBucket(_ bucket: [String: Any],
+                                             resetAt: Date?,
+                                             now: Date) -> Bool {
+        if let seconds = flexibleDouble(bucket["limitWindowSeconds"])
+            ?? flexibleDouble(bucket["limit_window_seconds"])
+            ?? flexibleDouble(bucket["windowSeconds"]) {
+            return seconds > 24 * 3600
+        }
+        for key in ["window", "duration", "quotaWindow", "windowType", "period"] {
+            if let text = (bucket[key] as? String)?.lowercased() {
+                if text.contains("week") || text.contains("7d") || text.contains("seven_day")
+                    || text.contains("168h") {
+                    return true
+                }
+                if text.contains("5h") || text.contains("5_hour") || text.contains("five_hour")
+                    || text.contains("daily") || text.contains("24h") {
+                    return false
+                }
+            }
+        }
+        if let resetAt {
+            return resetAt.timeIntervalSince(now) > 26 * 3600
+        }
+        return false
+    }
+
+    private static func geminiTierGroup(modelID: String) -> (id: String, title: String) {
+        let lower = modelID.lowercased()
+        if lower.isEmpty { return ("", "") }
+        if lower.contains("flash-lite") || lower.contains("flash_lite") {
+            return ("flash-lite", "Flash Lite")
+        }
+        if lower.contains("flash") {
+            return ("flash", "Flash")
+        }
+        if lower.contains("pro") {
+            return ("pro", "Pro")
+        }
+        let cleaned = modelID.hasPrefix("gemini-") ? String(modelID.dropFirst("gemini-".count)) : modelID
+        return (lower, cleaned)
     }
 
     private static func claudeToken() -> Result<String, CredentialError> {

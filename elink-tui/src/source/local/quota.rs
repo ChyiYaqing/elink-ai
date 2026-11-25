@@ -8,6 +8,63 @@ use super::creds;
 use crate::util::epoch_now;
 
 const WEEKLY_WINDOW_SECONDS: i64 = 6 * 24 * 60 * 60;
+const GEMINI_WEEKLY_THRESHOLD_SECONDS: i64 = 26 * 60 * 60;
+const GEMINI_CODE_ASSIST_BASE_URL: &str = "https://cloudcode-pa.googleapis.com/v1internal";
+
+/// Resolves the Gemini CLI desktop OAuth client credentials at runtime from
+/// environment variables or the locally installed `@google/gemini-cli` bundle
+/// so no third-party client secret is ever committed to the repository.
+fn gemini_oauth_client_config() -> Option<(String, String)> {
+    if let (Ok(id), Ok(secret)) = (
+        std::env::var("GEMINI_OAUTH_CLIENT_ID"),
+        std::env::var("GEMINI_OAUTH_CLIENT_SECRET"),
+    ) {
+        if !id.is_empty() && !secret.is_empty() {
+            return Some((id, secret));
+        }
+    }
+    let dirs = [
+        "/opt/homebrew/lib/node_modules/@google/gemini-cli/bundle",
+        "/usr/local/lib/node_modules/@google/gemini-cli/bundle",
+        "/usr/lib/node_modules/@google/gemini-cli/bundle",
+    ];
+    for dir in dirs {
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !name.starts_with("chunk-") || !name.ends_with(".js") {
+                continue;
+            }
+            let Ok(text) = fs::read_to_string(entry.path()) else {
+                continue;
+            };
+            if !text.contains("OAUTH_CLIENT_SECRET") {
+                continue;
+            }
+            if let (Some(id), Some(secret)) = (
+                extract_js_string_const(&text, "OAUTH_CLIENT_ID"),
+                extract_js_string_const(&text, "OAUTH_CLIENT_SECRET"),
+            ) {
+                return Some((id, secret));
+            }
+        }
+    }
+    None
+}
+
+fn extract_js_string_const(text: &str, name: &str) -> Option<String> {
+    let idx = text.find(name)?;
+    let rest = &text[idx + name.len()..];
+    let eq = rest.find('=')?;
+    let after_eq = rest[eq + 1..].trim_start();
+    let after_quote = after_eq.strip_prefix('"')?;
+    let end = after_quote.find('"')?;
+    let value = &after_quote[..end];
+    (!value.is_empty()).then(|| value.to_string())
+}
 const STATUSLINE_MAX_AGE_SECONDS: i64 = 6 * 60 * 60;
 /// Fallback when the installed Claude Code version cannot be resolved: a
 /// slightly stale version is harmless, a missing User-Agent is not.
@@ -148,6 +205,264 @@ pub fn codex_usage(json: &Value, fetched_at: i64, now: i64) -> ProviderUsage {
         scoped_limits: codex_scoped_limits(json, now),
         extra_usage: codex_extra_usage(json),
         credit_balance: codex_credit_balance(json),
+        fetched_at: Some(fetched_at),
+        ..ProviderUsage::default()
+    }
+}
+
+/// Parses Gemini Code Assist `retrieveUserQuota` buckets into 5-hour (`primary`),
+/// weekly (`weekly`), and per-tier `scoped_limits`. Missing windows stay `None`,
+/// never zero.
+pub fn gemini_usage(json: &Value, fetched_at: i64, now: i64) -> ProviderUsage {
+    let raw_buckets = json["buckets"]
+        .as_array()
+        .or_else(|| json["quotas"].as_array())
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+
+    struct ParsedBucket {
+        group_id: String,
+        title: String,
+        is_weekly: bool,
+        window: UsageWindow,
+    }
+
+    let mut parsed = Vec::new();
+    for bucket in raw_buckets {
+        let Some(remaining) = flexible_f64(&bucket["remainingFraction"]) else {
+            continue;
+        };
+        let used_percent = ((1.0 - remaining.clamp(0.0, 1.0)) * 100.0).clamp(0.0, 100.0);
+        let reset_at = bucket["resetTime"].as_str().and_then(parse_iso_epoch);
+        let window = UsageWindow {
+            percent: Some(used_percent),
+            reset_at,
+        }
+        .discard_if_expired(now);
+        if window.percent.is_none() {
+            continue;
+        }
+        let model_id = bucket["modelId"].as_str().unwrap_or("").trim();
+        let is_weekly = is_gemini_weekly_bucket(bucket, reset_at, now);
+        let (group_id, title) = gemini_tier_group(model_id);
+        parsed.push(ParsedBucket {
+            group_id,
+            title,
+            is_weekly,
+            window,
+        });
+    }
+
+    let pick_worst = |weekly: bool| -> UsageWindow {
+        parsed
+            .iter()
+            .filter(|item| item.is_weekly == weekly)
+            .map(|item| item.window)
+            .max_by(|lhs, rhs| {
+                let lp = lhs.percent.unwrap_or(-1.0);
+                let rp = rhs.percent.unwrap_or(-1.0);
+                lp.total_cmp(&rp).then_with(|| {
+                    let lr = lhs.reset_at.unwrap_or(i64::MAX);
+                    let rr = rhs.reset_at.unwrap_or(i64::MAX);
+                    rr.cmp(&lr)
+                })
+            })
+            .unwrap_or_default()
+    };
+
+    let primary = pick_worst(false);
+    let weekly = pick_worst(true);
+
+    let mut grouped: std::collections::HashMap<String, (String, bool, UsageWindow)> =
+        std::collections::HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+    for item in &parsed {
+        if item.group_id.is_empty() {
+            continue;
+        }
+        let key = format!("{}:{}", item.group_id, if item.is_weekly { "w" } else { "p" });
+        match grouped.get_mut(&key) {
+            Some(existing) => {
+                if item.window.percent.unwrap_or(-1.0) > existing.2.percent.unwrap_or(-1.0) {
+                    *existing = (item.title.clone(), item.is_weekly, item.window);
+                }
+            }
+            None => {
+                order.push(key.clone());
+                grouped.insert(key, (item.title.clone(), item.is_weekly, item.window));
+            }
+        }
+    }
+    let mut scoped_limits = Vec::new();
+    if order.len() > 1 {
+        for key in order {
+            if let Some((title, is_weekly, window)) = grouped.get(&key) {
+                let suffix = if *is_weekly { " weekly" } else { "" };
+                scoped_limits.push(ScopedLimit {
+                    id: key,
+                    title: format!("{title}{suffix}"),
+                    window: *window,
+                });
+            }
+        }
+    }
+
+    ProviderUsage {
+        primary,
+        weekly,
+        scoped_limits,
+        fetched_at: Some(fetched_at),
+        ..ProviderUsage::default()
+    }
+}
+
+fn is_gemini_weekly_bucket(bucket: &Value, reset_at: Option<i64>, now: i64) -> bool {
+    if let Some(seconds) = flexible_f64(&bucket["limitWindowSeconds"])
+        .or_else(|| flexible_f64(&bucket["limit_window_seconds"]))
+        .or_else(|| flexible_f64(&bucket["windowSeconds"]))
+    {
+        return seconds > 24.0 * 3600.0;
+    }
+    for key in ["window", "duration", "quotaWindow", "windowType", "period"] {
+        if let Some(text) = bucket[key].as_str() {
+            let lower = text.to_lowercase();
+            if lower.contains("week")
+                || lower.contains("7d")
+                || lower.contains("seven_day")
+                || lower.contains("168h")
+            {
+                return true;
+            }
+            if lower.contains("5h")
+                || lower.contains("5_hour")
+                || lower.contains("five_hour")
+                || lower.contains("daily")
+                || lower.contains("24h")
+            {
+                return false;
+            }
+        }
+    }
+    reset_at.is_some_and(|reset| reset - now > GEMINI_WEEKLY_THRESHOLD_SECONDS)
+}
+
+fn gemini_tier_group(model_id: &str) -> (String, String) {
+    let lower = model_id.to_lowercase();
+    if lower.is_empty() {
+        return (String::new(), String::new());
+    }
+    if lower.contains("flash-lite") || lower.contains("flash_lite") {
+        return ("flash-lite".to_string(), "Flash Lite".to_string());
+    }
+    if lower.contains("flash") {
+        return ("flash".to_string(), "Flash".to_string());
+    }
+    if lower.contains("pro") {
+        return ("pro".to_string(), "Pro".to_string());
+    }
+    let cleaned = model_id.strip_prefix("gemini-").unwrap_or(model_id);
+    (lower, cleaned.to_string())
+}
+
+/// Parses Antigravity CLI `statusLine` JSON (`quota` map keyed by bucket ID
+/// such as `gemini-5h` and `gemini-weekly`).
+pub fn antigravity_statusline_gemini_usage(
+    json: &Value,
+    fetched_at: i64,
+    now: i64,
+) -> ProviderUsage {
+    let Some(quota) = json["quota"].as_object() else {
+        return ProviderUsage::default();
+    };
+    let mut keys: Vec<&String> = quota.keys().collect();
+    keys.sort();
+    let mut primary_windows = Vec::new();
+    let mut weekly_windows = Vec::new();
+    let mut scoped_limits = Vec::new();
+
+    for key in keys {
+        let lower = key.to_lowercase();
+        if !lower.contains("gemini") {
+            continue;
+        }
+        let entry = &quota[key];
+        if entry["disabled"].as_bool() == Some(true) {
+            continue;
+        }
+        let Some(remaining) = flexible_f64(&entry["remaining_fraction"])
+            .or_else(|| flexible_f64(&entry["remainingFraction"]))
+        else {
+            continue;
+        };
+        let used_percent = ((1.0 - remaining.clamp(0.0, 1.0)) * 100.0).clamp(0.0, 100.0);
+        let reset_in_seconds = flexible_f64(&entry["reset_in_seconds"])
+            .or_else(|| flexible_f64(&entry["resetInSeconds"]));
+        let reset_at = entry["reset_time"]
+            .as_str()
+            .or_else(|| entry["resetTime"].as_str())
+            .and_then(parse_iso_epoch)
+            .or_else(|| {
+                reset_in_seconds
+                    .filter(|s| *s > 0.0)
+                    .map(|s| fetched_at + s as i64)
+            });
+        let window = UsageWindow {
+            percent: Some(used_percent),
+            reset_at,
+        }
+        .discard_if_expired(now);
+        if window.percent.is_none() {
+            continue;
+        }
+        let is_weekly = if lower.contains("week")
+            || lower.contains("7d")
+            || lower.contains("seven_day")
+        {
+            true
+        } else if lower.contains("5h")
+            || lower.contains("5_hour")
+            || lower.contains("five_hour")
+        {
+            false
+        } else if let Some(reset) = reset_at {
+            reset - now > GEMINI_WEEKLY_THRESHOLD_SECONDS
+        } else {
+            reset_in_seconds.is_some_and(|s| s > GEMINI_WEEKLY_THRESHOLD_SECONDS as f64)
+        };
+        if is_weekly {
+            weekly_windows.push(window);
+        } else {
+            primary_windows.push(window);
+        }
+        if lower != "gemini-5h" && lower != "gemini-weekly" {
+            scoped_limits.push(ScopedLimit {
+                id: key.clone(),
+                title: key.clone(),
+                window,
+            });
+        }
+    }
+
+    let pick_worst = |windows: &[UsageWindow]| -> UsageWindow {
+        windows
+            .iter()
+            .copied()
+            .max_by(|lhs, rhs| {
+                let lp = lhs.percent.unwrap_or(-1.0);
+                let rp = rhs.percent.unwrap_or(-1.0);
+                lp.total_cmp(&rp).then_with(|| {
+                    let lr = lhs.reset_at.unwrap_or(i64::MAX);
+                    let rr = rhs.reset_at.unwrap_or(i64::MAX);
+                    rr.cmp(&lr)
+                })
+            })
+            .unwrap_or_default()
+    };
+
+    ProviderUsage {
+        primary: pick_worst(&primary_windows),
+        weekly: pick_worst(&weekly_windows),
+        scoped_limits,
         fetched_at: Some(fetched_at),
         ..ProviderUsage::default()
     }
@@ -596,6 +911,9 @@ pub fn keep_last_good(old: &ProviderUsage, new: ProviderUsage, now: i64) -> Prov
 struct QuotaState {
     stored_claude: ProviderUsage,
     stored_codex: ProviderUsage,
+    stored_gemini: ProviderUsage,
+    gemini_access_token: Option<(String, i64)>,
+    gemini_project_id: Option<String>,
     last_timer: i64,
     next_allowed: i64,
     /// Longest `Retry-After` the servers asked for this round; read and
@@ -612,6 +930,7 @@ pub struct QuotaFetcher {
     agent: ureq::Agent,
     claude_home: PathBuf,
     codex_home: PathBuf,
+    gemini_home: PathBuf,
     statusline_cache: PathBuf,
     quota_fetch_s: u64,
     store: super::store::QuotaStore,
@@ -622,6 +941,7 @@ impl QuotaFetcher {
     pub fn new(
         claude_home: PathBuf,
         codex_home: PathBuf,
+        gemini_home: PathBuf,
         statusline_cache: PathBuf,
         quota_fetch_s: u64,
         store: super::store::QuotaStore,
@@ -630,6 +950,7 @@ impl QuotaFetcher {
         let state = QuotaState {
             stored_claude: store.load("claude", now).unwrap_or_default(),
             stored_codex: store.load("codex", now).unwrap_or_default(),
+            stored_gemini: store.load("gemini", now).unwrap_or_default(),
             ..QuotaState::default()
         };
         Self {
@@ -638,6 +959,7 @@ impl QuotaFetcher {
                 .build(),
             claude_home,
             codex_home,
+            gemini_home,
             statusline_cache,
             quota_fetch_s,
             store,
@@ -657,6 +979,10 @@ impl QuotaFetcher {
 
     pub fn codex(&self, now: i64) -> ProviderUsage {
         self.state().stored_codex.discarding_expired(now)
+    }
+
+    pub fn gemini(&self, now: i64) -> ProviderUsage {
+        self.state().stored_gemini.discarding_expired(now)
     }
 
     /// True when the 120 s timer elapsed and the 60 s floor (300 s after
@@ -690,16 +1016,19 @@ impl QuotaFetcher {
         let now = epoch_now();
         let claude = self.fetch_claude(now);
         let codex = self.fetch_codex(now);
-        let rate_limited = [&claude.error, &codex.error]
+        let gemini = self.fetch_gemini(now);
+        let rate_limited = [&claude.error, &codex.error, &gemini.error]
             .into_iter()
             .flatten()
             .any(|error| error.contains("429"));
         self.store.save("claude", &claude);
         self.store.save("codex", &codex);
+        self.store.save("gemini", &gemini);
         let mut state = self.state();
         state.next_allowed = now + backoff_interval(state.pending_retry_after.take(), rate_limited);
         state.stored_claude = keep_last_good(&state.stored_claude, claude, now);
         state.stored_codex = keep_last_good(&state.stored_codex, codex, now);
+        state.stored_gemini = keep_last_good(&state.stored_gemini, gemini, now);
         state.fetching = false;
     }
 
@@ -821,6 +1150,176 @@ impl QuotaFetcher {
             return ProviderUsage::with_error("codex usage response parse failed");
         }
         codex_usage(&json, now, now)
+    }
+
+    fn resolve_gemini_token(&self, now: i64, force_refresh: bool) -> Result<Option<String>, String> {
+        if !force_refresh {
+            if let Some((token, expires_at)) = self.state().gemini_access_token.clone() {
+                if expires_at - now > 60 {
+                    return Ok(Some(token));
+                }
+            }
+        }
+        let Some(creds) = creds::gemini_credentials(&self.gemini_home)? else {
+            return Ok(None);
+        };
+        if !force_refresh {
+            if let Some(token) = creds.access_token_usable(now) {
+                return Ok(Some(token.to_string()));
+            }
+        }
+        let refresh_token = creds
+            .refresh_token
+            .ok_or_else(|| "gemini credentials expired; run gemini to log in".to_string())?;
+        let (client_id, client_secret) = gemini_oauth_client_config()
+            .ok_or_else(|| "gemini credentials expired; run gemini to log in".to_string())?;
+        let response = self
+            .agent
+            .post("https://oauth2.googleapis.com/token")
+            .send_form(&[
+                ("client_id", client_id.as_str()),
+                ("client_secret", client_secret.as_str()),
+                ("refresh_token", refresh_token.as_str()),
+                ("grant_type", "refresh_token"),
+            ])
+            .map_err(|_| "gemini credentials expired; auto-renew failed".to_string())?;
+        let json: Value = response
+            .into_json()
+            .map_err(|_| "gemini credentials expired; auto-renew failed".to_string())?;
+        let token = json["access_token"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "gemini credentials expired; auto-renew failed".to_string())?
+            .to_string();
+        let expires_in = json["expires_in"].as_i64().unwrap_or(3600);
+        self.state().gemini_access_token = Some((token.clone(), now + expires_in));
+        Ok(Some(token))
+    }
+
+    fn resolve_gemini_project_id(&self, token: &str) -> Option<String> {
+        for key in ["GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_PROJECT_ID"] {
+            if let Ok(value) = std::env::var(key) {
+                if !value.is_empty() {
+                    return Some(value);
+                }
+            }
+        }
+        if let Some(cached) = self.state().gemini_project_id.clone() {
+            if !cached.is_empty() {
+                return Some(cached);
+            }
+        }
+        let url = format!("{GEMINI_CODE_ASSIST_BASE_URL}:loadCodeAssist");
+        let body = serde_json::json!({
+            "metadata": {
+                "ideType": "IDE_UNSPECIFIED",
+                "platform": "PLATFORM_UNSPECIFIED",
+                "pluginType": "GEMINI"
+            }
+        });
+        let response = self
+            .agent
+            .post(&url)
+            .set("Authorization", &format!("Bearer {token}"))
+            .set("Accept", "application/json")
+            .send_json(body)
+            .ok()?;
+        let json: Value = response.into_json().ok()?;
+        let project = json["cloudaicompanionProject"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                json["cloudaicompanionProject"]["id"]
+                    .as_str()
+                    .filter(|value| !value.is_empty())
+            })?
+            .to_string();
+        self.state().gemini_project_id = Some(project.clone());
+        Some(project)
+    }
+
+    fn cached_antigravity_gemini_usage(&self, now: i64) -> Option<ProviderUsage> {
+        let path = self
+            .statusline_cache
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("antigravity.json");
+        let metadata = fs::metadata(&path).ok()?;
+        let modified = metadata
+            .modified()
+            .ok()?
+            .duration_since(UNIX_EPOCH)
+            .ok()?
+            .as_secs() as i64;
+        if modified > now {
+            return None;
+        }
+        let data = fs::read(&path).ok()?;
+        let json: Value = serde_json::from_slice(&data).ok()?;
+        let usage = antigravity_statusline_gemini_usage(&json, modified, now);
+        if usage.primary.percent.is_none() && usage.weekly.percent.is_none() {
+            return None;
+        }
+        let has_reset = usage.primary.reset_at.is_some() || usage.weekly.reset_at.is_some();
+        if !has_reset && now - modified > STATUSLINE_MAX_AGE_SECONDS {
+            return None;
+        }
+        Some(usage)
+    }
+
+    fn fetch_gemini(&self, now: i64) -> ProviderUsage {
+        if let Some(cached) = self.cached_antigravity_gemini_usage(now) {
+            return cached;
+        }
+        let mut token = match self.resolve_gemini_token(now, false) {
+            Ok(Some(token)) => token,
+            Ok(None) => return ProviderUsage::default(),
+            Err(error) => return ProviderUsage::with_error(error),
+        };
+        let mut project_id = self.resolve_gemini_project_id(&token);
+        let url = format!("{GEMINI_CODE_ASSIST_BASE_URL}:retrieveUserQuota");
+        let call = |token: &str, project_id: Option<&str>| {
+            let body = match project_id {
+                Some(project) => serde_json::json!({ "project": project }),
+                None => serde_json::json!({}),
+            };
+            self.agent
+                .post(&url)
+                .set("Authorization", &format!("Bearer {token}"))
+                .set("Accept", "application/json")
+                .send_json(body)
+        };
+        let mut response = call(&token, project_id.as_deref());
+        if matches!(response, Err(ureq::Error::Status(401, _))) {
+            match self.resolve_gemini_token(now, true) {
+                Ok(Some(refreshed)) => {
+                    token = refreshed;
+                    if project_id.is_none() {
+                        project_id = self.resolve_gemini_project_id(&token);
+                    }
+                    response = call(&token, project_id.as_deref());
+                }
+                Ok(None) => return ProviderUsage::default(),
+                Err(error) => return ProviderUsage::with_error(error),
+            }
+        }
+        let json: Value = match response {
+            Ok(response) => match response.into_json() {
+                Ok(json) => json,
+                Err(_) => return ProviderUsage::with_error("gemini usage response parse failed"),
+            },
+            Err(ureq::Error::Status(401, _)) => {
+                return ProviderUsage::with_error("gemini credentials expired; run gemini to log in")
+            }
+            Err(ureq::Error::Status(code, response)) => {
+                self.note_retry_after(retry_after_seconds(response.header("Retry-After"), now));
+                return ProviderUsage::with_error(format!("gemini usage HTTP {code}"));
+            }
+            Err(ureq::Error::Transport(_)) => {
+                return ProviderUsage::with_error("gemini usage request failed")
+            }
+        };
+        gemini_usage(&json, now, now)
     }
 }
 
@@ -1283,6 +1782,7 @@ mod tests {
             PathBuf::new(),
             PathBuf::new(),
             PathBuf::new(),
+            PathBuf::new(),
             u64::MAX,
             super::super::store::QuotaStore::new(PathBuf::new()),
         );
@@ -1297,6 +1797,7 @@ mod tests {
             PathBuf::new(),
             PathBuf::new(),
             PathBuf::new(),
+            PathBuf::new(),
             120,
             super::super::store::QuotaStore::new(PathBuf::new()),
         );
@@ -1305,5 +1806,58 @@ mod tests {
 
         assert!(!fetcher.due(false));
         assert!(!fetcher.due(true));
+    }
+
+    #[test]
+    fn parses_gemini_five_hour_and_weekly_buckets_and_scoped_limits() {
+        // NOW = 1_783_933_200 = 2026-07-13T09:00:00Z
+        let json = json!({
+            "buckets": [
+                {
+                    "modelId": "gemini-2.5-pro",
+                    "remainingFraction": 0.6,
+                    "resetTime": "2026-07-13T12:00:00Z",
+                    "window": "5h"
+                },
+                {
+                    "modelId": "gemini-2.5-flash",
+                    "remainingFraction": 0.85,
+                    "resetTime": "2026-07-13T13:00:00Z",
+                    "window": "5h"
+                },
+                {
+                    "modelId": "gemini-2.5-pro",
+                    "remainingFraction": 0.3,
+                    "resetTime": "2026-07-18T09:00:00Z",
+                    "window": "weekly"
+                }
+            ]
+        });
+        let usage = gemini_usage(&json, NOW, NOW);
+        assert!((usage.primary.percent.unwrap() - 40.0).abs() < 1e-6);
+        assert_eq!(usage.primary.reset_minutes(NOW), Some(180));
+        assert!((usage.weekly.percent.unwrap() - 70.0).abs() < 1e-6);
+        assert_eq!(usage.weekly.reset_minutes(NOW), Some(5 * 24 * 60));
+        assert_eq!(usage.scoped_limits.len(), 3);
+        assert_eq!(usage.scoped_limits[0].title, "Pro");
+        assert_eq!(usage.scoped_limits[1].title, "Flash");
+        assert_eq!(usage.scoped_limits[2].title, "Pro weekly");
+    }
+
+    #[test]
+    fn gemini_usage_keeps_missing_weekly_window_as_none() {
+        let json = json!({
+            "buckets": [
+                {
+                    "modelId": "gemini-2.5-pro",
+                    "remainingFraction": 0.75,
+                    "resetTime": "2026-07-13T14:00:00Z"
+                }
+            ]
+        });
+        let usage = gemini_usage(&json, NOW, NOW);
+        assert!((usage.primary.percent.unwrap() - 25.0).abs() < 1e-6);
+        assert_eq!(usage.weekly.percent, None);
+        assert!(usage.scoped_limits.is_empty());
     }
 }

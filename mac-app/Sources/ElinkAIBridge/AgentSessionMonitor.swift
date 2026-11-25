@@ -6,7 +6,7 @@ import Foundation
 
 // MARK: - 模型
 
-enum AgentKind: String { case claude = "Claude Code", codex = "Codex" }
+enum AgentKind: String { case claude = "Claude Code", codex = "Codex", gemini = "Gemini CLI" }
 
 private func sanitizedClaudeProjectPath(_ path: String) -> String {
     path.replacingOccurrences(of: "[^a-zA-Z0-9]", with: "-", options: .regularExpression)
@@ -74,6 +74,7 @@ final class ProcessDiscovery {
             guard tty != "??", !command.isEmpty else { continue }  // 必须挂在终端上
             if isClaude(command) { candidates.append((pid, tty, .claude)) }
             else if isCodex(command) { candidates.append((pid, tty, .codex)) }
+            else if isGemini(command) { candidates.append((pid, tty, .gemini)) }
         }
         let chunks = lsofChunks(pids: candidates.map(\.pid))
         var out: [Snapshot] = []
@@ -94,6 +95,11 @@ final class ProcessDiscovery {
             case .codex:
                 guard let path = bestCodexTranscript(in: lsof),
                       claimed.insert("codex:\(path)").inserted else { continue }
+                out.append(Snapshot(kind: kind, transcriptPath: path, cwd: cwd))
+            case .gemini:
+                let path = bestGeminiTranscript(in: lsof)
+                guard path != nil || cwd != nil else { continue }
+                guard claimed.insert("gemini:\(path ?? tty)").inserted else { continue }
                 out.append(Snapshot(kind: kind, transcriptPath: path, cwd: cwd))
             }
         }
@@ -135,6 +141,14 @@ final class ProcessDiscovery {
         return first == "codex" || first.hasSuffix("/codex") || lowered.contains("/codex/codex")
     }
 
+    private func isGemini(_ command: String) -> Bool {
+        let lowered = command.lowercased()
+        if lowered.contains("@google/gemini-cli") || lowered.contains("/gemini.js") { return true }
+        return lowered.split(separator: " ").contains { token in
+            token == "gemini" || token.hasSuffix("/gemini")
+        }
+    }
+
     private func workingDirectory(from lsof: String) -> String? {
         let lines = lsof.split(whereSeparator: \.isNewline).map(String.init)
         for i in lines.indices where lines[i] == "fcwd" && lines.indices.contains(i + 1) {
@@ -168,6 +182,19 @@ final class ProcessDiscovery {
     private func bestCodexTranscript(in lsof: String) -> String? {
         // rollout 文件名内嵌时间戳，名称最大即最新
         paths(in: lsof, containing: "/.codex/sessions/").max {
+            URL(fileURLWithPath: $0).deletingPathExtension().lastPathComponent
+                < URL(fileURLWithPath: $1).deletingPathExtension().lastPathComponent
+        }
+    }
+
+    private func bestGeminiTranscript(in lsof: String) -> String? {
+        lsof.split(whereSeparator: \.isNewline).compactMap { line -> String? in
+            guard line.first == "n" else { return nil }
+            let v = String(line.dropFirst()).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard v.contains("/.gemini/tmp/"), v.contains("/chats/session-"),
+                  v.hasSuffix(".json") || v.hasSuffix(".jsonl") else { return nil }
+            return v
+        }.max {
             URL(fileURLWithPath: $0).deletingPathExtension().lastPathComponent
                 < URL(fileURLWithPath: $1).deletingPathExtension().lastPathComponent
         }
@@ -228,6 +255,7 @@ final class SessionScanner {
     private let fm = FileManager.default
     private let claudeRoot: URL
     private let codexRoot: URL
+    private let geminiRoot: URL
     /// 按文件缓存的 `tailInfo` 结果，键为路径，大小或 mtime 变了才重读。
     ///
     /// 每轮 poll 都要重新判活，但活跃会话之外的 transcript 大多一个字节都没动，
@@ -243,9 +271,12 @@ final class SessionScanner {
     init(claudeRoot: URL = FileManager.default.homeDirectoryForCurrentUser
              .appendingPathComponent(".claude/projects"),
          codexRoot: URL = FileManager.default.homeDirectoryForCurrentUser
-             .appendingPathComponent(".codex/sessions")) {
+             .appendingPathComponent(".codex/sessions"),
+         geminiRoot: URL = FileManager.default.homeDirectoryForCurrentUser
+             .appendingPathComponent(".gemini/tmp")) {
         self.claudeRoot = claudeRoot
         self.codexRoot = codexRoot
+        self.geminiRoot = geminiRoot
     }
 
     /// `live` = 运行中进程持有的 transcript 路径集合；
@@ -256,9 +287,69 @@ final class SessionScanner {
         touched = []
         var sessions = scanClaude(live: live, cwdCounts: claudeCwdCounts).filter(recent)
             + groupCodex(scanCodex(live: live).filter(recent))
+            + scanGemini(live: live).filter(recent)
         tailCache = tailCache.filter { touched.contains($0.key) }
         sessions.sort { $0.effectiveLastModified > $1.effectiveLastModified }
         return sessions
+    }
+
+    private func scanGemini(live: Set<String>) -> [AgentSession] {
+        let files = StatusService.geminiChatFiles(at: geminiRoot) ?? []
+        var out: [AgentSession] = []
+        for file in files {
+            guard let mtime = (try? file.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate else {
+                continue
+            }
+            let isLive = live.contains(file.path)
+            guard isLive || Date().timeIntervalSince(mtime) < 6 * 3600 else { continue }
+            guard let data = try? Data(contentsOf: file) else { continue }
+            var messages: [[String: Any]] = []
+            var projectName = file.deletingLastPathComponent().deletingLastPathComponent().lastPathComponent
+            var sessionID = file.deletingPathExtension().lastPathComponent
+            if let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                if let sid = root["sessionId"] as? String, !sid.isEmpty { sessionID = sid }
+                if let dirs = root["directories"] as? [String], let first = dirs.first, !first.isEmpty {
+                    projectName = URL(fileURLWithPath: first).lastPathComponent
+                }
+                messages = root["messages"] as? [[String: Any]] ?? []
+            } else if let text = String(data: data, encoding: .utf8) {
+                for line in text.split(separator: "\n") {
+                    guard let lineData = line.data(using: .utf8),
+                          let obj = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any] else { continue }
+                    if let sid = obj["sessionId"] as? String, !sid.isEmpty { sessionID = sid }
+                    if let dirs = obj["directories"] as? [String], let first = dirs.first, !first.isEmpty {
+                        projectName = URL(fileURLWithPath: first).lastPathComponent
+                    }
+                    messages.append(obj)
+                }
+            }
+            var model = ""
+            var lastActivity: Date?
+            var snippet = ""
+            for msg in messages.reversed() {
+                if model.isEmpty, let m = msg["model"] as? String, !m.isEmpty { model = m }
+                if lastActivity == nil, let ts = msg["timestamp"] as? String {
+                    lastActivity = StatusService.timestamp(ts)
+                }
+                if snippet.isEmpty, let content = msg["content"] as? String {
+                    let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !trimmed.isEmpty { snippet = String(trimmed.prefix(120)) }
+                }
+                if !model.isEmpty && lastActivity != nil && !snippet.isEmpty { break }
+            }
+            out.append(AgentSession(
+                id: file.path,
+                kind: .gemini,
+                title: projectName,
+                snippet: snippet,
+                model: model,
+                lastModified: mtime,
+                threadID: sessionID,
+                isLive: isLive,
+                lastActivity: lastActivity ?? mtime
+            ))
+        }
+        return out
     }
 
     /// 把 Codex 子代理 rollout 折叠为根线程的 children。

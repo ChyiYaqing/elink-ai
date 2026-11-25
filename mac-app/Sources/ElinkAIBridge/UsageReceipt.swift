@@ -39,7 +39,7 @@ struct UsageReceipt: Equatable {
     var isEmpty: Bool { totalTokens == 0 && clients.isEmpty }
 
     static let providers: [(key: String, name: String)] = [
-        ("claude", "Claude Code"), ("codex", "Codex CLI"),
+        ("claude", "Claude Code"), ("codex", "Codex CLI"), ("gemini", "Gemini CLI"),
     ]
 
     /// 范围窗口的起点，与 `UsageStats.windowFilter` 的天键一致：
@@ -113,7 +113,13 @@ struct UsageReceipt: Equatable {
     /// 「mtime ≥ 窗口起点」恰好等价于「窗口内写过这个会话」。
     /// Claude 只算项目目录下的顶层 transcript（子代理在更深的 subagents/ 里，
     /// worktree 代理目录也跳过）；Codex 跳过带 parent_thread_id 的子代理 rollout。
-    static func sessionCount(since: Date, claudeRoot: URL, codexRoot: URL) -> Int {
+    static func sessionCount(
+        since: Date,
+        claudeRoot: URL,
+        codexRoot: URL,
+        geminiRoot: URL = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".gemini/tmp")
+    ) -> Int {
         let fm = FileManager.default
         func modified(_ url: URL) -> Date? {
             (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
@@ -130,6 +136,10 @@ struct UsageReceipt: Equatable {
             where file.pathExtension == "jsonl" && (modified(file) ?? .distantPast) >= since {
                 if !isCodexSubagent(file) { count += 1 }
             }
+        }
+        for file in StatusService.geminiChatFiles(at: geminiRoot) ?? []
+        where (modified(file) ?? .distantPast) >= since {
+            count += 1
         }
         return count
     }

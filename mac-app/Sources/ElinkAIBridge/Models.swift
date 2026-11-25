@@ -117,6 +117,7 @@ struct ClusterSummary: Codable, Equatable {
 struct BridgeSnapshot: Codable {
     var claude = AgentStatus()
     var codex = AgentStatus()
+    var gemini = AgentStatus()
     var generatedAt = Date()
     var usageFetchedAt: Date?
     var cluster = ClusterSummary()
@@ -198,6 +199,7 @@ struct BridgeSnapshot: Codable {
             },
             "claude": provider(claude, claude: true),
             "codex": provider(codex, claude: false),
+            "gemini": provider(gemini, claude: false),
         ]
         return (try? JSONSerialization.data(withJSONObject: object)) ?? Data("{}".utf8)
     }

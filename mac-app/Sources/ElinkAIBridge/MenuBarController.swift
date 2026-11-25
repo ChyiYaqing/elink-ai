@@ -75,7 +75,8 @@ final class MenuBarController: NSObject {
             let snapshot = self.status.snapshot()
             let percent = Self.menuBarWeeklyPercent(
                 claudeWeekly: snapshot.claude.weekly.percent,
-                codexWeekly: snapshot.codex.weekly.percent
+                codexWeekly: snapshot.codex.weekly.percent,
+                geminiWeekly: snapshot.gemini.weekly.percent
             )
             DispatchQueue.main.async {
                 guard let button = self.item.button else { return }
@@ -90,8 +91,9 @@ final class MenuBarController: NSObject {
             }
         }
     }
-    static func menuBarWeeklyPercent(claudeWeekly: Double?, codexWeekly: Double?) -> Double? {
-        [claudeWeekly, codexWeekly].compactMap { $0 }.max()
+    static func menuBarWeeklyPercent(claudeWeekly: Double?, codexWeekly: Double?,
+                                     geminiWeekly: Double? = nil) -> Double? {
+        [claudeWeekly, codexWeekly, geminiWeekly].compactMap { $0 }.max()
     }
     static func statusColor(percent: Double) -> NSColor {
         switch UsageLevel.level(usedPercent: percent) {

@@ -27,7 +27,7 @@ class SessionSummary:
             return None
         session_id = _text(value.get("id"), 128)
         provider = _text(value.get("provider"), 16)
-        if not session_id or provider not in {"claude", "codex"}:
+        if not session_id or provider not in {"claude", "codex", "gemini"}:
             return None
         state = _text(value.get("state"), 16)
         if state not in {"working", "idle"}:
@@ -56,7 +56,7 @@ class RecentEvent:
         event_id = _text(value.get("id"), 128)
         provider = _text(value.get("provider"), 16)
         kind = _text(value.get("kind"), 32)
-        if (not event_id or provider not in {"claude", "codex"}
+        if (not event_id or provider not in {"claude", "codex", "gemini"}
                 or kind not in {"working", "idle", "needs_input"}):
             return None
         occurred_at = max(0, _int(value.get("occurred_at"), 0) or 0)
@@ -209,6 +209,7 @@ class StatusSnapshot:
     usage_fetched_at: int | None = None
     claude: ProviderStatus = field(default_factory=ProviderStatus)
     codex: ProviderStatus = field(default_factory=ProviderStatus)
+    gemini: ProviderStatus = field(default_factory=ProviderStatus)
     current_sessions: list[SessionSummary] = field(default_factory=list)
     recent_events: list[RecentEvent] = field(default_factory=list)
 
@@ -226,6 +227,7 @@ class StatusSnapshot:
             usage_fetched_at=_int(obj.get("usage_fetched_at")),
             claude=ProviderStatus.from_dict(obj.get("claude"), provider="claude"),
             codex=ProviderStatus.from_dict(obj.get("codex"), provider="codex"),
+            gemini=ProviderStatus.from_dict(obj.get("gemini"), provider="gemini"),
             current_sessions=_parse_items(obj.get("current_sessions"), SessionSummary.from_dict),
             recent_events=_parse_items(obj.get("recent_events"), RecentEvent.from_dict),
         )

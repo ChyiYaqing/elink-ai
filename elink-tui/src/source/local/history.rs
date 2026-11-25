@@ -41,10 +41,12 @@ type DayWrite = (
 struct HistoryData {
     claude: DayTotals,
     codex: DayTotals,
+    gemini: DayTotals,
     /// Cost conversion needs the model and the category together; these ride
     /// the same dirty set as the totals so the two can never drift apart.
     claude_categories: DayModelCategories,
     codex_categories: DayModelCategories,
+    gemini_categories: DayModelCategories,
     backfilled: bool,
     /// (provider, day) buckets changed in memory but not yet written.
     dirty: HashSet<(String, String)>,
@@ -69,8 +71,8 @@ impl History {
     pub fn new(path: PathBuf) -> Self {
         match open_db(&path) {
             Ok(conn) => {
-                let (claude, codex) = load_days(&conn).unwrap_or_default();
-                let (claude_categories, codex_categories) =
+                let (claude, codex, gemini) = load_days(&conn).unwrap_or_default();
+                let (claude_categories, codex_categories, gemini_categories) =
                     load_model_categories(&conn).unwrap_or_default();
                 let bucket_timezone = db::metadata_get(&conn, BUCKET_TIMEZONE_KEY).ok().flatten();
                 Self {
@@ -78,8 +80,10 @@ impl History {
                     data: Mutex::new(HistoryData {
                         claude,
                         codex,
+                        gemini,
                         claude_categories,
                         codex_categories,
+                        gemini_categories,
                         bucket_timezone,
                         ..HistoryData::default()
                     }),
@@ -169,23 +173,18 @@ impl History {
         if timezone.is_some_and(|timezone| data.bucket_timezone.as_deref() != Some(timezone)) {
             return;
         }
-        // Borrow the two maps one at a time: taking `&mut` on both fields in a
-        // single match is more than the borrow checker will allow here.
-        let claude = match provider {
-            "claude" => true,
-            "codex" => false,
+        let unchanged_totals = match provider {
+            "claude" => data.claude.get(day) == Some(&totals),
+            "codex" => data.codex.get(day) == Some(&totals),
+            "gemini" => data.gemini.get(day) == Some(&totals),
             _ => return,
         };
-        let unchanged_totals = if claude {
-            data.claude.get(day) == Some(&totals)
-        } else {
-            data.codex.get(day) == Some(&totals)
-        };
         let categories_changed = !model_categories.is_empty()
-            && if claude {
-                data.claude_categories.get(day) != Some(model_categories)
-            } else {
-                data.codex_categories.get(day) != Some(model_categories)
+            && match provider {
+                "claude" => data.claude_categories.get(day) != Some(model_categories),
+                "codex" => data.codex_categories.get(day) != Some(model_categories),
+                "gemini" => data.gemini_categories.get(day) != Some(model_categories),
+                _ => false,
             };
         if unchanged_totals && !categories_changed {
             return;
@@ -195,17 +194,31 @@ impl History {
             // were cleaned up); only real totals overwrite.
             return;
         }
-        if claude {
-            data.claude.insert(day.to_string(), totals);
-        } else {
-            data.codex.insert(day.to_string(), totals);
+        match provider {
+            "claude" => {
+                data.claude.insert(day.to_string(), totals);
+            }
+            "codex" => {
+                data.codex.insert(day.to_string(), totals);
+            }
+            "gemini" => {
+                data.gemini.insert(day.to_string(), totals);
+            }
+            _ => return,
         }
         if !model_categories.is_empty() {
             let value = model_categories.clone();
-            if claude {
-                data.claude_categories.insert(day.to_string(), value);
-            } else {
-                data.codex_categories.insert(day.to_string(), value);
+            match provider {
+                "claude" => {
+                    data.claude_categories.insert(day.to_string(), value);
+                }
+                "codex" => {
+                    data.codex_categories.insert(day.to_string(), value);
+                }
+                "gemini" => {
+                    data.gemini_categories.insert(day.to_string(), value);
+                }
+                _ => {}
             }
         }
         data.dirty.insert((provider.to_string(), day.to_string()));
@@ -221,6 +234,7 @@ impl History {
         let categories = match provider {
             "claude" => &data.claude_categories,
             "codex" => &data.codex_categories,
+            "gemini" => &data.gemini_categories,
             _ => return HashMap::new(),
         };
         categories.get(day).cloned().unwrap_or_default()
@@ -253,32 +267,56 @@ impl History {
         old_explained: Option<(DayTotals, DayTotals)>,
         today: NaiveDate,
     ) -> bool {
+        self.apply_backfill_all(
+            timezone,
+            target_claude,
+            target_codex,
+            DayTotals::new(),
+            old_explained.map(|(c, x)| (c, x, DayTotals::new())),
+            today,
+        )
+    }
+
+    pub fn apply_backfill_all(
+        &self,
+        timezone: &str,
+        target_claude: DayTotals,
+        target_codex: DayTotals,
+        target_gemini: DayTotals,
+        old_explained: Option<(DayTotals, DayTotals, DayTotals)>,
+        today: NaiveDate,
+    ) -> bool {
         let mut data = self.data();
         let source = data.bucket_timezone.clone();
-        let (mut claude, mut codex) = match source.as_deref() {
+        let (mut claude, mut codex, mut gemini) = match source.as_deref() {
             Some(source) if source == timezone => (
                 known_rebucket(&data.claude, &target_claude, &target_claude),
                 known_rebucket(&data.codex, &target_codex, &target_codex),
+                known_rebucket(&data.gemini, &target_gemini, &target_gemini),
             ),
             Some(_) => match old_explained {
-                Some((old_claude, old_codex)) => (
+                Some((old_claude, old_codex, old_gemini)) => (
                     known_rebucket(&data.claude, &old_claude, &target_claude),
                     known_rebucket(&data.codex, &old_codex, &target_codex),
+                    known_rebucket(&data.gemini, &old_gemini, &target_gemini),
                 ),
                 None => (
                     legacy_rebucket(&data.claude, &target_claude),
                     legacy_rebucket(&data.codex, &target_codex),
+                    legacy_rebucket(&data.gemini, &target_gemini),
                 ),
             },
             None => (
                 legacy_rebucket(&data.claude, &target_claude),
                 legacy_rebucket(&data.codex, &target_codex),
+                legacy_rebucket(&data.gemini, &target_gemini),
             ),
         };
         if let Some(cutoff) = today.checked_sub_days(Days::new(RETENTION_DAYS)) {
             let cutoff = cutoff.format("%Y-%m-%d").to_string();
             claude.retain(|day, _| day >= &cutoff);
             codex.retain(|day, _| day >= &cutoff);
+            gemini.retain(|day, _| day >= &cutoff);
         }
 
         let mut conn = self.conn();
@@ -287,10 +325,10 @@ impl History {
         };
         let saved = (|| -> rusqlite::Result<()> {
             transaction.execute(
-                "DELETE FROM daily_model_usage WHERE provider IN ('claude', 'codex')",
+                "DELETE FROM daily_model_usage WHERE provider IN ('claude', 'codex', 'gemini')",
                 [],
             )?;
-            for (provider, days) in [("claude", &claude), ("codex", &codex)] {
+            for (provider, days) in [("claude", &claude), ("codex", &codex), ("gemini", &gemini)] {
                 for (day, models) in days {
                     for (model, tokens) in models {
                         transaction.execute(
@@ -316,6 +354,7 @@ impl History {
         }
         data.claude = claude;
         data.codex = codex;
+        data.gemini = gemini;
         data.bucket_timezone = Some(timezone.to_string());
         data.backfilled = true;
         data.dirty.clear();
@@ -331,6 +370,7 @@ impl History {
         match provider {
             "claude" => data.claude.clone(),
             "codex" => data.codex.clone(),
+            "gemini" => data.gemini.clone(),
             _ => DayTotals::new(),
         }
     }
@@ -376,11 +416,14 @@ impl History {
             if let Some(key) = &cutoff {
                 data.claude.retain(|day, _| day.as_str() >= key.as_str());
                 data.codex.retain(|day, _| day.as_str() >= key.as_str());
+                data.gemini.retain(|day, _| day.as_str() >= key.as_str());
             }
             if let Some(key) = &cutoff {
                 data.claude_categories
                     .retain(|day, _| day.as_str() >= key.as_str());
                 data.codex_categories
+                    .retain(|day, _| day.as_str() >= key.as_str());
+                data.gemini_categories
                     .retain(|day, _| day.as_str() >= key.as_str());
             }
             let writes: Vec<DayWrite> = std::mem::take(&mut data.dirty)
@@ -389,6 +432,7 @@ impl History {
                     let (bucket, categories) = match provider.as_str() {
                         "claude" => (data.claude.get(&day), data.claude_categories.get(&day)),
                         "codex" => (data.codex.get(&day), data.codex_categories.get(&day)),
+                        "gemini" => (data.gemini.get(&day), data.gemini_categories.get(&day)),
                         _ => (None, None),
                     };
                     (
@@ -479,9 +523,10 @@ impl History {
 /// Loads the stored model x category breakdown, split by provider.
 fn load_model_categories(
     conn: &Connection,
-) -> rusqlite::Result<(DayModelCategories, DayModelCategories)> {
+) -> rusqlite::Result<(DayModelCategories, DayModelCategories, DayModelCategories)> {
     let mut claude = DayModelCategories::new();
     let mut codex = DayModelCategories::new();
+    let mut gemini = DayModelCategories::new();
     let mut statement = conn.prepare(
         "SELECT day, provider, model, category, tokens FROM daily_model_category_usage",
     )?;
@@ -499,6 +544,7 @@ fn load_model_categories(
         let days = match provider.as_str() {
             "claude" => &mut claude,
             "codex" => &mut codex,
+            "gemini" => &mut gemini,
             _ => continue,
         };
         days.entry(day)
@@ -507,13 +553,14 @@ fn load_model_categories(
             .or_default()
             .insert(category, tokens.max(0) as u64);
     }
-    Ok((claude, codex))
+    Ok((claude, codex, gemini))
 }
 
 /// Loads every stored day bucket, split by provider.
-fn load_days(conn: &Connection) -> rusqlite::Result<(DayTotals, DayTotals)> {
+fn load_days(conn: &Connection) -> rusqlite::Result<(DayTotals, DayTotals, DayTotals)> {
     let mut claude = DayTotals::new();
     let mut codex = DayTotals::new();
+    let mut gemini = DayTotals::new();
     let mut statement =
         conn.prepare("SELECT day, provider, model, tokens FROM daily_model_usage")?;
     let rows = statement.query_map([], |row| {
@@ -529,13 +576,14 @@ fn load_days(conn: &Connection) -> rusqlite::Result<(DayTotals, DayTotals)> {
         let days = match provider.as_str() {
             "claude" => &mut claude,
             "codex" => &mut codex,
+            "gemini" => &mut gemini,
             _ => continue,
         };
         days.entry(day)
             .or_default()
             .insert(model, tokens.max(0) as u64);
     }
-    Ok((claude, codex))
+    Ok((claude, codex, gemini))
 }
 
 /// Legacy migration and backfill rescans carry model totals only — the

@@ -76,6 +76,17 @@ struct ClusterLiveStatus: Codable, Equatable {
     let observedAt: Date
     let claude: AgentStatus
     let codex: AgentStatus
+    let gemini: AgentStatus?
+
+    init(nodeID: String, nodeName: String, observedAt: Date,
+         claude: AgentStatus, codex: AgentStatus, gemini: AgentStatus? = nil) {
+        self.nodeID = nodeID
+        self.nodeName = nodeName
+        self.observedAt = observedAt
+        self.claude = claude
+        self.codex = codex
+        self.gemini = gemini
+    }
 }
 
 struct ClusterManifest: Codable {

@@ -149,6 +149,8 @@ struct ClusterLiveStatus {
     observed_at: f64,
     claude: ClusterAgentStatus,
     codex: ClusterAgentStatus,
+    #[serde(default)]
+    gemini: Option<ClusterAgentStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1360,6 +1362,14 @@ impl ClusterService {
             })
             .cloned()
             .collect();
+        let include_gemini = request
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("x-elink-providers"))
+            .is_some_and(|(_, v)| {
+                v.split(',')
+                    .any(|item| item.trim().eq_ignore_ascii_case("gemini"))
+            });
         let manifest = ClusterManifest {
             protocol_version: PROTOCOL_VERSION,
             cluster_id: credentials.cluster_id.clone().unwrap_or_default(),
@@ -1370,6 +1380,7 @@ impl ClusterService {
                 .stored
                 .snapshots
                 .iter()
+                .filter(|snapshot| include_gemini || snapshot.key.provider != "gemini")
                 .map(ClusterUsageSnapshot::descriptor)
                 .collect(),
         };
@@ -1634,6 +1645,7 @@ impl ClusterService {
             &random_uuid()?,
         )?;
         let response = with_headers(agent.get(&format!("{endpoint}{path}")), &headers)
+            .set("X-Elink-Providers", "claude,codex,gemini")
             .call()
             .map_err(|error| network_error(endpoint, error))?;
         let data = read_response(response)?;
@@ -1754,6 +1766,9 @@ impl ClusterService {
         }
         let local_node = state.stored.credentials.node_id.clone();
         for snapshot in snapshots {
+            if !matches!(snapshot.key.provider.as_str(), "claude" | "codex" | "gemini") {
+                continue;
+            }
             validate_snapshot(&snapshot)?;
             if snapshot.key.origin_node_id == local_node {
                 continue;
@@ -1825,7 +1840,9 @@ fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
 fn validate_snapshot(snapshot: &ClusterUsageSnapshot) -> Result<()> {
     if snapshot.key.origin_node_id.is_empty()
         || snapshot.key.origin_node_id.len() > 256
-        || snapshot.key.provider != "claude" && snapshot.key.provider != "codex"
+        || (snapshot.key.provider != "claude"
+            && snapshot.key.provider != "codex"
+            && snapshot.key.provider != "gemini")
         || chrono::NaiveDate::parse_from_str(&snapshot.key.day, "%Y-%m-%d").is_err()
         || snapshot.revision <= 0
         || !snapshot.observed_at.is_finite()
@@ -1888,11 +1905,19 @@ impl ClusterService {
             .filter(|_| history_current)
             .map(|history| history.provider_days("codex"))
             .unwrap_or_default();
+        let mut gemini_days = history
+            .filter(|_| history_current)
+            .map(|history| history.provider_days("gemini"))
+            .unwrap_or_default();
         claude_days.insert(
             today.clone(),
             models_to_map(&local.claude.model_usage_today),
         );
         codex_days.insert(today.clone(), models_to_map(&local.codex.model_usage_today));
+        gemini_days.insert(
+            today.clone(),
+            models_to_map(&local.gemini.model_usage_today),
+        );
 
         let mut changed = update_local_snapshots(
             &mut state.stored.snapshots,
@@ -1910,6 +1935,14 @@ impl ClusterService {
             now,
             history_current,
         ));
+        changed.extend(update_local_snapshots(
+            &mut state.stored.snapshots,
+            &credentials.node_id,
+            "gemini",
+            &gemini_days,
+            now,
+            history_current,
+        ));
         state.pending_announcements.extend(changed.clone());
         let local_live = ClusterLiveStatus {
             node_id: credentials.node_id.clone(),
@@ -1917,6 +1950,7 @@ impl ClusterService {
             observed_at: now as f64,
             claude: ClusterAgentStatus::from_provider(&local.claude, now),
             codex: ClusterAgentStatus::from_provider(&local.codex, now),
+            gemini: Some(ClusterAgentStatus::from_provider(&local.gemini, now)),
         };
         state
             .live_statuses
@@ -1953,9 +1987,18 @@ impl ClusterService {
                 .map(|status| (status.observed_at, &status.codex)),
             now,
         );
+        result.gemini = aggregate_provider(
+            "gemini",
+            &today,
+            &state.stored.snapshots,
+            live.iter()
+                .filter_map(|status| status.gemini.as_ref().map(|g| (status.observed_at, g))),
+            now,
+        );
         result.usage_fetched_at = [
             result.claude.provider_usage_fetched_at,
             result.codex.provider_usage_fetched_at,
+            result.gemini.provider_usage_fetched_at,
         ]
         .into_iter()
         .flatten()
@@ -2434,6 +2477,7 @@ mod tests {
             cluster: None,
             claude: provider(model, tokens, percent, fetched_at),
             codex: ProviderStatus::default(),
+            gemini: ProviderStatus::default(),
         }
     }
 

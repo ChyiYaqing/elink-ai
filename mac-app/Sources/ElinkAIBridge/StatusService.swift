@@ -42,11 +42,19 @@ final class StatusService {
     /// 只有正在跑的那一两个会话在追加。事件与时区无关，按天/小时分桶每轮现做。
     /// 仍是整份文件解析而非续读：跨行状态见 `codexUsageEvents`，截断续读会重复计数。
     private var codexFiles: [String: (size: Int, mtime: Date, usage: CodexFileUsage)] = [:]
+    private var geminiCache: (latest: Date?, day: String, timeZoneID: String, status: AgentStatus)?
+    private var geminiFiles: [String: (size: Int, mtime: Date, events: [(date: Date, model: String, tokens: Int, categories: [String: Int])])] = [:]
 
     private static let claudeRoot = URL(
         fileURLWithPath: ("~/.claude/projects" as NSString).expandingTildeInPath)
     private static let codexRoot = URL(
         fileURLWithPath: ("~/.codex/sessions" as NSString).expandingTildeInPath)
+    private static let geminiRoot = URL(
+        fileURLWithPath: ("~/.gemini/tmp" as NSString).expandingTildeInPath)
+    private static let antigravityBrainRoots = [
+        URL(fileURLWithPath: ("~/.gemini/antigravity-cli/brain" as NSString).expandingTildeInPath),
+        URL(fileURLWithPath: ("~/.gemini/antigravity/brain" as NSString).expandingTildeInPath),
+    ]
 
     init(usage: UsageFetcher, store: UsageStore? = nil, cluster: ClusterManager? = nil) {
         self.usage = usage
@@ -71,9 +79,11 @@ final class StatusService {
             value.generatedAt = Date()
             value.claude = overlay(value.claude, provider: "claude", usage: usage.claude)
             value.codex = overlay(value.codex, provider: "codex", usage: usage.codex)
+            value.gemini = overlay(value.gemini, provider: "gemini", usage: usage.gemini)
             value.usageFetchedAt = Self.latestUsageFetchedAt(
                 claude: value.claude.usageFetchedAt,
-                codex: value.codex.usageFetchedAt
+                codex: value.codex.usageFetchedAt,
+                gemini: value.gemini.usageFetchedAt
             )
             value.currentSessions = currentSessions
             value.recentEvents = recentEvents.filter {
@@ -83,12 +93,12 @@ final class StatusService {
         }
     }
 
-    static func latestUsageFetchedAt(claude: Date?, codex: Date?) -> Date? {
-        [claude, codex].compactMap { $0 }.max()
+    static func latestUsageFetchedAt(claude: Date?, codex: Date?, gemini: Date? = nil) -> Date? {
+        [claude, codex, gemini].compactMap { $0 }.max()
     }
 
     func recordEvent(agent: String, event: String, message: String?) {
-        guard ["claude", "codex"].contains(agent) else { return }
+        guard ["claude", "codex", "gemini"].contains(agent) else { return }
         lock.holding {
             let now = Date()
             if ["PermissionRequest", "Elicitation"].contains(event)
@@ -129,7 +139,13 @@ final class StatusService {
                 : session.threadID
             return BridgeSessionSummary(
                 id: protocolText(rawID, limit: 128),
-                provider: session.kind == .claude ? "claude" : "codex",
+                provider: {
+                    switch session.kind {
+                    case .claude: return "claude"
+                    case .codex: return "codex"
+                    case .gemini: return "gemini"
+                    }
+                }(),
                 project: protocolText(session.title, limit: 80),
                 model: protocolText(session.model, limit: 80),
                 state: session.anyBusy ? "working" : "idle",
@@ -192,6 +208,7 @@ final class StatusService {
         return BridgeSnapshot(
             claude: readClaude(in: timeZone, prices: prices),
             codex: readCodex(in: timeZone, prices: prices),
+            gemini: readGemini(in: timeZone, prices: prices),
             generatedAt: Date(),
             usageFetchedAt: nil
         )
@@ -393,6 +410,227 @@ final class StatusService {
         return status
     }
 
+    private func readGemini(in timeZone: TimeZone,
+                            prices: [String: ModelPricing]) -> AgentStatus {
+        let files = Self.geminiChatFiles(at: Self.geminiRoot) ?? []
+        let latest = latestModification(files)
+        let dayKey = Self.dayKeyMaker(timeZone)
+        let today = dayKey(Date())
+        if let cache = geminiCache,
+           cache.latest == latest,
+           cache.day == today,
+           cache.timeZoneID == timeZone.identifier {
+            var status = cache.status
+            status.state = state(latest)
+            return status
+        }
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = timeZone
+        let start = calendar.startOfDay(for: Date())
+        let hourKey = Self.hourKeyMaker(timeZone)
+        var daily: [String: [String: Int]] = [:]
+        var hourlyKeyed: [String: [String: Int]] = [:]
+        var dailyCategories: [String: [String: Int]] = [:]
+        var dailyModelCategories: [String: [String: [String: Int]]] = [:]
+        var seen = Set<String>()
+        for file in files {
+            guard let mtime = modification(file), mtime >= start else { continue }
+            let path = file.path
+            let size = (try? file.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? -1
+            let events: [(date: Date, model: String, tokens: Int, categories: [String: Int])]
+            if let hit = geminiFiles[path], hit.size == size, hit.mtime == mtime {
+                events = hit.events
+            } else if let data = try? Data(contentsOf: file),
+                      let parsed = Self.geminiUsageEvents(data: data, isJSONL: file.pathExtension == "jsonl") {
+                events = parsed
+                geminiFiles[path] = (size, mtime, events)
+            } else if let hit = geminiFiles[path] {
+                events = hit.events
+            } else {
+                continue
+            }
+            seen.insert(path)
+            Self.merge(Self.bucketCodexEvents(events, dayKey: dayKey), into: &daily)
+            Self.merge(Self.bucketCodexEvents(events, dayKey: hourKey), into: &hourlyKeyed)
+            Self.merge(Self.bucketCodexCategories(events, dayKey: dayKey), into: &dailyCategories)
+            Self.merge(Self.bucketCodexModelCategories(events, dayKey: dayKey),
+                       into: &dailyModelCategories)
+        }
+        geminiFiles = geminiFiles.filter { seen.contains($0.key) }
+        let totals = daily[today] ?? [:]
+        store?.record(
+            day: today, provider: "gemini", models: totals,
+            expectedBucketTimeZone: timeZone.identifier, preservingResidue: true
+        )
+        store?.recordHourly(
+            day: today, provider: "gemini",
+            hours: Self.hourBuckets(from: hourlyKeyed, day: today),
+            expectedBucketTimeZone: timeZone.identifier
+        )
+        store?.recordModelCategories(
+            day: today, provider: "gemini",
+            usage: dailyModelCategories[today] ?? [:],
+            expectedBucketTimeZone: timeZone.identifier
+        )
+        store?.recordCategories(
+            day: today, provider: "gemini",
+            categories: dailyCategories[today] ?? [:],
+            expectedBucketTimeZone: timeZone.identifier
+        )
+        let models = Self.sorted(totals)
+        let cost = Self.todayCost(dailyModelCategories[today] ?? [:], prices: prices)
+        let status = AgentStatus(
+            state: state(latest),
+            tokensToday: models.reduce(0) { $0 + $1.tokens },
+            modelUsageToday: models,
+            costToday: cost.cost,
+            unpricedModels: cost.unpriced
+        )
+        geminiCache = (latest, today, timeZone.identifier, status)
+        return status
+    }
+
+    static func geminiChatFiles(
+        at root: URL,
+        antigravityRoots: [URL] = antigravityBrainRoots
+    ) -> [URL]? {
+        let fm = FileManager.default
+        var result: [URL] = []
+        if fm.fileExists(atPath: root.path),
+           let projects = try? fm.contentsOfDirectory(
+               at: root,
+               includingPropertiesForKeys: [.isDirectoryKey]
+           ) {
+            for project in projects {
+                let chatsDir = project.appendingPathComponent("chats", isDirectory: true)
+                guard let files = try? fm.contentsOfDirectory(
+                    at: chatsDir,
+                    includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey]
+                ) else { continue }
+                for url in files {
+                    let name = url.lastPathComponent
+                    guard name.hasPrefix("session-"),
+                          url.pathExtension == "json" || url.pathExtension == "jsonl" else { continue }
+                    result.append(url)
+                }
+            }
+        }
+        for brainRoot in antigravityRoots where fm.fileExists(atPath: brainRoot.path) {
+            guard let conversations = try? fm.contentsOfDirectory(
+                at: brainRoot,
+                includingPropertiesForKeys: [.isDirectoryKey]
+            ) else { continue }
+            for conv in conversations {
+                let transcript = conv
+                    .appendingPathComponent(".system_generated/logs/transcript.jsonl")
+                if fm.fileExists(atPath: transcript.path) {
+                    result.append(transcript)
+                }
+            }
+        }
+        return result
+    }
+
+    /// 规范化 Gemini 模型名：去掉 Antigravity 附加的 effort/tier 后缀（如 `-medium`、
+    /// `-high`、`-tiered`），便于合并统计并命中官方 API 定价表。
+    static func normalizedGeminiModel(_ raw: String?) -> String {
+        var name = normalizedModel(raw)
+        for suffix in ["-xhigh", "-medium", "-high", "-low", "-max", "-tiered"] {
+            if name.hasSuffix(suffix) {
+                name = String(name.dropLast(suffix.count))
+                break
+            }
+        }
+        return name
+    }
+
+    /// 解析单个 Gemini CLI 会话文件或 Antigravity `transcript.jsonl`（兼容 `.json`
+    /// 整包与 `.jsonl` 流式格式）。`.json` 写入半截解析失败时返回 nil，调用方可保留缓存。
+    static func geminiUsageEvents(
+        data: Data,
+        isJSONL: Bool = false
+    ) -> [(date: Date, model: String, tokens: Int, categories: [String: Int])]? {
+        var objects: [[String: Any]] = []
+        if isJSONL {
+            guard let text = String(data: data, encoding: .utf8) else { return nil }
+            for line in text.split(separator: "\n") {
+                guard let lineData = line.data(using: .utf8),
+                      let obj = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any] else {
+                    continue
+                }
+                objects.append(obj)
+            }
+        } else {
+            guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                return nil
+            }
+            if let messages = root["messages"] as? [[String: Any]] {
+                objects = messages
+            } else {
+                objects = [root]
+            }
+        }
+        var byID: [String: (date: Date, model: String, tokens: Int, categories: [String: Int])] = [:]
+        var idOrder: [String] = []
+        var anonymous: [(date: Date, model: String, tokens: Int, categories: [String: Int])] = []
+        for obj in objects {
+            // 1. Gemini CLI 格式：{ timestamp, model, tokens: { input, cached, output, thoughts, tool, total } }
+            if let tokens = obj["tokens"] as? [String: Any] {
+                guard let date = timestamp(obj["timestamp"]) else { continue }
+                let rawInput = max(0, (tokens["input"] as? NSNumber)?.intValue ?? 0)
+                let cached = max(0, (tokens["cached"] as? NSNumber)?.intValue ?? 0)
+                let output = max(0, (tokens["output"] as? NSNumber)?.intValue ?? 0)
+                let thoughts = max(0, (tokens["thoughts"] as? NSNumber)?.intValue ?? 0)
+                let tool = max(0, (tokens["tool"] as? NSNumber)?.intValue ?? 0)
+                let rawTotal = max(0, (tokens["total"] as? NSNumber)?.intValue ?? 0)
+                let nonCachedInput = max(0, rawInput - cached) + tool
+                var categories: [String: Int] = [:]
+                if nonCachedInput > 0 { categories["input"] = nonCachedInput }
+                if output > 0 { categories["output"] = output }
+                if cached > 0 { categories["cache_read"] = cached }
+                if thoughts > 0 { categories["reasoning"] = thoughts }
+                let sum = nonCachedInput + output + cached + thoughts
+                let total = rawTotal > 0 ? rawTotal : sum
+                guard total > 0 else { continue }
+                let model = normalizedGeminiModel(obj["model"] as? String)
+                let event = (date: date, model: model, tokens: total, categories: categories)
+                if let id = obj["id"] as? String, !id.isEmpty {
+                    if byID[id] == nil { idOrder.append(id) }
+                    byID[id] = event
+                } else {
+                    anonymous.append(event)
+                }
+                continue
+            }
+
+            // 2. Antigravity transcript.jsonl 格式：
+            // { step_index, created_at, model, input_tokens, cache_read_tokens, output_tokens }
+            if let rawModel = obj["model"] as? String,
+               rawModel.lowercased().contains("gemini"),
+               let date = timestamp(obj["created_at"]) {
+                let input = max(0, (obj["input_tokens"] as? NSNumber)?.intValue ?? 0)
+                let cacheRead = max(0, (obj["cache_read_tokens"] as? NSNumber)?.intValue ?? 0)
+                let output = max(0, (obj["output_tokens"] as? NSNumber)?.intValue ?? 0)
+                let total = input + cacheRead + output
+                guard total > 0 else { continue }
+                var categories: [String: Int] = [:]
+                if input > 0 { categories["input"] = input }
+                if cacheRead > 0 { categories["cache_read"] = cacheRead }
+                if output > 0 { categories["output"] = output }
+                let model = normalizedGeminiModel(rawModel)
+                let event = (date: date, model: model, tokens: total, categories: categories)
+                if let step = (obj["step_index"] as? NSNumber)?.intValue {
+                    let key = "step:\(step)"
+                    if byID[key] == nil { idOrder.append(key) }
+                    byID[key] = event
+                } else {
+                    anonymous.append(event)
+                }
+            }
+        }
+        return idOrder.compactMap { byID[$0] } + anonymous
+    }
+
     /// 一次读取日志，再按一个或多个固定时区分桶。迁移时旧/新时区必须共用
     /// 同一份文件内容，否则两遍读取之间的追加或删除会伪造历史残差。
     /// `scannedCategories` 带回金额折算所需的 模型×分类 明细：时区 -> provider ->
@@ -415,7 +653,8 @@ final class StatusService {
         }
         let accumulator = ClaudeUsageAccumulator()
         guard let claudeFiles = Self.jsonlFiles(at: Self.claudeRoot),
-              let codexFiles = Self.jsonlFiles(at: Self.codexRoot) else {
+              let codexFiles = Self.jsonlFiles(at: Self.codexRoot),
+              let geminiFiles = Self.geminiChatFiles(at: Self.geminiRoot) else {
             Log.warning("usage maintenance could not enumerate history", category: "storage")
             return nil
         }
@@ -456,16 +695,43 @@ final class StatusService {
                 codexCategories[identifier] = categories
             }
         }
+        var geminiDaily: [String: DailyUsageTotals] = [:]
+        var geminiCategories: [String: DayModelCategories] = [:]
+        for file in geminiFiles {
+            guard let modified = modification(file) else {
+                Log.warning("usage maintenance could not stat \(file.path)", category: "storage")
+                return nil
+            }
+            guard modified >= cutoff else { continue }
+            guard let data = try? Data(contentsOf: file) else {
+                Log.warning("usage maintenance could not read \(file.path)", category: "storage")
+                return nil
+            }
+            let events = Self.geminiUsageEvents(
+                data: data, isJSONL: file.pathExtension == "jsonl"
+            ) ?? []
+            for (identifier, dayKey) in dayKeys {
+                var totals = geminiDaily[identifier] ?? [:]
+                Self.merge(Self.bucketCodexEvents(events, dayKey: dayKey), into: &totals)
+                geminiDaily[identifier] = totals
+                var categories = geminiCategories[identifier] ?? [:]
+                Self.merge(Self.bucketCodexModelCategories(events, dayKey: dayKey),
+                           into: &categories)
+                geminiCategories[identifier] = categories
+            }
+        }
         var result: [String: UsageHistoryTotals] = [:]
         for (identifier, dayKey) in dayKeys {
             result[identifier] = UsageHistoryTotals(
                 claude: accumulator.dailyTotals(dayKey: dayKey),
-                codex: codexDaily[identifier] ?? [:]
+                codex: codexDaily[identifier] ?? [:],
+                gemini: geminiDaily[identifier] ?? [:]
             )
             // accumulator 已经持有全部消息，再分一次桶同样不需要重新读文件
             scannedCategories[identifier] = [
                 "claude": accumulator.dailyModelCategoryTotals(dayKey: dayKey),
                 "codex": codexCategories[identifier] ?? [:],
+                "gemini": geminiCategories[identifier] ?? [:],
             ]
         }
         return result
@@ -482,7 +748,8 @@ final class StatusService {
     /// v3：分类明细的历史回填。解析没变，但已经装过前一版的库里，集群表缺这份
     /// 数据——金额读的正是集群表，不重跑一次，本机当天没用过的 provider 会在所有
     /// 区间里都没有金额。
-    static let usageParserVersion = "3"
+    /// v4：接入 Gemini / Antigravity transcript 历史回填。
+    static let usageParserVersion = "4"
 
     /// 启动时后台回填近一年历史，让统计页首次打开就有周/月/年数据
     @discardableResult
@@ -513,7 +780,7 @@ final class StatusService {
                 expectedTimeZone: capturedTimeZone.identifier, usage: categories
             )
         }
-        Log.info("usage backfill: claude \(totals.claude.count) days, codex \(totals.codex.count) days")
+        Log.info("usage backfill: claude \(totals.claude.count) days, codex \(totals.codex.count) days, gemini \(totals.gemini.count) days")
         return true
     }
 
@@ -950,7 +1217,7 @@ final class StatusService {
         return trimmed.isEmpty ? "unknown" : trimmed
     }
 
-    private static func timestamp(_ value: Any?) -> Date? {
+    static func timestamp(_ value: Any?) -> Date? {
         guard let value = value as? String else { return nil }
         return fractionalTimestamp.date(from: value) ?? basicTimestamp.date(from: value)
     }

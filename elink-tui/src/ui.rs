@@ -13,6 +13,17 @@ use crate::source::local::stun::StunObservation;
 use crate::util::{epoch_now, format_age, format_minutes, format_tokens};
 
 const STACK_BELOW_WIDTH: u16 = 70;
+const THREE_COL_STACK_BELOW_WIDTH: u16 = 96;
+
+fn has_gemini_activity(snapshot: Option<&Snapshot>) -> bool {
+    snapshot.is_some_and(|s| {
+        s.gemini.status != "offline"
+            || s.gemini.primary_pct.is_some()
+            || s.gemini.weekly_pct.is_some()
+            || s.gemini.tokens_today > 0
+            || s.gemini.error.is_some()
+    })
+}
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
@@ -106,9 +117,10 @@ pub fn compact_line(snapshot: &Snapshot) -> String {
         text
     }
     format!(
-        "{} | {}",
+        "{} | {} | {}",
         part("C", &snapshot.claude),
-        part("X", &snapshot.codex)
+        part("X", &snapshot.codex),
+        part("G", &snapshot.gemini)
     )
 }
 
@@ -117,7 +129,13 @@ pub fn compact_line(snapshot: &Snapshot) -> String {
 pub fn terminal_title(snapshot: Option<&Snapshot>) -> String {
     let weekly = snapshot
         .into_iter()
-        .flat_map(|snapshot| [snapshot.claude.weekly_pct, snapshot.codex.weekly_pct])
+        .flat_map(|snapshot| {
+            [
+                snapshot.claude.weekly_pct,
+                snapshot.codex.weekly_pct,
+                snapshot.gemini.weekly_pct,
+            ]
+        })
         .flatten()
         .fold(None::<f64>, |best, value| {
             Some(best.map_or(value, |best| best.max(value)))
@@ -145,7 +163,7 @@ fn footer(app: &App) -> Paragraph<'static> {
             " q quit  r refresh  ⇥ focus  s stats  c cluster  v nebula  d device  u update  ? help"
         }
         View::Stats => " s back  w/m/y range  n source  ⇥ focus  q quit  ? help",
-        View::Device => " d back  1/2/3 mode  p smart  f full  b bridge→here  q quit",
+        View::Device => " d back  1/2/3/4 mode  p smart  f full  b bridge→here  q quit",
         View::Cluster => " c back  p pair  r sync  q quit  ? help",
         View::Mesh => " v back  q quit  ? help",
     };
@@ -160,22 +178,46 @@ fn footer(app: &App) -> Paragraph<'static> {
 }
 
 fn draw_cards(frame: &mut Frame, area: Rect, app: &App) {
-    let stacked = area.width < STACK_BELOW_WIDTH;
-    let areas = if stacked {
-        Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).split(area)
-    } else {
-        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(area)
-    };
+    let show_gemini = has_gemini_activity(app.snapshot.as_ref());
+    let stacked = area.width
+        < if show_gemini {
+            THREE_COL_STACK_BELOW_WIDTH
+        } else {
+            STACK_BELOW_WIDTH
+        };
     let dimmed = app.error.is_some();
-    for (index, name) in ["Claude", "Codex"].into_iter().enumerate() {
-        draw_card(frame, areas[index], app, index, name, dimmed);
+    if show_gemini {
+        let constraints = [
+            Constraint::Ratio(1, 3),
+            Constraint::Ratio(1, 3),
+            Constraint::Ratio(1, 3),
+        ];
+        let areas = if stacked {
+            Layout::vertical(constraints).split(area)
+        } else {
+            Layout::horizontal(constraints).split(area)
+        };
+        for (index, name) in ["Claude", "Codex", "Gemini"].into_iter().enumerate() {
+            draw_card(frame, areas[index], app, index, name, dimmed);
+        }
+    } else {
+        let constraints = [Constraint::Percentage(50), Constraint::Percentage(50)];
+        let areas = if stacked {
+            Layout::vertical(constraints).split(area)
+        } else {
+            Layout::horizontal(constraints).split(area)
+        };
+        for (index, name) in ["Claude", "Codex"].into_iter().enumerate() {
+            draw_card(frame, areas[index], app, index, name, dimmed);
+        }
     }
 }
 
 fn draw_card(frame: &mut Frame, area: Rect, app: &App, index: usize, name: &str, dimmed: bool) {
     let provider = app.snapshot.as_ref().map(|snapshot| match index {
         0 => &snapshot.claude,
-        _ => &snapshot.codex,
+        1 => &snapshot.codex,
+        _ => &snapshot.gemini,
     });
     let focused = app.focus == index;
     let border_style = if focused {
@@ -414,10 +456,15 @@ fn truncated(value: &str, max: usize) -> String {
 /// per-model breakdown aggregated over the range.
 fn draw_stats(frame: &mut Frame, area: Rect, app: &App) {
     let stacked = area.width < STACK_BELOW_WIDTH;
+    let constraints = [
+        Constraint::Ratio(1, 3),
+        Constraint::Ratio(1, 3),
+        Constraint::Ratio(1, 3),
+    ];
     let areas = if stacked {
-        Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).split(area)
+        Layout::vertical(constraints).split(area)
     } else {
-        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(area)
+        Layout::horizontal(constraints).split(area)
     };
     let today = app.cluster.today();
     let nodes = app.cluster.stats_nodes();
@@ -427,9 +474,13 @@ fn draw_stats(frame: &mut Frame, area: Rect, app: &App) {
         .and_then(|selected| nodes.iter().find(|node| &node.node_id == selected))
         .map(|node| node.name.as_str())
         .unwrap_or("all");
-    for (index, (name, provider)) in [("Claude", "claude"), ("Codex", "codex")]
-        .into_iter()
-        .enumerate()
+    for (index, (name, provider)) in [
+        ("Claude", "claude"),
+        ("Codex", "codex"),
+        ("Gemini", "gemini"),
+    ]
+    .into_iter()
+    .enumerate()
     {
         let days = match app.stats_node_id.as_deref() {
             Some(node_id) => app
@@ -937,7 +988,7 @@ fn draw_device(frame: &mut Frame, area: Rect, app: &App) {
     }
     lines.push(Line::raw(""));
     for (keys, action) in [
-        ("1/2/3", "mode dashboard/claude/codex"),
+        ("1/2/3/4", "mode dashboard/claude/codex/gemini"),
         ("p", "smart refresh"),
         ("f", "full refresh"),
         ("b", "point device at this machine"),
@@ -1031,7 +1082,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ("q / Ctrl-C", "quit"),
         ("r", "refresh status and quota now"),
         ("Tab / ← → / h l", "switch focused provider"),
-        ("1 / 2", "focus Claude / Codex"),
+        ("1 / 2 / 3", "focus Claude / Codex / Gemini"),
         ("↑ ↓ / k j", "scroll model list"),
         ("s", "toggle usage history stats"),
         ("w / m / y", "stats range: week / month / year"),
@@ -1147,6 +1198,7 @@ mod tests {
             cluster: None,
             claude: ProviderStatus::default(),
             codex: ProviderStatus::default(),
+            gemini: ProviderStatus::default(),
         };
         snapshot.claude.status = "working".to_string();
         snapshot.claude.primary_pct = Some(43.0);
@@ -1154,7 +1206,10 @@ mod tests {
         snapshot.codex.status = "idle".to_string();
         snapshot.codex.needs_input = true;
 
-        assert_eq!(compact_line(&snapshot), "C● 43%/68% | X○ -/- ⚠");
+        assert_eq!(
+            compact_line(&snapshot),
+            "C● 43%/68% | X○ -/- ⚠ | G· -/-"
+        );
     }
 
     #[test]
@@ -1167,11 +1222,14 @@ mod tests {
             cluster: None,
             claude: ProviderStatus::default(),
             codex: ProviderStatus::default(),
+            gemini: ProviderStatus::default(),
         };
         assert_eq!(terminal_title(Some(&snapshot)), "elink-ai");
         snapshot.claude.weekly_pct = Some(47.0);
         snapshot.codex.weekly_pct = Some(68.0);
         assert_eq!(terminal_title(Some(&snapshot)), "elink-ai 68%");
+        snapshot.gemini.weekly_pct = Some(82.0);
+        assert_eq!(terminal_title(Some(&snapshot)), "elink-ai 82%");
     }
 
     #[test]
