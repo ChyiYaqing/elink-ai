@@ -417,6 +417,7 @@ struct UsageStatsView: View {
     @State private var hourlyRows: [HourlyModelUsage] = []
     @State private var categoryRows: [DailyCategoryUsage] = []
     @State private var modelCategoryRows: [ModelCategoryUsage] = []
+    @State private var selectedNodeModelCategoryRows: [ModelCategoryUsage]?
     @State private var loaded = false
     @State private var hoveredBucket: String?
     @State private var hoveredHeatmapDay: HeatmapDay?
@@ -441,24 +442,35 @@ struct UsageStatsView: View {
                 ? UsageStats.deviceTotals(hourly: hourlyRows, bucketID: bucket)
                 : UsageStats.deviceTotals(rows: rows, range: range, bucketID: bucket)
         } ?? rangeDevices
+        let activeModelCategories = effectiveNodeID != nil
+            ? (selectedNodeModelCategoryRows ?? [])
+            : modelCategoryRows
+        let yearHeatmapWeeks = range == .year ? UsageStats.heatmapWeeks(rows: chartRows) : []
+        let hasHeatmapData = yearHeatmapWeeks.contains { $0.contains { $0.tokens > 0 } }
         return VStack(spacing: 10) {
             header
             if clusterNodes.count > 1 { nodeFilter }
-            if order.isEmpty {
+            if order.isEmpty && !hasHeatmapData {
                 emptyState
             } else {
-                chart(buckets: buckets, order: order, colors: colors)
+                if !order.isEmpty {
+                    chart(buckets: buckets, order: order, colors: colors)
+                }
                 ScrollView(.vertical, showsIndicators: false) {
                     VStack(spacing: 10) {
-                        detail(buckets: buckets, order: order, colors: colors)
-                        if range == .year {
-                            heatmapSection(weeks: UsageStats.heatmapWeeks(rows: chartRows))
+                        if !order.isEmpty {
+                            detail(buckets: buckets, order: order, colors: colors)
                         }
-                        categorySection(
-                            UsageStats.categoryTotals(rows: categoryRows, range: range))
+                        if range == .year && hasHeatmapData {
+                            heatmapSection(weeks: yearHeatmapWeeks)
+                        }
+                        if effectiveNodeID == nil {
+                            categorySection(
+                                UsageStats.categoryTotals(rows: categoryRows, range: range))
+                        }
                         costSection(
-                            UsageStats.costTotal(rows: modelCategoryRows, range: range),
-                            cacheEfficiency: UsageStats.cacheEfficiency(rows: modelCategoryRows, range: range),
+                            UsageStats.costTotal(rows: activeModelCategories, range: range),
+                            cacheEfficiency: UsageStats.cacheEfficiency(rows: activeModelCategories, range: range),
                             // 与金额同一个窗口的 token 总量，用来判断覆盖了多少
                             windowTokens: buckets.reduce(0) { $0 + $1.total })
                         if UsageStats.showsDeviceShare(
@@ -491,6 +503,7 @@ struct UsageStatsView: View {
         .onChange(of: selectedNodeID) { _ in
             hoveredBucket = nil
             hoveredHeatmapDay = nil
+            loadSelectedNodeModelCategories()
         }
         .onChange(of: clusterNodes.map(\.nodeID)) { ids in
             // 选中的节点离开集群后清空选择，回退为全部主机
@@ -972,6 +985,7 @@ struct UsageStatsView: View {
         let since = StatusService.dayKey(
             StatusService.aggregationCalendar.date(byAdding: .day, value: -366, to: Date()) ?? Date())
         let provider = provider
+        let nodeID = effectiveNodeID
         if !silent { loaded = false }
         let today = StatusService.dayKey(Date())
         // 集群启用时 usage() 返回全节点带 nodeID 的行，节点筛选在内存中完成
@@ -980,12 +994,34 @@ struct UsageStatsView: View {
             let hourly = store.hourlyUsage(provider: provider, day: today)
             let categories = store.categoryUsage(provider: provider, since: since)
             let modelCategories = store.modelCategoryUsage(provider: provider, since: since)
+            let nodeModelCategories = nodeID.map {
+                store.clusterModelCategoryUsage(provider: provider, since: since, nodeID: $0)
+            }
             DispatchQueue.main.async {
                 rows = result
                 hourlyRows = hourly
                 categoryRows = categories
                 modelCategoryRows = modelCategories
+                selectedNodeModelCategoryRows = nodeModelCategories
                 loaded = true
+            }
+        }
+    }
+
+    private func loadSelectedNodeModelCategories() {
+        guard let nodeID = effectiveNodeID else {
+            selectedNodeModelCategoryRows = nil
+            return
+        }
+        let since = StatusService.dayKey(
+            StatusService.aggregationCalendar.date(byAdding: .day, value: -366, to: Date()) ?? Date())
+        let provider = provider
+        DispatchQueue.global(qos: .userInitiated).async {
+            let filtered = store.clusterModelCategoryUsage(provider: provider, since: since, nodeID: nodeID)
+            DispatchQueue.main.async {
+                if effectiveNodeID == nodeID {
+                    selectedNodeModelCategoryRows = filtered
+                }
             }
         }
     }

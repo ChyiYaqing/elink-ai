@@ -36,10 +36,14 @@ struct SessionMetrics: Equatable {
     var sessionCost: Double?
     /// 统计窗口内的累计总 token
     var totalTokens: Int = 0
+    /// 是否来自长日志的尾部采样窗口（>128 KiB 时列表只扫尾部，需与详情全量口径区分）
+    var isPartialWindow: Bool = false
 
     var contextRatio: Double? {
-        guard let ctx = contextTokens, let limit = contextWindow, limit > 0 else { return nil }
-        return min(1.0, Double(ctx) / Double(limit))
+        guard let ctx = contextTokens, let limit = contextWindow, limit > 0, ctx <= limit else {
+            return nil
+        }
+        return Double(ctx) / Double(limit)
     }
 }
 
@@ -371,18 +375,21 @@ final class SessionScanner {
     private typealias TailInfo = (snippet: String, model: String, prompt: String,
                                   transcript: [TranscriptEntry], activity: Date?, rate: Double?,
                                   metrics: SessionMetrics)
-    private var tailCache: [String: (size: Int, mtime: Date, info: TailInfo)] = [:]
-    /// Gemini 会话文件的解析结果，同样按大小与 mtime 复用。Gemini CLI 的 `.json`
+    private var tailCache: [String: (size: Int, mtime: Date, pricing: [String: ModelPricing], info: TailInfo)] = [:]
+    /// Gemini 会话文件的解析结果，同样按大小、mtime 与定价表复用。Gemini CLI 的 `.json`
     /// 会话是整份对话，长会话可达数 MB，不能每轮 poll 都整份重读。
     private typealias GeminiInfo = (title: String, sessionID: String, model: String,
                                     snippet: String, activity: Date?, rate: Double?,
                                     metrics: SessionMetrics)
-    private var geminiCache: [String: (size: Int, mtime: Date, info: GeminiInfo)] = [:]
+    private var geminiCache: [String: (size: Int, mtime: Date, pricing: [String: ModelPricing], info: GeminiInfo)] = [:]
     /// Antigravity 纯文本回复没有独立结束时间戳：在步骤落盘于文件末尾时记下
     /// 其 `mtime`，后续用户继续对话追加 `USER_INPUT` 后仍能保留已测样本。
+    /// 由 `stateLock` 保护，供后台轮询队列与独立的详情解析队列安全共享。
+    private let stateLock = NSLock()
     private var antigravityStepEnds: [String: [Int: Date]] = [:]
     /// 单会话按需详情缓存（仅在打开 SessionDetailView 时写入，关闭或切换时由上层丢弃）
-    private var inspectionCache: (path: String, size: Int, mtime: Date, value: SessionInspection)?
+    private var inspectionCache: (path: String, size: Int, mtime: Date,
+                                  pricing: [String: ModelPricing], value: SessionInspection)?
     /// 本轮 scan 用到的路径；scan 结束时据此丢掉已不再扫描的文件
     private var touched = Set<String>()
 
@@ -414,7 +421,9 @@ final class SessionScanner {
                          antigravityLive: antigravityLive, pricing: pricing).filter(recent)
         tailCache = tailCache.filter { touched.contains($0.key) }
         geminiCache = geminiCache.filter { touched.contains($0.key) }
+        stateLock.lock()
         antigravityStepEnds = antigravityStepEnds.filter { touched.contains($0.key) }
+        stateLock.unlock()
         sessions.sort { $0.effectiveLastModified > $1.effectiveLastModified }
         return sessions
     }
@@ -559,6 +568,26 @@ final class SessionScanner {
         return (meta, ids.compactMap { byID[$0] })
     }
 
+    /// 从 Gemini CLI `.jsonl` 原始操作日志中提取所有产生过用量的消息（按 `id` 去重、
+    /// 保留 `$rewindTo` / `$set.messages` 回退前已消耗的调用，与 `StatusService.geminiUsageEvents` 一致）。
+    static func allGeminiUsageMessages(from records: [[String: Any]]) -> [[String: Any]] {
+        var order: [String] = []
+        var byID: [String: [String: Any]] = [:]
+        var anonymous: [[String: Any]] = []
+        for record in records {
+            if record["$patch"] != nil || record["$rewindTo"] != nil { continue }
+            for msg in StatusService.geminiRecordMessages(record) {
+                if let id = msg["id"] as? String, !id.isEmpty {
+                    if byID[id] == nil { order.append(id) }
+                    byID[id] = msg
+                } else if msg["type"] is String {
+                    anonymous.append(msg)
+                }
+            }
+        }
+        return order.compactMap { byID[$0] } + anonymous
+    }
+
     /// Antigravity：brain/<id>/.system_generated/logs/transcript.jsonl
     private static func isAntigravityTranscript(_ file: URL) -> Bool {
         file.lastPathComponent == "transcript.jsonl" && file.path.contains("/.system_generated/logs/")
@@ -581,9 +610,10 @@ final class SessionScanner {
         let path = file.path
         touched.insert(path)
         let size = (try? file.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? -1
-        if let hit = geminiCache[path], hit.size == size, hit.mtime == mtime { return hit.info }
+        if let hit = geminiCache[path], hit.size == size, hit.mtime == mtime,
+           hit.pricing == pricing { return hit.info }
         let info = geminiInfo(of: file, mtime: mtime, antigravity: antigravity, pricing: pricing)
-        geminiCache[path] = (size, mtime, info)
+        geminiCache[path] = (size, mtime, pricing, info)
         return info
     }
 
@@ -608,19 +638,23 @@ final class SessionScanner {
                                   && afterRead?.fileSize == data.count) ? mtime : nil
         var meta: [String: Any] = [:]
         var messages: [[String: Any]] = []
+        var usageMessages: [[String: Any]] = []
         // 按扩展名分流：只有一行的 `.jsonl` 也能整份解析成对象，不能拿来判断格式
         if file.pathExtension == "json" {
             let root = (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
             meta = root
             messages = root["messages"] as? [[String: Any]] ?? []
+            usageMessages = messages
         } else if let text = String(data: data, encoding: .utf8) {
             let records = text.split(separator: "\n").compactMap {
                 try? JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any]
             }
             if antigravity {
                 messages = records
+                usageMessages = records
             } else {
                 (meta, messages) = Self.replayGeminiLog(records)
+                usageMessages = Self.allGeminiUsageMessages(from: records)
             }
         }
         if let sid = meta["sessionId"] as? String, !sid.isEmpty { sessionID = sid }
@@ -644,21 +678,26 @@ final class SessionScanner {
             }
             if !model.isEmpty && lastActivity != nil && !snippet.isEmpty { break }
         }
-        if antigravity, let stableMtime, let last = messages.last,
-           last["type"] as? String == "PLANNER_RESPONSE",
-           (last["status"] as? String ?? "DONE") == "DONE",
-           let step = (last["step_index"] as? NSNumber)?.intValue,
-           antigravityStepEnds[file.path]?[step] == nil,
-           let start = StatusService.timestamp(last["created_at"]) {
-            let dt = stableMtime.timeIntervalSince(start)
-            if dt > 0 && dt <= 600 {
-                antigravityStepEnds[file.path, default: [:]][step] = stableMtime
+        var observedEnds: [Int: Date] = [:]
+        if antigravity {
+            stateLock.lock()
+            if let stableMtime, let last = messages.last,
+               last["type"] as? String == "PLANNER_RESPONSE",
+               (last["status"] as? String ?? "DONE") == "DONE",
+               let step = (last["step_index"] as? NSNumber)?.intValue,
+               antigravityStepEnds[file.path]?[step] == nil,
+               let start = StatusService.timestamp(last["created_at"]) {
+                let dt = stableMtime.timeIntervalSince(start)
+                if dt > 0 && dt <= 600 {
+                    antigravityStepEnds[file.path, default: [:]][step] = stableMtime
+                }
             }
+            observedEnds = antigravityStepEnds[file.path] ?? [:]
+            stateLock.unlock()
         }
-        let observedEnds = antigravity ? (antigravityStepEnds[file.path] ?? [:]) : [:]
-        let rate = Self.geminiOutputRate(messages, antigravity: antigravity,
+        let rate = Self.geminiOutputRate(usageMessages, antigravity: antigravity,
                                          fileModified: stableMtime, observedEnds: observedEnds)
-        let parsed = Self.parseGeminiSteps(messages, antigravity: antigravity,
+        let parsed = Self.parseGeminiSteps(usageMessages, antigravity: antigravity,
                                            fileModified: stableMtime, observedEnds: observedEnds,
                                            pricing: pricing)
         let metrics = Self.summarizeMetrics(steps: parsed.steps, fallbackModel: model,
@@ -889,9 +928,10 @@ final class SessionScanner {
         let path = file.path
         touched.insert(path)
         let size = (try? file.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? -1
-        if let hit = tailCache[path], hit.size == size, hit.mtime == mtime { return hit.info }
+        if let hit = tailCache[path], hit.size == size, hit.mtime == mtime,
+           hit.pricing == pricing { return hit.info }
         let info = tailInfo(of: file, kind: kind, pricing: pricing)
-        tailCache[path] = (size, mtime, info)
+        tailCache[path] = (size, mtime, pricing, info)
         return info
     }
 
@@ -953,7 +993,7 @@ final class SessionScanner {
                     .replacingOccurrences(of: "claude-", with: "")
             }
         }
-        let metrics: SessionMetrics
+        var metrics: SessionMetrics
         if kind == .codex {
             let parsed = Self.parseCodexSteps(lines, pricing: pricing, fallbackModel: model)
             metrics = Self.summarizeMetrics(steps: parsed.steps, fallbackModel: model,
@@ -963,48 +1003,52 @@ final class SessionScanner {
             metrics = Self.summarizeMetrics(steps: parsed.steps, fallbackModel: model,
                                             explicitContextWindow: nil)
         }
+        metrics.isPartialWindow = size > readLen
         return (snippet, model, prompt, transcript, activity, outputRate(lines), metrics)
     }
 
     // MARK: - 会话指标与按需步骤明细
 
-    /// 常见模型上下文窗口上限；未知模型返回 nil，UI 仅展示绝对 token 数，不猜测百分比。
+    /// 仅返回明确可确认的上下文窗口上限（显式 `[1m]` 标记或 Gemini 1M）；
+    /// Claude / Codex 未在日志或模型名中明确声明窗口大小时返回 nil，避免 200K/1M 混用误报 100%。
     static func modelContextWindow(for rawModel: String) -> Int? {
         let m = rawModel.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
         guard !m.isEmpty else { return nil }
-        if m.contains("[1m]") || m.contains("1m") { return 1_000_000 }
+        if m.contains("[1m]") { return 1_000_000 }
         if m.contains("gemini") { return 1_000_000 }
-        if m.contains("claude") || m.contains("opus") || m.contains("sonnet")
-            || m.contains("haiku") || m.contains("fable") {
-            return 200_000
-        }
-        if m.contains("gpt-5") || m.contains("gpt-6") || m.contains("codex")
-            || m.contains("o3") || m.contains("o4") {
-            return 200_000
-        }
         return nil
     }
 
-    /// 按需读取单个会话文件并解析最近 80 步明细（仅在打开 SessionDetailView 时调用）。
+    /// 按需读取单个会话文件并解析最近 80 步明细（仅在打开 SessionDetailView 时调用，
+    /// 线程安全：可在独立的详情队列上执行，不阻塞后台存活轮询）。
     func inspect(session: AgentSession,
                  pricing: [String: ModelPricing] = Pricing.table()) -> SessionInspection {
         let file = URL(fileURLWithPath: session.id)
         let values = try? file.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
         let size = values?.fileSize ?? -1
         let mtime = values?.contentModificationDate ?? session.lastModified
-        if let hit = inspectionCache, hit.path == session.id, hit.size == size, hit.mtime == mtime {
+        stateLock.lock()
+        let cachedHit = inspectionCache
+        let observedEnds = antigravityStepEnds[session.id] ?? [:]
+        stateLock.unlock()
+        if let hit = cachedHit, hit.path == session.id, hit.size == size,
+           hit.mtime == mtime, hit.pricing == pricing {
             return hit.value
         }
         let result = Self.inspectFile(file, kind: session.kind, fallbackModel: session.model,
                                       mtime: mtime,
-                                      observedEnds: antigravityStepEnds[session.id] ?? [:],
+                                      observedEnds: observedEnds,
                                       pricing: pricing)
-        inspectionCache = (session.id, size, mtime, result)
+        stateLock.lock()
+        inspectionCache = (session.id, size, mtime, pricing, result)
+        stateLock.unlock()
         return result
     }
 
     func clearInspectionCache() {
+        stateLock.lock()
         inspectionCache = nil
+        stateLock.unlock()
     }
 
     static func inspectFile(_ file: URL, kind: AgentKind, fallbackModel: String = "",
@@ -1048,7 +1092,7 @@ final class SessionScanner {
                 let records = text.split(separator: "\n").compactMap {
                     try? JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any]
                 }
-                messages = antigravity ? records : replayGeminiLog(records).messages
+                messages = antigravity ? records : allGeminiUsageMessages(from: records)
             }
             let parsed = parseGeminiSteps(messages, antigravity: antigravity,
                                           fileModified: stableMtime, observedEnds: observedEnds,
@@ -1068,9 +1112,14 @@ final class SessionScanner {
     static func summarizeMetrics(steps: [SessionStep], fallbackModel: String,
                                  explicitContextWindow: Int?) -> SessionMetrics {
         guard !steps.isEmpty else { return SessionMetrics() }
-        let latestContext = steps.last(where: { $0.contextTokens != nil })?.contextTokens
+        // 以最新一步为准：若最新一步缺少可靠的单步上下文（例如老 Codex 累计日志），
+        // 留空显示未知，不回退更早步骤的旧值冒充当前上下文。
+        let latestContext = steps.last?.contextTokens
         let latestModel = steps.last(where: { !$0.model.isEmpty })?.model ?? fallbackModel
-        let window = explicitContextWindow ?? modelContextWindow(for: latestModel)
+        var window = explicitContextWindow ?? modelContextWindow(for: latestModel)
+        if let ctx = latestContext, let win = window, ctx > win {
+            window = nil
+        }
         let totalPrompt = steps.reduce(0) { $0 + $1.totalPromptTokens }
         let totalCacheRead = steps.reduce(0) { $0 + $1.cacheReadTokens }
         let cacheHitRate = totalPrompt > 0 ? Double(totalCacheRead) / Double(totalPrompt) : nil
@@ -1229,58 +1278,71 @@ final class SessionScanner {
     static func parseCodexSteps(_ lines: [Substring], pricing: [String: ModelPricing],
                                 fallbackModel: String)
         -> (steps: [SessionStep], unpriced: Set<String>, contextWindow: Int?) {
-        var steps: [SessionStep] = []
-        var unpriced = Set<String>()
-        var currentModel = fallbackModel
+        struct RawCodexStep {
+            var id: String
+            var timestamp: Date?
+            var model: String?
+            var input: Int
+            var cached: Int
+            var output: Int
+            var reasoning: Int
+            var contextTokens: Int?
+            var duration: TimeInterval?
+            var rawInput: Int
+            var rawOutput: Int
+        }
+        var rawSteps: [RawCodexStep] = []
+        var currentModel: String?
+        var firstModel: String?
         var contextWindow: Int?
         var lastInput: Date?
         var codexStart: Date?
         var inResponse = false
         var previousTotal: Int?
         var previousFields: [String: Int] = [:]
+        // 真实 Codex 日志会为同一次调用先后写 token_usage_record 与 token_count：
+        // 记录刚追加的 token_usage_record 索引，遇到紧随其后的配对 token_count 时合并而非双计。
+        var pendingRecordIndex: Int?
 
-        func appendStep(ts: Date?, fields: [String: Int], hasLastUsage: Bool, suffix: String) {
+        func makeStep(ts: Date?, fields: [String: Int], hasLastUsage: Bool,
+                      suffix: String, index: Int) -> RawCodexStep? {
             let rawInput = max(0, fields["input_tokens"] ?? 0)
             let cached = max(0, fields["cached_input_tokens"] ?? 0)
             let rawOutput = max(0, fields["output_tokens"] ?? 0)
             let reasoning = max(0, fields["reasoning_output_tokens"] ?? 0)
             let nonCachedInput = max(0, rawInput - cached)
             let nonReasoningOutput = max(0, rawOutput - reasoning)
-            guard nonCachedInput + cached + nonReasoningOutput + reasoning > 0 else { return }
+            guard nonCachedInput + cached + nonReasoningOutput + reasoning > 0 else { return nil }
             let duration: TimeInterval? = {
                 guard inResponse, let start = codexStart, let ts else { return nil }
                 let dt = ts.timeIntervalSince(start)
                 return dt > 0 ? dt : nil
             }()
-            let cost = stepCost(rawModel: currentModel, kind: .codex,
-                                input: nonCachedInput, cacheRead: cached, cacheWrite: 0,
-                                output: nonReasoningOutput, reasoning: reasoning,
-                                pricing: pricing, unpriced: &unpriced)
             // Codex 只有在存在单步 last_token_usage 时才能可靠得出上下文长度，
             // 绝不拿会话累计 total_token_usage 冒充当前上下文。
             let contextTokens = (hasLastUsage && rawInput > 0) ? rawInput : nil
-            steps.append(SessionStep(
-                id: "codex:\(steps.count + 1):\(suffix)",
-                index: steps.count + 1,
+            return RawCodexStep(
+                id: "codex:\(index):\(suffix)",
                 timestamp: ts,
                 model: currentModel,
-                inputTokens: nonCachedInput,
-                cacheReadTokens: cached,
-                cacheWriteTokens: 0,
-                outputTokens: nonReasoningOutput,
-                reasoningTokens: reasoning,
+                input: nonCachedInput,
+                cached: cached,
+                output: nonReasoningOutput,
+                reasoning: reasoning,
                 contextTokens: contextTokens,
-                durationSeconds: duration,
-                cost: cost
-            ))
-            codexStart = nil
-            inResponse = false
+                duration: duration,
+                rawInput: rawInput,
+                rawOutput: rawOutput
+            )
         }
 
         for line in lines {
             guard let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
                   let payload = obj["payload"] as? [String: Any] else { continue }
-            if let m = payload["model"] as? String, !m.isEmpty { currentModel = m }
+            if let m = payload["model"] as? String, !m.isEmpty {
+                currentModel = m
+                if firstModel == nil { firstModel = m }
+            }
             let type = obj["type"] as? String
             let ptype = payload["type"] as? String ?? ""
             let ts = (obj["timestamp"] as? String).flatMap(StatusService.timestamp)
@@ -1291,8 +1353,14 @@ final class SessionScanner {
                     "output_tokens": (usage["output_tokens"] as? NSNumber)?.intValue ?? 0,
                     "reasoning_output_tokens": (usage["reasoning_output_tokens"] as? NSNumber)?.intValue ?? 0,
                 ]
-                appendStep(ts: ts, fields: fields, hasLastUsage: fields["input_tokens"] ?? 0 > 0,
-                           suffix: "rec")
+                if let step = makeStep(ts: ts, fields: fields,
+                                       hasLastUsage: (fields["input_tokens"] ?? 0) > 0,
+                                       suffix: "rec", index: rawSteps.count + 1) {
+                    pendingRecordIndex = rawSteps.count
+                    rawSteps.append(step)
+                }
+                codexStart = nil
+                inResponse = false
             } else if ptype == "token_count", let info = payload["info"] as? [String: Any] {
                 if let win = (info["model_context_window"] as? NSNumber)?.intValue, win > 0 {
                     contextWindow = win
@@ -1323,11 +1391,39 @@ final class SessionScanner {
                 }
                 previousTotal = cumulative
                 previousFields = cumulativeFields
-                if !deltaFields.isEmpty {
-                    appendStep(ts: ts, fields: deltaFields, hasLastUsage: lastUsage != nil,
-                               suffix: "cnt")
+                guard !deltaFields.isEmpty else { continue }
+                if let idx = pendingRecordIndex, rawSteps.indices.contains(idx) {
+                    // 合并配对的 token_count 到刚记录的 token_usage_record，保留耗时并补全上下文/细分字段
+                    let prev = rawSteps[idx]
+                    let rawIn = max(0, deltaFields["input_tokens"] ?? 0)
+                    let cached = max(0, deltaFields["cached_input_tokens"] ?? 0)
+                    let rawOut = max(0, deltaFields["output_tokens"] ?? 0)
+                    let reasoning = max(0, deltaFields["reasoning_output_tokens"] ?? 0)
+                    let nonCachedIn = max(0, rawIn - cached)
+                    let nonReasoningOut = max(0, rawOut - reasoning)
+                    rawSteps[idx] = RawCodexStep(
+                        id: prev.id,
+                        timestamp: ts ?? prev.timestamp,
+                        model: prev.model ?? currentModel,
+                        input: nonCachedIn,
+                        cached: cached,
+                        output: nonReasoningOut,
+                        reasoning: reasoning,
+                        contextTokens: (lastUsage != nil && rawIn > 0) ? rawIn : prev.contextTokens,
+                        duration: prev.duration,
+                        rawInput: rawIn,
+                        rawOutput: rawOut
+                    )
+                    pendingRecordIndex = nil
+                } else if let step = makeStep(ts: ts, fields: deltaFields,
+                                              hasLastUsage: lastUsage != nil,
+                                              suffix: "cnt", index: rawSteps.count + 1) {
+                    rawSteps.append(step)
+                    codexStart = nil
+                    inResponse = false
                 }
             } else if type == "response_item" {
+                pendingRecordIndex = nil
                 if ptype.hasSuffix("_output")
                     || (ptype == "message" && payload["role"] as? String != "assistant") {
                     lastInput = ts
@@ -1336,8 +1432,34 @@ final class SessionScanner {
                     codexStart = lastInput
                 }
             } else if type == "event_msg", ptype == "user_message" {
+                pendingRecordIndex = nil
                 lastInput = ts
             }
+        }
+        // 与 StatusService.codexUsageEvents 一致：模型声明前的开头用量归属文件首个声明的模型
+        let defaultModel = firstModel ?? fallbackModel
+        var steps: [SessionStep] = []
+        var unpriced = Set<String>()
+        for (idx, raw) in rawSteps.enumerated() {
+            let resolvedModel = raw.model ?? defaultModel
+            let cost = stepCost(rawModel: resolvedModel, kind: .codex,
+                                input: raw.input, cacheRead: raw.cached, cacheWrite: 0,
+                                output: raw.output, reasoning: raw.reasoning,
+                                pricing: pricing, unpriced: &unpriced)
+            steps.append(SessionStep(
+                id: raw.id,
+                index: idx + 1,
+                timestamp: raw.timestamp,
+                model: resolvedModel,
+                inputTokens: raw.input,
+                cacheReadTokens: raw.cached,
+                cacheWriteTokens: 0,
+                outputTokens: raw.output,
+                reasoningTokens: raw.reasoning,
+                contextTokens: raw.contextTokens,
+                durationSeconds: raw.duration,
+                cost: cost
+            ))
         }
         return (steps, unpriced, contextWindow)
     }
@@ -1768,6 +1890,10 @@ final class AgentSessionMonitor {
     private let scanner = SessionScanner()
     private var tracker = LivenessTracker()
     private let queue = DispatchQueue(label: "ai.elink.agent-sessions", qos: .utility)
+    /// 独立的详情解析队列：打开长会话时绝不阻塞 3 秒一次的存活轮询。
+    private let inspectionQueue = DispatchQueue(label: "ai.elink.agent-session-inspect", qos: .userInitiated)
+    private let inspectLock = NSLock()
+    private var inspectGeneration: UInt64 = 0
 
     func poll(completion: @escaping ([AgentSession]) -> Void) {
         queue.async { [weak self] in
@@ -1782,22 +1908,32 @@ final class AgentSessionMonitor {
     }
 
     func inspect(session: AgentSession, completion: @escaping (SessionInspection) -> Void) {
-        queue.async { [weak self] in
+        inspectLock.lock()
+        inspectGeneration &+= 1
+        let gen = inspectGeneration
+        inspectLock.unlock()
+        inspectionQueue.async { [weak self] in
             guard let self else { return }
+            // 若期间已有更新的刷新请求排队，跳过过时的全量解析
+            self.inspectLock.lock()
+            let current = self.inspectGeneration
+            self.inspectLock.unlock()
+            guard gen == current else { return }
             let result = self.scanner.inspect(session: session)
             DispatchQueue.main.async { completion(result) }
         }
     }
 
     func clearInspectionCache() {
-        queue.async { [weak self] in self?.scanner.clearInspectionCache() }
+        inspectLock.lock()
+        inspectGeneration &+= 1
+        inspectLock.unlock()
+        inspectionQueue.async { [weak self] in self?.scanner.clearInspectionCache() }
     }
 
     /// 面板关闭时调用，避免重开时用陈旧的 miss 计数闪现过期存活状态。
     func reset() {
-        queue.async { [weak self] in
-            self?.tracker.reset()
-            self?.scanner.clearInspectionCache()
-        }
+        clearInspectionCache()
+        queue.async { [weak self] in self?.tracker.reset() }
     }
 }

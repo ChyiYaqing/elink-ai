@@ -294,6 +294,7 @@ struct AgentSessionsCard: View {
     }
 
     /// 会话行下方紧凑的实时监控摘要：上下文占用 · 缓存命中 · 等价成本。
+    /// 超过 128 KiB 的长日志仅扫描尾部样本，此时明确标出「近期」，与详情页全量成本区分。
     static func metricsSummaryText(_ metrics: SessionMetrics) -> String? {
         var parts: [String] = []
         if let ctx = metrics.contextTokens {
@@ -303,11 +304,16 @@ struct AgentSessionsCard: View {
                 parts.append("ctx \(UsageFormat.tokens(ctx))")
             }
         }
+        var windowParts: [String] = []
         if let hit = metrics.cacheHitRate {
-            parts.append("cache \(Int((hit * 100).rounded()))%")
+            windowParts.append("cache \(Int((hit * 100).rounded()))%")
         }
         if let cost = metrics.sessionCost, cost > 0 {
-            parts.append(UsageFormat.money(cost))
+            windowParts.append(UsageFormat.money(cost))
+        }
+        if !windowParts.isEmpty {
+            let joined = windowParts.joined(separator: " · ")
+            parts.append(metrics.isPartialWindow ? "\(tr("近期", "recent")) \(joined)" : joined)
         }
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
