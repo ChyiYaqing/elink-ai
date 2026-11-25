@@ -6,6 +6,32 @@ and `Removed`.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## 0.1.21-rc19
+
+### Added
+
+- Gemini is now a third provider next to Claude and Codex. The Mac app shows
+  today's Gemini tokens and API cost, and lists running Gemini CLI and
+  Antigravity (`agy`) sessions. It also shows Gemini's 5-hour and weekly
+  limits when a source provides them: either the quota API, using your
+  Gemini CLI login, or the Antigravity CLI's statusLine cache, written by
+  `hooks/antigravity-statusline.sh`. Use the cache if the quota API rejects
+  your account, as it can for personal accounts. Each refresh uses one
+  source, so a window it does not report stays empty rather than being
+  filled from the other. The menu bar's weekly figure includes Gemini.
+- The Linux TUI gains a Gemini card, shown only when there is Gemini
+  activity, so 80×24 terminals keep the two-column layout otherwise.
+- The e-paper device has a new `gemini` display mode.
+- Cluster sync carries Gemini usage between nodes on this version. Older nodes
+  keep syncing Claude and Codex as before.
+
+### Changed
+
+- The e-paper device only wakes for approvals and activity from the providers
+  its current mode shows: Claude and Codex on the dashboard, or the one
+  provider in a single-provider mode. A waiting approval it cannot display no
+  longer pulls the panel off the monitor page.
+
 ## 0.1.21-rc18
 
 ### Packaging
