@@ -298,8 +298,11 @@ final class SessionScanner {
     /// Gemini 会话文件的解析结果，同样按大小与 mtime 复用。Gemini CLI 的 `.json`
     /// 会话是整份对话，长会话可达数 MB，不能每轮 poll 都整份重读。
     private typealias GeminiInfo = (title: String, sessionID: String, model: String,
-                                    snippet: String, activity: Date?)
+                                    snippet: String, activity: Date?, rate: Double?)
     private var geminiCache: [String: (size: Int, mtime: Date, info: GeminiInfo)] = [:]
+    /// Antigravity 纯文本回复没有独立结束时间戳：在步骤落盘于文件末尾时记下
+    /// 其 `mtime`，后续用户继续对话追加 `USER_INPUT` 后仍能保留已测样本。
+    private var antigravityStepEnds: [String: [Int: Date]] = [:]
     /// 本轮 scan 用到的路径；scan 结束时据此丢掉已不再扫描的文件
     private var touched = Set<String>()
 
@@ -329,6 +332,7 @@ final class SessionScanner {
             + scanGemini(live: live, cwdCounts: geminiCwdCounts, antigravityLive: antigravityLive).filter(recent)
         tailCache = tailCache.filter { touched.contains($0.key) }
         geminiCache = geminiCache.filter { touched.contains($0.key) }
+        antigravityStepEnds = antigravityStepEnds.filter { touched.contains($0.key) }
         sessions.sort { $0.effectiveLastModified > $1.effectiveLastModified }
         return sessions
     }
@@ -377,7 +381,8 @@ final class SessionScanner {
                 lastModified: mtime,
                 threadID: info.sessionID,
                 isLive: isLive,
-                lastActivity: info.activity ?? mtime
+                lastActivity: info.activity ?? mtime,
+                tokensPerSecond: info.rate
             ))
         }
         return out
@@ -492,12 +497,12 @@ final class SessionScanner {
         touched.insert(path)
         let size = (try? file.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? -1
         if let hit = geminiCache[path], hit.size == size, hit.mtime == mtime { return hit.info }
-        let info = geminiInfo(of: file, antigravity: antigravity)
+        let info = geminiInfo(of: file, mtime: mtime, antigravity: antigravity)
         geminiCache[path] = (size, mtime, info)
         return info
     }
 
-    private func geminiInfo(of file: URL, antigravity: Bool) -> GeminiInfo {
+    private func geminiInfo(of file: URL, mtime: Date, antigravity: Bool) -> GeminiInfo {
         // Antigravity 的文件名与上两级目录都是固定的，会话 ID 是 brain 下的目录名
         var projectName = antigravity
             ? "Antigravity"
@@ -506,7 +511,13 @@ final class SessionScanner {
             ? file.deletingLastPathComponent().deletingLastPathComponent()
                 .deletingLastPathComponent().lastPathComponent
             : file.deletingPathExtension().lastPathComponent
-        guard let data = try? Data(contentsOf: file) else { return (projectName, sessionID, "", "", nil) }
+        guard let data = try? Data(contentsOf: file) else { return (projectName, sessionID, "", "", nil, nil) }
+        // 读取后核对文件版本（新建 URL 绕过 Foundation 的 resourceValues 缓存），
+        // 避免 stat 之后、读取之前落盘导致旧 mtime 被误缓存为新回复的结束时间
+        let afterRead = try? URL(fileURLWithPath: file.path)
+            .resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
+        let stableMtime: Date? = (afterRead?.contentModificationDate == mtime
+                                  && afterRead?.fileSize == data.count) ? mtime : nil
         var meta: [String: Any] = [:]
         var messages: [[String: Any]] = []
         // 按扩展名分流：只有一行的 `.jsonl` 也能整份解析成对象，不能拿来判断格式
@@ -545,7 +556,98 @@ final class SessionScanner {
             }
             if !model.isEmpty && lastActivity != nil && !snippet.isEmpty { break }
         }
-        return (projectName, sessionID, model, snippet, lastActivity)
+        if antigravity, let stableMtime, let last = messages.last,
+           last["type"] as? String == "PLANNER_RESPONSE",
+           (last["status"] as? String ?? "DONE") == "DONE",
+           let step = (last["step_index"] as? NSNumber)?.intValue,
+           antigravityStepEnds[file.path]?[step] == nil,
+           let start = StatusService.timestamp(last["created_at"]) {
+            let dt = stableMtime.timeIntervalSince(start)
+            if dt > 0 && dt <= 600 {
+                antigravityStepEnds[file.path, default: [:]][step] = stableMtime
+            }
+        }
+        let observedEnds = antigravity ? (antigravityStepEnds[file.path] ?? [:]) : [:]
+        let rate = Self.geminiOutputRate(messages, antigravity: antigravity,
+                                         fileModified: stableMtime, observedEnds: observedEnds)
+        return (projectName, sessionID, model, snippet, lastActivity, rate)
+    }
+
+    /// 计算 Gemini CLI / Antigravity 会话最近响应的输出速率（output tokens / 秒）。
+    /// - Gemini CLI：`gemini` 消息的 `timestamp` 是响应完成时间，起点取前一条 `user`
+    ///   消息或上一轮 `toolCalls` 的最晚完成时间；输出 token 合并 `output + thoughts`
+    ///   （与 Claude/Codex 把思维链计入 `output_tokens` 的口径一致）。
+    /// - Antigravity：`PLANNER_RESPONSE` 的 `created_at` 是生成起点；紧跟工具/模型
+    ///   步骤时以下一条的 `created_at` 为生成终点；若处于文件末尾且已 `DONE`，
+    ///   `transcript.jsonl` 是在步骤完成时落盘的，用文件 `mtime` 作终点（设 10 分钟
+    ///   上限，避免文件被事后触碰导致失真），并按 `step_index` 缓存供后续轮次复用。
+    static func geminiOutputRate(
+        _ messages: [[String: Any]],
+        antigravity: Bool,
+        fileModified: Date? = nil,
+        observedEnds: [Int: Date] = [:]
+    ) -> Double? {
+        var samples: [(tokens: Int, seconds: TimeInterval)] = []
+        if antigravity {
+            for i in messages.indices {
+                let msg = messages[i]
+                guard msg["type"] as? String == "PLANNER_RESPONSE",
+                      (msg["status"] as? String ?? "DONE") == "DONE",
+                      let out = (msg["output_tokens"] as? NSNumber)?.intValue, out > 0,
+                      let start = StatusService.timestamp(msg["created_at"]) else { continue }
+                let step = (msg["step_index"] as? NSNumber)?.intValue
+                let end: Date?
+                if messages.indices.contains(i + 1) {
+                    let next = messages[i + 1]
+                    if next["type"] as? String != "USER_INPUT",
+                       next["source"] as? String != "USER_EXPLICIT",
+                       next["source"] as? String != "SYSTEM" {
+                        end = StatusService.timestamp(next["created_at"])
+                    } else if let step {
+                        end = observedEnds[step]
+                    } else {
+                        end = nil
+                    }
+                } else if let step, let recorded = observedEnds[step] {
+                    end = recorded
+                } else if let mtime = fileModified,
+                          mtime.timeIntervalSince(start) <= 600 {
+                    end = mtime
+                } else {
+                    end = nil
+                }
+                if let end {
+                    let dt = end.timeIntervalSince(start)
+                    if dt > 0 { samples.append((out, dt)) }
+                }
+            }
+        } else {
+            var lastInput: Date?
+            for msg in messages {
+                let type = msg["type"] as? String
+                if type == "user" {
+                    lastInput = StatusService.timestamp(msg["timestamp"])
+                } else if type == "gemini" {
+                    let ts = StatusService.timestamp(msg["timestamp"])
+                    if let start = lastInput, let end = ts,
+                       let tokens = msg["tokens"] as? [String: Any] {
+                        let output = max(0, (tokens["output"] as? NSNumber)?.intValue ?? 0)
+                        let thoughts = max(0, (tokens["thoughts"] as? NSNumber)?.intValue ?? 0)
+                        let generated = output + thoughts
+                        let dt = end.timeIntervalSince(start)
+                        if generated > 0 && dt > 0 { samples.append((generated, dt)) }
+                    }
+                    let toolEnd = (msg["toolCalls"] as? [[String: Any]])?
+                        .compactMap { StatusService.timestamp($0["timestamp"]) }
+                        .max()
+                    if let nextStart = toolEnd ?? ts { lastInput = nextStart }
+                }
+            }
+        }
+        let recent = samples.filter { $0.seconds > 0 }.suffix(Self.rateSamples)
+        let tokens = recent.reduce(0) { $0 + $1.tokens }
+        let seconds = recent.reduce(0) { $0 + $1.seconds }
+        return tokens > 0 && seconds > 0 ? Double(tokens) / seconds : nil
     }
 
     /// 把 Codex 子代理 rollout 折叠为根线程的 children。

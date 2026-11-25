@@ -549,6 +549,103 @@ final class AgentSessionMonitorTests: XCTestCase {
         XCTAssertEqual(messages.compactMap { $0["id"] as? String }, ["c", "a"])
     }
 
+    func testGeminiCLIOutputRateCountsOutputAndThoughtsAcrossToolCalls() throws {
+        let t0 = Date().addingTimeInterval(-100)
+        func at(_ s: Double) -> String { Self.iso.string(from: t0.addingTimeInterval(s)) }
+        let json = """
+        {
+          "sessionId": "sess-rate",
+          "messages": [
+            {"id":"u1","type":"user","timestamp":"\(at(0))","content":"code review"},
+            {
+              "id":"g1","type":"gemini","timestamp":"\(at(10))","model":"gemini-3-pro",
+              "content":"checking files",
+              "tokens":{"input":1000,"output":100,"thoughts":300,"cached":0,"tool":0,"total":1400},
+              "toolCalls":[{"id":"t1","name":"read_file","timestamp":"\(at(12))"}]
+            },
+            {
+              "id":"g2","type":"gemini","timestamp":"\(at(22))","model":"gemini-3-pro",
+              "content":"done",
+              "tokens":{"input":2000,"output":200,"thoughts":400,"cached":0,"tool":0,"total":2600}
+            }
+          ]
+        }
+        """
+        try write([json], to: "proj/chats/session-rate.json", under: geminiRoot)
+
+        let s = try XCTUnwrap(scanner().scan(live: [], claudeCwdCounts: [:]).first)
+        // (400 + 600) tokens / (10s + 10s) = 50 tok/s
+        XCTAssertEqual(try XCTUnwrap(s.tokensPerSecond), 50, accuracy: 0.001)
+        XCTAssertTrue(AgentSessionsCard.tagText(s, now: t0.addingTimeInterval(25)).contains("50 tok/s"))
+
+        // 新用户消息缺少有效时间戳时必须清除上一轮起点，不能把跨轮空闲时间计入耗时
+        let brokenTurn: [[String: Any]] = [
+            ["type": "user", "timestamp": at(0)],
+            ["type": "gemini", "timestamp": at(10), "tokens": ["output": 500]],
+            ["type": "user"],
+            ["type": "gemini", "timestamp": at(200), "tokens": ["output": 100]],
+        ]
+        XCTAssertEqual(try XCTUnwrap(SessionScanner.geminiOutputRate(brokenTurn, antigravity: false)),
+                       50, accuracy: 0.001)
+    }
+
+    func testAntigravityOutputRatePairsPlannerWithNextModelStepAndFinalMtime() throws {
+        let t0 = Date(timeIntervalSince1970: floor(Date().timeIntervalSince1970) - 200)
+        func at(_ s: Double) -> String { ISO8601DateFormatter().string(from: t0.addingTimeInterval(s)) }
+        try write([
+            #"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","created_at":"\#(at(0))","content":"hi"}"#,
+            #"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"\#(at(0))","model":"gemini-4-neon-medium","output_tokens":300}"#,
+            #"{"step_index":2,"source":"MODEL","type":"GENERIC","created_at":"\#(at(5))","content":"tool output"}"#,
+            #"{"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"\#(at(6))","model":"gemini-4-neon-medium","output_tokens":700}"#,
+            // 后面隔了 120 秒才是用户输入：这段等待不能算进模型生成耗时
+            #"{"step_index":4,"source":"USER_EXPLICIT","type":"USER_INPUT","created_at":"\#(at(126))","content":"next"}"#,
+            #"{"step_index":5,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"\#(at(126))","model":"gemini-4-neon-medium","output_tokens":500}"#,
+            #"{"step_index":6,"source":"MODEL","type":"GENERIC","created_at":"\#(at(136))","content":"tool output 2"}"#,
+            // 末尾纯文本回复：步骤完成时写入文件，以 mtime (at(143)) 作为结束时间
+            #"{"step_index":7,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"\#(at(138))","model":"gemini-4-neon-medium","output_tokens":400,"content":"done"}"#,
+        ], to: "conv-rate/.system_generated/logs/transcript.jsonl", under: antigravityRoot,
+           mtime: t0.addingTimeInterval(143))
+
+        let s = try XCTUnwrap(scanner().scan(live: [], claudeCwdCounts: [:]).first)
+        // (300 + 500 + 400) tokens / (5s + 10s + 5s) = 60 tok/s
+        XCTAssertEqual(try XCTUnwrap(s.tokensPerSecond), 60.0, accuracy: 0.001)
+    }
+
+    func testAntigravityPureTextChatRetainsObservedRatesAcrossTurns() throws {
+        let t0 = Date(timeIntervalSince1970: floor(Date().timeIntervalSince1970) - 200)
+        func at(_ s: Double) -> String { ISO8601DateFormatter().string(from: t0.addingTimeInterval(s)) }
+        let path = "conv-chat/.system_generated/logs/transcript.jsonl"
+        let scanner = scanner()
+
+        // 第一轮纯文本回复完成：1000 tokens / 20s = 50 tok/s
+        var lines = [
+            #"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","created_at":"\#(at(0))","content":"解释一下"}"#,
+            #"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"\#(at(0))","model":"gemini-4-neon-high","output_tokens":1000,"content":"回答"}"#,
+        ]
+        try write(lines, to: path, under: antigravityRoot, mtime: t0.addingTimeInterval(20))
+        XCTAssertEqual(try XCTUnwrap(scanner.scan(live: [], claudeCwdCounts: [:]).first?.tokensPerSecond),
+                       50.0, accuracy: 0.001)
+
+        // 用户 100 秒后发出下一条问题，模型尚在生成中：第一轮已测得的速率不该消失
+        lines.append(#"{"step_index":2,"source":"USER_EXPLICIT","type":"USER_INPUT","created_at":"\#(at(120))","content":"继续"}"#)
+        try write(lines, to: path, under: antigravityRoot, mtime: t0.addingTimeInterval(120))
+        XCTAssertEqual(try XCTUnwrap(scanner.scan(live: [], claudeCwdCounts: [:]).first?.tokensPerSecond),
+                       50.0, accuracy: 0.001)
+
+        // 第二轮纯文本回复完成：2000 tokens / 20s；两轮合并 (1000 + 2000) / (20 + 20) = 75 tok/s
+        lines.append(#"{"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"\#(at(120))","model":"gemini-4-neon-high","output_tokens":2000,"content":"继续回答"}"#)
+        try write(lines, to: path, under: antigravityRoot, mtime: t0.addingTimeInterval(140))
+        XCTAssertEqual(try XCTUnwrap(scanner.scan(live: [], claudeCwdCounts: [:]).first?.tokensPerSecond),
+                       75.0, accuracy: 0.001)
+
+        // 事后很久才被触碰的文件（mtime 晚于 created_at 超过 10 分钟）不应算出失真速率
+        let staleStart = ISO8601DateFormatter().string(from: Date().addingTimeInterval(-3600))
+        let staleMsgs: [[String: Any]] = [
+            ["step_index": 1, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": staleStart, "output_tokens": 1000],
+        ]
+        XCTAssertNil(SessionScanner.geminiOutputRate(staleMsgs, antigravity: true, fileModified: Date()))
+    }
+
     func testGeminiSessionReparsedOnlyWhenFileChanges() throws {
         let mtime = Date().addingTimeInterval(-60)
         try write([#"{"sessionId":"s","messages":[{"type":"gemini","content":"第一版"}]}"#],
