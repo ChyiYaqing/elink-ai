@@ -940,10 +940,8 @@ final class UsageFetcher {
 
         for key in quota.keys.sorted() {
             let lower = key.lowercased()
-            // 只取 Gemini 相关 bucket（跳过 claude / gpt 等第三方池）
-            if lower.contains("claude") || lower.contains("gpt") || lower.contains("openai") {
-                continue
-            }
+            // 只取 Gemini 自己的 bucket（跳过 3p-5h / 3p-weekly / claude / gpt 等第三方池）
+            guard lower.contains("gemini") else { continue }
             guard let entry = quota[key] as? [String: Any] else { continue }
             if entry["disabled"] as? Bool == true { continue }
             guard let remaining = flexibleDouble(entry["remaining_fraction"])

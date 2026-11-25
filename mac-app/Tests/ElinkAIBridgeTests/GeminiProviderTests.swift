@@ -138,6 +138,16 @@ final class GeminiProviderTests: XCTestCase {
                     "reset_time": "2026-07-18T09:00:00Z",
                     "reset_in_seconds": 432000,
                 ],
+                "3p-5h": [
+                    "remaining_fraction": 1.0,
+                    "reset_time": "2026-07-13T14:00:00Z",
+                    "reset_in_seconds": 17999,
+                ],
+                "3p-weekly": [
+                    "remaining_fraction": 1.0,
+                    "reset_time": "2026-07-20T09:00:00Z",
+                    "reset_in_seconds": 604799,
+                ],
                 "claude-sonnet": [
                     "remaining_fraction": 0.1,
                     "reset_time": "2026-07-13T11:00:00Z",

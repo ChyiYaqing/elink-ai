@@ -382,7 +382,7 @@ pub fn antigravity_statusline_gemini_usage(
 
     for key in keys {
         let lower = key.to_lowercase();
-        if lower.contains("claude") || lower.contains("gpt") || lower.contains("openai") {
+        if !lower.contains("gemini") {
             continue;
         }
         let entry = &quota[key];
