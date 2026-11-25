@@ -114,11 +114,11 @@ fn is_echo_reply(data: &[u8], sequence: u16) -> bool {
 /// Standard internet checksum: one's complement of the one's complement sum.
 pub fn checksum(data: &[u8]) -> u16 {
     let mut sum = 0u32;
-    let mut chunks = data.chunks_exact(2);
-    for chunk in chunks.by_ref() {
-        sum += u32::from(u16::from_be_bytes([chunk[0], chunk[1]]));
+    let (pairs, remainder) = data.as_chunks::<2>();
+    for pair in pairs {
+        sum += u32::from(u16::from_be_bytes(*pair));
     }
-    if let Some(&last) = chunks.remainder().first() {
+    if let Some(&last) = remainder.first() {
         sum += u32::from(last) << 8;
     }
     while sum >> 16 != 0 {
@@ -232,7 +232,10 @@ mod tests {
     /// An odd-length payload must fold the trailing byte into the high half.
     #[test]
     fn checksum_handles_odd_length() {
-        assert_eq!(checksum(&[0x12, 0x34, 0x56]), checksum(&[0x12, 0x34, 0x56, 0x00]));
+        assert_eq!(
+            checksum(&[0x12, 0x34, 0x56]),
+            checksum(&[0x12, 0x34, 0x56, 0x00])
+        );
     }
 
     fn reply(sequence: u16) -> Vec<u8> {
@@ -250,7 +253,10 @@ mod tests {
         untagged[HEADER_LEN] = b'x';
         assert!(!matches_reply(&untagged, 3), "payload token must match");
 
-        assert!(!matches_reply(&echo_request(3), 3), "a request is not a reply");
+        assert!(
+            !matches_reply(&echo_request(3), 3),
+            "a request is not a reply"
+        );
         assert!(!matches_reply(&[], 3));
     }
 

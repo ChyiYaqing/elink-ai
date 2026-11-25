@@ -429,8 +429,12 @@ pub struct ContentionView {
     pub rewritten: Vec<String>,
 }
 
+/// Per WAN IP: the default-port holder with its packet count, and the nodes
+/// whose port was rewritten.
+type WanContention<'a> = (Option<(&'a str, i64)>, Vec<&'a str>);
+
 pub fn contention(rows: &[LighthouseRow], default_port: u16) -> Vec<ContentionView> {
-    let mut by_wan: HashMap<&str, (Option<(&str, i64)>, Vec<&str>)> = HashMap::new();
+    let mut by_wan: HashMap<&str, WanContention> = HashMap::new();
     for row in rows {
         let entry = by_wan.entry(&row.wan_ip).or_insert((None, Vec::new()));
         if row.source_port == default_port {
@@ -508,10 +512,9 @@ impl LogReader {
                     .args(["-u", unit, "--since", &since, "--no-pager"])
                     .output()?;
                 if !output.status.success() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("journalctl -u {unit} failed"),
-                    ));
+                    return Err(std::io::Error::other(format!(
+                        "journalctl -u {unit} failed"
+                    )));
                 }
                 Ok(String::from_utf8_lossy(&output.stdout).into_owned())
             }
@@ -1103,7 +1106,10 @@ mod tests {
         let connection = Connection::open_in_memory().unwrap();
         create_schema(&connection).unwrap();
         record_roster(&connection, &[entry], 1_785_000_000).unwrap();
-        assert_eq!(hosts(&connection).unwrap()[0].last_activity_at, 1_785_000_000);
+        assert_eq!(
+            hosts(&connection).unwrap()[0].last_activity_at,
+            1_785_000_000
+        );
     }
 
     /// Re-reading an old file must not drag a node's liveness backwards, or a

@@ -194,7 +194,10 @@ pub fn buckets(connection: &Connection, since: f64) -> rusqlite::Result<Vec<Mesh
     rows.collect()
 }
 
-pub fn summaries(connection: &Connection, since: f64) -> rusqlite::Result<HashMap<String, MeshSummary>> {
+pub fn summaries(
+    connection: &Connection,
+    since: f64,
+) -> rusqlite::Result<HashMap<String, MeshSummary>> {
     let mut summaries: HashMap<String, MeshSummary> = HashMap::new();
     for bucket in buckets(connection, since)? {
         let entry = summaries.entry(bucket.host_name).or_default();

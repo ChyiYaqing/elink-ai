@@ -500,7 +500,10 @@ mod cost_tests {
             &pricing::built_in(),
         );
         assert!((status.cost_today.expect("cost") - 5.0).abs() < 1e-9);
-        assert_eq!(status.unpriced_models, vec!["codex-auto-review".to_string()]);
+        assert_eq!(
+            status.unpriced_models,
+            vec!["codex-auto-review".to_string()]
+        );
     }
 
     /// No usage at all means no figure, rather than a misleading $0.00.

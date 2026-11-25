@@ -106,6 +106,9 @@ struct ConnectionGuard {
 }
 
 impl ConnectionGuard {
+    // `fetch_update` is deprecated in favour of `try_update`, but that only
+    // stabilised in Rust 1.95; keep building on older stable toolchains.
+    #[allow(deprecated)]
     fn acquire(active: &Arc<AtomicUsize>) -> Option<Self> {
         active
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
