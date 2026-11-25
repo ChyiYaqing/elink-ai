@@ -281,7 +281,10 @@ fn provider_lines(
         let label = if provider.unpriced_models.is_empty() {
             "API cost today".to_string()
         } else {
-            format!("API cost today ({} unpriced)", provider.unpriced_models.len())
+            format!(
+                "API cost today ({} unpriced)",
+                provider.unpriced_models.len()
+            )
         };
         lines.push(two_column(
             &label,
@@ -623,7 +626,10 @@ fn draw_mesh(frame: &mut Frame, area: Rect, app: &App) {
     let (observation, unavailable) = app.cluster.nat_observation();
 
     let mut lines = vec![
-        Line::raw(format!(" Egress    {}", format_nat(observation, unavailable))),
+        Line::raw(format!(
+            " Egress    {}",
+            format_nat(observation, unavailable)
+        )),
         Line::raw(format!(
             " Devices   {} on the overlay, {} reachable from here",
             snapshot.hosts.len(),

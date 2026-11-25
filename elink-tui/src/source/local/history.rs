@@ -527,9 +527,8 @@ fn load_model_categories(
     let mut claude = DayModelCategories::new();
     let mut codex = DayModelCategories::new();
     let mut gemini = DayModelCategories::new();
-    let mut statement = conn.prepare(
-        "SELECT day, provider, model, category, tokens FROM daily_model_category_usage",
-    )?;
+    let mut statement = conn
+        .prepare("SELECT day, provider, model, category, tokens FROM daily_model_category_usage")?;
     let rows = statement.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
@@ -1173,11 +1172,23 @@ mod tests {
     #[test]
     fn live_rows_wait_for_the_matching_timezone_marker() {
         let history = temp_history();
-        history.record_day_in("claude", "2026-07-19", &[usage("a", 10)], &HashMap::new(), "UTC");
+        history.record_day_in(
+            "claude",
+            "2026-07-19",
+            &[usage("a", 10)],
+            &HashMap::new(),
+            "UTC",
+        );
         assert!(history.provider_days("claude").is_empty());
 
         history.record_bucket_timezone("UTC");
-        history.record_day_in("claude", "2026-07-19", &[usage("a", 10)], &HashMap::new(), "UTC");
+        history.record_day_in(
+            "claude",
+            "2026-07-19",
+            &[usage("a", 10)],
+            &HashMap::new(),
+            "UTC",
+        );
         assert_eq!(history.provider_days("claude")["2026-07-19"]["a"], 10);
     }
 }

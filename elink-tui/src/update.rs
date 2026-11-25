@@ -243,9 +243,7 @@ mod tests {
             {"tag_name": "v99.0.0", "prerelease": false, "html_url": "https://x/99"}
         ]);
         assert!(
-            release_info(&ahead)
-                .expect("stable release found")
-                .newer,
+            release_info(&ahead).expect("stable release found").newer,
             "a stable release above the running build is an update"
         );
         assert_eq!(release_info(&serde_json::json!([])), None);

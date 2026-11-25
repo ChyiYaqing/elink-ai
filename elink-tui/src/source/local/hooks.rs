@@ -108,7 +108,7 @@ struct ConnectionGuard {
 impl ConnectionGuard {
     fn acquire(active: &Arc<AtomicUsize>) -> Option<Self> {
         active
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 (current < MAX_CONCURRENT_REQUESTS).then_some(current + 1)
             })
             .ok()?;

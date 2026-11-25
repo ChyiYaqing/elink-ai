@@ -359,7 +359,10 @@ mod tests {
             "192.168.100.200:8767"
         );
         assert_eq!(default_listen(None), "127.0.0.1:8767");
-        for listen in [default_listen(Some("192.168.100.200")), default_listen(None)] {
+        for listen in [
+            default_listen(Some("192.168.100.200")),
+            default_listen(None),
+        ] {
             assert!(
                 !listen.starts_with("0.0.0.0") && !listen.starts_with("[::]"),
                 "default must not be a wildcard: {listen}"

@@ -284,7 +284,6 @@ struct RuntimeState {
     nat_observation: Option<stun::StunObservation>,
 }
 
-
 #[derive(Debug, Clone)]
 pub struct ClusterView {
     pub enabled: bool,
