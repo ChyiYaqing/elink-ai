@@ -28,6 +28,31 @@ pub fn full_daily_totals(
     full_daily_totals_in(claude_home, codex_home, cutoff_epoch, None)
 }
 
+pub fn full_daily_totals_all_in(
+    claude_home: &Path,
+    codex_home: &Path,
+    gemini_home: &Path,
+    cutoff_epoch: i64,
+    timezone: Option<Tz>,
+) -> (DayTotals, DayTotals, DayTotals) {
+    let (claude, codex) = full_daily_totals_in(claude_home, codex_home, cutoff_epoch, timezone);
+    let mut gemini = DayTotals::new();
+    for (path, mtime, _) in gemini_chat_files(&gemini_home.join("tmp")) {
+        if epoch(mtime) < cutoff_epoch {
+            continue;
+        }
+        let text = fs::read_to_string(&path).unwrap_or_default();
+        for (timestamp, model, tokens, _categories) in parse_gemini_file(&text) {
+            *gemini
+                .entry(day_key_in(timestamp, timezone))
+                .or_default()
+                .entry(model)
+                .or_insert(0) += tokens;
+        }
+    }
+    (claude, codex, gemini)
+}
+
 pub fn full_daily_totals_in(
     claude_home: &Path,
     codex_home: &Path,
@@ -399,6 +424,7 @@ pub struct ProviderScan {
 pub struct ScanOutcome {
     pub claude: ProviderScan,
     pub codex: ProviderScan,
+    pub gemini: ProviderScan,
     /// Log-derived Codex quota fallback: (epoch of observation, rate_limits).
     pub codex_rate_limits: Option<(i64, Value)>,
 }
@@ -406,8 +432,10 @@ pub struct ScanOutcome {
 pub struct SessionScanner {
     claude_files: FileIndex,
     codex_files: FileIndex,
+    gemini_root: PathBuf,
     claude_cache: HashMap<PathBuf, CacheEntry<ClaudeMessages>>,
     codex_cache: HashMap<PathBuf, CacheEntry<CodexParsed>>,
+    gemini_cache: HashMap<PathBuf, CacheEntry<Vec<(i64, String, u64, BTreeMap<String, u64>)>>>,
     timezone: Option<Tz>,
 }
 
@@ -417,11 +445,22 @@ impl SessionScanner {
     }
 
     pub fn new_in(claude_home: &Path, codex_home: &Path, timezone: Option<Tz>) -> Self {
+        Self::new_with_gemini_in(claude_home, codex_home, &PathBuf::new(), timezone)
+    }
+
+    pub fn new_with_gemini_in(
+        claude_home: &Path,
+        codex_home: &Path,
+        gemini_home: &Path,
+        timezone: Option<Tz>,
+    ) -> Self {
         Self {
             claude_files: FileIndex::new(claude_home.join("projects")),
             codex_files: FileIndex::new(codex_home.join("sessions")),
+            gemini_root: gemini_home.join("tmp"),
             claude_cache: HashMap::new(),
             codex_cache: HashMap::new(),
+            gemini_cache: HashMap::new(),
             timezone,
         }
     }
@@ -496,12 +535,145 @@ impl SessionScanner {
         let codex_rate_limits = latest_limits
             .and_then(|(timestamp, limits)| Some((parse_iso_epoch(&timestamp)?, limits)));
 
+        let gemini_files = gemini_chat_files(&self.gemini_root);
+        let gemini_state = activity_state(latest_mtime(&gemini_files));
+        let gemini_today_files: Vec<&(PathBuf, SystemTime, u64)> = gemini_files
+            .iter()
+            .filter(|(_, mtime, _)| epoch(*mtime) >= start_of_day)
+            .collect();
+        let mut gemini_totals: HashMap<String, u64> = HashMap::new();
+        let mut gemini_categories: HashMap<String, HashMap<String, u64>> = HashMap::new();
+        for (path, mtime, len) in &gemini_today_files {
+            let events = cached_parse(&mut self.gemini_cache, path, *mtime, *len, parse_gemini_file);
+            for (timestamp, model, tokens, categories) in &events {
+                if day_key_in(*timestamp, self.timezone) == today {
+                    *gemini_totals.entry(model.clone()).or_insert(0) += tokens;
+                    let bucket = gemini_categories.entry(model.clone()).or_default();
+                    for (category, value) in categories {
+                        *bucket.entry(category.clone()).or_insert(0) += value;
+                    }
+                }
+            }
+        }
+        prune(&mut self.gemini_cache, &gemini_today_files);
+
         ScanOutcome {
             claude: provider_scan(claude_state, claude_totals, claude_categories),
             codex: provider_scan(codex_state, codex_totals, codex_categories),
+            gemini: provider_scan(gemini_state, gemini_totals, gemini_categories),
             codex_rate_limits,
         }
     }
+}
+
+/// Finds `<gemini_tmp>/<project>/chats/session-*.json(l)` files.
+pub fn gemini_chat_files(root: &Path) -> Vec<(PathBuf, SystemTime, u64)> {
+    let mut out = Vec::new();
+    let Ok(projects) = fs::read_dir(root) else {
+        return out;
+    };
+    for project in projects.flatten() {
+        let chats_dir = project.path().join("chats");
+        let Ok(entries) = fs::read_dir(&chats_dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|v| v.to_str()) else {
+                continue;
+            };
+            if !name.starts_with("session-")
+                || !(name.ends_with(".json") || name.ends_with(".jsonl"))
+            {
+                continue;
+            }
+            if let Ok(meta) = entry.metadata() {
+                if meta.is_file() {
+                    if let Ok(mtime) = meta.modified() {
+                        out.push((path, mtime, meta.len()));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Parses a Gemini CLI session transcript (`.json` conversation record or
+/// `.jsonl` stream) into `(epoch, model, total_tokens, category_breakdown)`.
+pub fn parse_gemini_file(text: &str) -> Vec<(i64, String, u64, BTreeMap<String, u64>)> {
+    let mut objects: Vec<Value> = Vec::new();
+    if let Ok(root) = serde_json::from_str::<Value>(text) {
+        if let Some(messages) = root["messages"].as_array() {
+            objects.extend(messages.iter().cloned());
+        } else {
+            objects.push(root);
+        }
+    } else {
+        for line in text.lines() {
+            if let Ok(obj) = serde_json::from_str::<Value>(line) {
+                objects.push(obj);
+            }
+        }
+    }
+    let mut by_id: HashMap<String, (i64, String, u64, BTreeMap<String, u64>)> = HashMap::new();
+    let mut id_order: Vec<String> = Vec::new();
+    let mut anonymous = Vec::new();
+    for obj in objects {
+        let Some(tokens) = obj["tokens"].as_object() else {
+            continue;
+        };
+        let Some(timestamp) = obj["timestamp"].as_str().and_then(parse_iso_epoch) else {
+            continue;
+        };
+        let get_u64 = |key: &str| tokens.get(key).and_then(Value::as_u64).unwrap_or(0);
+        let raw_input = get_u64("input");
+        let cached = get_u64("cached");
+        let output = get_u64("output");
+        let thoughts = get_u64("thoughts");
+        let tool = get_u64("tool");
+        let raw_total = get_u64("total");
+        let non_cached_input = raw_input.saturating_sub(cached).saturating_add(tool);
+        let mut categories = BTreeMap::new();
+        if non_cached_input > 0 {
+            categories.insert("input".to_string(), non_cached_input);
+        }
+        if output > 0 {
+            categories.insert("output".to_string(), output);
+        }
+        if cached > 0 {
+            categories.insert("cache_read".to_string(), cached);
+        }
+        if thoughts > 0 {
+            categories.insert("reasoning".to_string(), thoughts);
+        }
+        let sum = non_cached_input + output + cached + thoughts;
+        let total = if raw_total > 0 { raw_total } else { sum };
+        if total == 0 {
+            continue;
+        }
+        let model = obj["model"]
+            .as_str()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .unwrap_or("unknown")
+            .to_string();
+        let event = (timestamp, model, total, categories);
+        if let Some(id) = obj["id"].as_str().filter(|v| !v.is_empty()) {
+            if !by_id.contains_key(id) {
+                id_order.push(id.to_string());
+            }
+            by_id.insert(id.to_string(), event);
+        } else {
+            anonymous.push(event);
+        }
+    }
+    let mut events: Vec<_> = id_order
+        .into_iter()
+        .filter_map(|id| by_id.remove(&id))
+        .collect();
+    events.extend(anonymous);
+    events
 }
 
 fn provider_scan(

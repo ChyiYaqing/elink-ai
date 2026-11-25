@@ -69,8 +69,10 @@ class DashboardRenderer:
         draw = ImageDraw.Draw(image)
         updated_at = updated_at or datetime.now().astimezone()
         self._header(draw, stale, updated_at)
-        if mode in {"claude", "codex"}:
-            provider = snapshot.claude if mode == "claude" else snapshot.codex
+        if mode in {"claude", "codex", "gemini"}:
+            provider = (snapshot.claude if mode == "claude"
+                        else snapshot.gemini if mode == "gemini"
+                        else snapshot.codex)
             self._provider_panel(
                 draw, self.SINGLE_BOX, mode.capitalize(), provider,
                 sessions=self._for_provider(snapshot.current_sessions, mode),
@@ -99,7 +101,7 @@ class DashboardRenderer:
         Right/bottom-exclusive, matching `Rect`, because the caller compares these
         against refresh regions. The drawing constants are PIL's closed corners.
         """
-        if mode in {"claude", "codex"}:
+        if mode in {"claude", "codex", "gemini"}:
             panels = {mode: self.SINGLE_BOX,
                       f"{mode}.badge": self._badge_box(self.SINGLE_BOX, large=True),
                       f"{mode}.session": self._activity_box(self.SINGLE_BOX, 2),
@@ -157,7 +159,11 @@ class DashboardRenderer:
         draw.rounded_rectangle((x0, y0, x1 - 3, y1 - 3), radius=12,
                                fill=255, outline=0, width=2)
         title_size = 32 if large else 25
-        provider_index = "PROVIDER 01" if name.lower() == "claude" else "PROVIDER 02"
+        provider_index = (
+            "PROVIDER 01" if name.lower() == "claude"
+            else "PROVIDER 03" if name.lower() == "gemini"
+            else "PROVIDER 02"
+        )
         draw.text((x0 + 16, y0 + 10), provider_index,
                   font=self._font(10, bold=True), fill=0)
         draw.text((x0 + 16, y0 + 25), name.upper(),
@@ -352,7 +358,13 @@ class DashboardRenderer:
     @staticmethod
     def _model_label(model: str, provider_name: str) -> str:
         value = model.strip()
-        prefixes = ["claude-"] if provider_name.lower() == "claude" else ["gpt-", "openai-"]
+        lower_provider = provider_name.lower()
+        if lower_provider == "claude":
+            prefixes = ["claude-"]
+        elif lower_provider == "gemini":
+            prefixes = ["gemini-"]
+        else:
+            prefixes = ["gpt-", "openai-"]
         lowered = value.lower()
         for prefix in prefixes:
             if lowered.startswith(prefix):

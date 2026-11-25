@@ -94,6 +94,51 @@ pub fn built_in() -> HashMap<String, ModelPricing> {
                 cache_write: 6.25,
             },
         ),
+        (
+            "gemini-2.5-pro",
+            ModelPricing {
+                input: 1.25,
+                output: 10.0,
+                cache_read: 0.125,
+                cache_write: 0.0,
+            },
+        ),
+        (
+            "gemini-2.5-flash",
+            ModelPricing {
+                input: 0.30,
+                output: 2.50,
+                cache_read: 0.03,
+                cache_write: 0.0,
+            },
+        ),
+        (
+            "gemini-2.5-flash-lite",
+            ModelPricing {
+                input: 0.10,
+                output: 0.40,
+                cache_read: 0.01,
+                cache_write: 0.0,
+            },
+        ),
+        (
+            "gemini-3-pro-preview",
+            ModelPricing {
+                input: 2.0,
+                output: 12.0,
+                cache_read: 0.2,
+                cache_write: 0.0,
+            },
+        ),
+        (
+            "gemini-3-flash-preview",
+            ModelPricing {
+                input: 0.5,
+                output: 3.0,
+                cache_read: 0.05,
+                cache_write: 0.0,
+            },
+        ),
     ]
     .into_iter()
     .map(|(model, pricing)| (model.to_string(), pricing))

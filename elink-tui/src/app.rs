@@ -62,7 +62,7 @@ pub struct App {
     pub kind: SourceKind,
     pub bridge_configured: bool,
     pub focus: usize,
-    pub scroll: [usize; 2],
+    pub scroll: [usize; 3],
     pub show_help: bool,
     pub should_quit: bool,
     pub view: View,
@@ -99,7 +99,7 @@ impl App {
             kind,
             bridge_configured,
             focus: 0,
-            scroll: [0, 0],
+            scroll: [0, 0, 0],
             show_help: false,
             should_quit: false,
             view: View::Dashboard,
@@ -238,14 +238,15 @@ impl App {
                 let _ = commands.send(Command::Refresh);
                 self.set_hint("refreshing…");
             }
-            KeyCode::Tab
-            | KeyCode::BackTab
-            | KeyCode::Left
-            | KeyCode::Right
-            | KeyCode::Char('h')
-            | KeyCode::Char('l') => self.focus ^= 1,
+            KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
+                self.focus = (self.focus + 1) % 3;
+            }
+            KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
+                self.focus = (self.focus + 2) % 3;
+            }
             KeyCode::Char('1') => self.focus = 0,
             KeyCode::Char('2') => self.focus = 1,
+            KeyCode::Char('3') => self.focus = 2,
             KeyCode::Up | KeyCode::Char('k') => {
                 self.scroll[self.focus] = self.scroll[self.focus].saturating_sub(1);
             }
@@ -284,6 +285,7 @@ impl App {
             KeyCode::Char('1') => device.send(DeviceCommand::SetMode("dashboard")),
             KeyCode::Char('2') => device.send(DeviceCommand::SetMode("claude")),
             KeyCode::Char('3') => device.send(DeviceCommand::SetMode("codex")),
+            KeyCode::Char('4') => device.send(DeviceCommand::SetMode("gemini")),
             KeyCode::Char('p') => device.send(DeviceCommand::Refresh("smart")),
             KeyCode::Char('f') => device.send(DeviceCommand::Refresh("full")),
             KeyCode::Char('b') => {
@@ -395,6 +397,7 @@ impl App {
         let counts = [
             snapshot.claude.model_usage_today.len(),
             snapshot.codex.model_usage_today.len(),
+            snapshot.gemini.model_usage_today.len(),
         ];
         for (scroll, count) in self.scroll.iter_mut().zip(counts) {
             *scroll = (*scroll).min(count.saturating_sub(1));
@@ -460,6 +463,7 @@ mod tests {
             cluster: None,
             claude: ProviderStatus::default(),
             codex: ProviderStatus::default(),
+            gemini: ProviderStatus::default(),
         }
     }
 

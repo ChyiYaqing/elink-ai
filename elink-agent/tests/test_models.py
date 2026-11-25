@@ -95,6 +95,37 @@ def test_invalid_model_usage_degrades_to_empty_list():
     assert snapshot.claude.model_usage_today == []
 
 
+def test_gemini_provider_parses_five_hour_and_weekly_limits_and_defaults_offline():
+    absent = StatusSnapshot.from_dict({})
+    assert absent.gemini.status == "offline"
+    assert absent.gemini.primary_pct is None
+    assert absent.gemini.weekly_pct is None
+
+    present = StatusSnapshot.from_dict({
+        "gemini": {
+            "status": "working",
+            "tokens_today": 120_000,
+            "model_usage_today": [{"model": "gemini-2.5-pro", "tokens": 120_000}],
+            "primary_pct": 40.0,
+            "primary_reset_min": 180,
+            "weekly_pct": 70.0,
+            "weekly_reset_min": 7200,
+            "scoped_limits": [{"id": "pro:p", "title": "Pro", "pct": 40.0, "reset_min": 180}],
+            "needs_input": False,
+        },
+        "current_sessions": [
+            {"id": "g1", "provider": "gemini", "project": "elink-ai", "model": "gemini-2.5-pro", "state": "working"}
+        ],
+    })
+    assert present.gemini.status == "working"
+    assert present.gemini.primary_pct == 40.0
+    assert present.gemini.primary_reset_min == 180
+    assert present.gemini.weekly_pct == 70.0
+    assert present.gemini.weekly_reset_min == 7200
+    assert present.gemini.scoped_limits[0].title == "Pro"
+    assert present.current_sessions[0].provider == "gemini"
+
+
 class TestProviderUsageStale:
     """额度取数失败但仍有可信缓存时，属于陈旧而非错误。"""
 

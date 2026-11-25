@@ -31,7 +31,7 @@ class RefreshPolicy:
         self.partial_count = 0
 
     def decide(self, snapshot: StatusSnapshot, *, stale: bool, now: float | None = None,
-               force: str | None = None) -> RefreshDecision:
+               force: str | None = None, mode: str = "dashboard") -> RefreshDecision:
         now = time.monotonic() if now is None else now
         if force in {"full", "partial", "smart"}:
             # 手动刷新同样要过最小间隔。这个端点没有鉴权，局域网上任何人都能调，
@@ -40,8 +40,8 @@ class RefreshPolicy:
             if self.last_refresh_at and now - self.last_refresh_at < self.min_interval_s:
                 return RefreshDecision(False, reason="throttled")
             return RefreshDecision(True, force, "manual")
-        signature = self._signature(snapshot, stale)
-        priority = self._priority_signature(snapshot, stale)
+        signature = self._signature(snapshot, stale, mode=mode)
+        priority = self._priority_signature(snapshot, stale, mode=mode)
         time_due = bool(self.last_full_at and now - self.last_full_at >= self.full_interval_s)
         if signature == self.last_signature:
             # 未变化分支不能用 partial_count + 1：full 后计数归零会造成无限维护全刷
@@ -61,10 +61,10 @@ class RefreshPolicy:
                                "priority-change" if high_priority else "data-change")
 
     def record(self, snapshot: StatusSnapshot, *, stale: bool, kind: str,
-               now: float | None = None) -> None:
+               now: float | None = None, mode: str = "dashboard") -> None:
         now = time.monotonic() if now is None else now
-        self.last_signature = self._signature(snapshot, stale)
-        self.last_priority_signature = self._priority_signature(snapshot, stale)
+        self.last_signature = self._signature(snapshot, stale, mode=mode)
+        self.last_priority_signature = self._priority_signature(snapshot, stale, mode=mode)
         self.last_refresh_at = now
         if kind == "full":
             self.partial_count = 0
@@ -86,7 +86,7 @@ class RefreshPolicy:
             "error": bool(value.error),
         }
 
-    def _signature(self, snapshot: StatusSnapshot, stale: bool) -> str:
+    def _signature(self, snapshot: StatusSnapshot, stale: bool, *, mode: str = "dashboard") -> str:
         value = {
             "stale": stale,
             "claude": self._provider_view(snapshot.claude),
@@ -100,11 +100,16 @@ class RefreshPolicy:
                 for item in snapshot.recent_events
             ],
         }
+        if mode == "gemini":
+            value["gemini"] = self._provider_view(snapshot.gemini)
         raw = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
         return hashlib.sha256(raw).hexdigest()
 
     @staticmethod
-    def _priority_signature(snapshot: StatusSnapshot, stale: bool) -> str:
-        value = (stale, snapshot.claude.status, snapshot.codex.status,
-                 snapshot.claude.needs_input, snapshot.codex.needs_input)
+    def _priority_signature(snapshot: StatusSnapshot, stale: bool, *, mode: str = "dashboard") -> str:
+        if mode == "gemini":
+            value = (stale, snapshot.gemini.status, snapshot.gemini.needs_input)
+        else:
+            value = (stale, snapshot.claude.status, snapshot.codex.status,
+                     snapshot.claude.needs_input, snapshot.codex.needs_input)
         return repr(value)

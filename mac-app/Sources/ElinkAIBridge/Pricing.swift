@@ -48,6 +48,11 @@ enum Pricing {
         "gpt-6-sol": ModelPricing(input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5),
         "gpt-5.6-sol": ModelPricing(input: 4, output: 20, cacheRead: 0.4, cacheWrite: 5),
         "gpt-5.6-luna": ModelPricing(input: 0.2, output: 1.2, cacheRead: 0.02, cacheWrite: 0.25),
+        "gemini-2.5-pro": ModelPricing(input: 1.25, output: 10, cacheRead: 0.125, cacheWrite: 0),
+        "gemini-2.5-flash": ModelPricing(input: 0.30, output: 2.50, cacheRead: 0.03, cacheWrite: 0),
+        "gemini-2.5-flash-lite": ModelPricing(input: 0.10, output: 0.40, cacheRead: 0.01, cacheWrite: 0),
+        "gemini-3-pro-preview": ModelPricing(input: 2.0, output: 12.0, cacheRead: 0.2, cacheWrite: 0),
+        "gemini-3-flash-preview": ModelPricing(input: 0.5, output: 3.0, cacheRead: 0.05, cacheWrite: 0),
     ]
 
     /// 用户覆盖表所在位置，与 usage.db 同目录。

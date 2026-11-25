@@ -441,17 +441,19 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
                 withAnimation(.easeOut(duration: 0.3)) {
                     self.model.claude = snapshot.claude
                     self.model.codex = snapshot.codex
+                    self.model.gemini = snapshot.gemini
                     self.model.claudeCost = costs.claude
                     self.model.codexCost = costs.codex
+                    self.model.geminiCost = costs.gemini
                 }
                 self.model.updatedText = Self.updatedText(snapshot.usageFetchedAt)
             }
         }
     }
 
-    /// 两家 provider 的成本汇总。定价表只读一次：它要落一次盘，两张卡片各读一遍
+    /// 三家 provider 的成本汇总。定价表只读一次：它要落一次盘，各张卡片各自读一遍
     /// 是白读的。
-    private static func costSummaries() -> (claude: CostSummary, codex: CostSummary) {
+    private static func costSummaries() -> (claude: CostSummary, codex: CostSummary, gemini: CostSummary) {
         let now = Date()
         let since = StatusService.dayKey(
             StatusService.aggregationCalendar.date(byAdding: .day, value: -29, to: now) ?? now)
@@ -461,7 +463,7 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
                 rows: UsageStore.shared.modelCategoryUsage(provider: provider, since: since),
                 now: now, table: table)
         }
-        return (summary("claude"), summary("codex"))
+        return (summary("claude"), summary("codex"), summary("gemini"))
     }
 
     private func reloadPreview() {
@@ -532,7 +534,7 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
     }
 
     static func segment(for mode: String) -> Int {
-        ["dashboard", "claude", "codex"].firstIndex(of: mode) ?? 0
+        ["dashboard", "claude", "codex", "gemini"].firstIndex(of: mode) ?? 0
     }
 
     static func deviceSummary(_ info: DeviceInfo) -> String {
@@ -541,7 +543,7 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
         // 屏幕停在监控页时报 mode 是错的：那是用量面板的排版，跟屏上正显示的东西无关
         let mode = info.showsMonitor
             ? tr("设备监控", "Device Monitor")
-            : (["dashboard": tr("双栏", "Dual"), "claude": "Claude", "codex": "Codex"][info.mode] ?? info.mode)
+            : (["dashboard": tr("双栏", "Dual"), "claude": "Claude", "codex": "Codex", "gemini": "Gemini"][info.mode] ?? info.mode)
         let refresh = ["full": tr("完整刷新", "Full refresh"),
                        "partial": tr("局部刷新", "Partial refresh"),
                        "none": tr("尚未刷新", "Not refreshed yet")][info.refreshKind]

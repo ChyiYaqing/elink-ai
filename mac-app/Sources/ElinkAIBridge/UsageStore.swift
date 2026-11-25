@@ -88,12 +88,18 @@ typealias DayModelCategories = [String: [String: [String: Int]]]
 struct UsageHistoryTotals: Equatable {
     var claude: DailyUsageTotals
     var codex: DailyUsageTotals
+    var gemini: DailyUsageTotals = [:]
 
     func values(for provider: String) -> DailyUsageTotals {
-        provider == "claude" ? claude : codex
+        switch provider {
+        case "claude": return claude
+        case "codex": return codex
+        case "gemini": return gemini
+        default: return [:]
+        }
     }
 
-    var isEmpty: Bool { claude.isEmpty && codex.isEmpty }
+    var isEmpty: Bool { claude.isEmpty && codex.isEmpty && gemini.isEmpty }
 }
 
 enum UsageBucketMigrationResult: Equatable {
@@ -632,7 +638,7 @@ final class UsageStore {
                 return false
             }
             var succeeded = true
-            for (provider, days) in usage where ["claude", "codex"].contains(provider) {
+            for (provider, days) in usage where ["claude", "codex", "gemini"].contains(provider) {
                 guard succeeded else { break }
                 // 整个 provider 一次性重建：扫描覆盖的是全部历史，留下旧行只会
                 // 让改过归属的那些天既算新的又算旧的。
@@ -980,11 +986,12 @@ final class UsageStore {
             }
             guard marker.value == expectedSource,
                   let storedClaude = localDailyModelUsageLocked(provider: "claude"),
-                  let storedCodex = localDailyModelUsageLocked(provider: "codex") else {
+                  let storedCodex = localDailyModelUsageLocked(provider: "codex"),
+                  let storedGemini = localDailyModelUsageLocked(provider: "gemini") else {
                 _ = finishTransactionLocked(false)
                 return marker.value == expectedSource ? .failed : .sourceChanged
             }
-            let stored = UsageHistoryTotals(claude: storedClaude, codex: storedCodex)
+            let stored = UsageHistoryTotals(claude: storedClaude, codex: storedCodex, gemini: storedGemini)
             let plan: UsageHistoryTotals
             if let oldExplained, expectedSource != nil {
                 plan = UsageHistoryTotals(
@@ -997,6 +1004,11 @@ final class UsageStore {
                         stored: stored.codex,
                         oldExplained: oldExplained.codex,
                         targetTotals: targetTotals.codex
+                    ),
+                    gemini: Self.knownRebucketPlan(
+                        stored: stored.gemini,
+                        oldExplained: oldExplained.gemini,
+                        targetTotals: targetTotals.gemini
                     )
                 )
             } else if oldExplained == nil, expectedSource == nil {
@@ -1006,6 +1018,9 @@ final class UsageStore {
                     ),
                     codex: Self.legacyRebucketPlan(
                         stored: stored.codex, targetTotals: targetTotals.codex
+                    ),
+                    gemini: Self.legacyRebucketPlan(
+                        stored: stored.gemini, targetTotals: targetTotals.gemini
                     )
                 )
             } else {
@@ -1055,16 +1070,18 @@ final class UsageStore {
             let marker = metadataValueLocked(Self.bucketTimeZoneMetadataKey)
             guard marker.succeeded, marker.value == expectedTimeZone,
                   let storedClaude = localDailyModelUsageLocked(provider: "claude"),
-                  let storedCodex = localDailyModelUsageLocked(provider: "codex") else {
+                  let storedCodex = localDailyModelUsageLocked(provider: "codex"),
+                  let storedGemini = localDailyModelUsageLocked(provider: "gemini") else {
                 _ = finishTransactionLocked(false)
                 return false
             }
-            let stored = UsageHistoryTotals(claude: storedClaude, codex: storedCodex)
+            let stored = UsageHistoryTotals(claude: storedClaude, codex: storedCodex, gemini: storedGemini)
             let plan: UsageHistoryTotals
             if exact {
                 plan = UsageHistoryTotals(
                     claude: Self.exactRebuildPlan(stored: stored.claude, targetTotals: totals.claude),
-                    codex: Self.exactRebuildPlan(stored: stored.codex, targetTotals: totals.codex)
+                    codex: Self.exactRebuildPlan(stored: stored.codex, targetTotals: totals.codex),
+                    gemini: Self.exactRebuildPlan(stored: stored.gemini, targetTotals: totals.gemini)
                 )
             } else {
                 plan = UsageHistoryTotals(
@@ -1077,6 +1094,11 @@ final class UsageStore {
                         stored: stored.codex,
                         oldExplained: totals.codex,
                         targetTotals: totals.codex
+                    ),
+                    gemini: Self.knownRebucketPlan(
+                        stored: stored.gemini,
+                        oldExplained: totals.gemini,
+                        targetTotals: totals.gemini
                     )
                 )
             }
@@ -1169,7 +1191,7 @@ final class UsageStore {
     private func replaceLocalUsageLocked(plan: UsageHistoryTotals,
                                          stored: UsageHistoryTotals,
                                          descriptors: inout [ClusterSnapshotDescriptor]) -> Bool {
-        for provider in ["claude", "codex"] {
+        for provider in ["claude", "codex", "gemini"] {
             let desired = plan.values(for: provider)
             let existing = stored.values(for: provider)
             for day in Set(desired.keys).union(existing.keys).sorted() {
@@ -1719,7 +1741,7 @@ final class UsageStore {
             for snapshot in snapshots {
                 // 本机 origin 的快照只能由本地 record() 产生，拒绝对端伪造覆盖
                 guard snapshot.key.originNodeID != clusterNodeID,
-                      ["claude", "codex"].contains(snapshot.key.provider),
+                      ["claude", "codex", "gemini"].contains(snapshot.key.provider),
                       snapshot.key.day.count == 10,
                       snapshot.models.count <= 100,
                       snapshot.models.allSatisfy({ !$0.key.isEmpty && $0.value >= 0 }) else { continue }

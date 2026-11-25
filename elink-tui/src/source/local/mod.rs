@@ -38,6 +38,7 @@ pub struct LocalSource {
     listener_retry_at: Option<Instant>,
     claude_home: PathBuf,
     codex_home: PathBuf,
+    gemini_home: PathBuf,
     backfill_started: bool,
     /// The bucket timezone the running backfill was scanned under; a change
     /// (e.g. joining a cluster in another zone) re-runs it to rebucket days.
@@ -86,14 +87,16 @@ impl LocalSource {
     fn build(config: &Config, history: Option<Arc<History>>, cluster: Arc<ClusterService>) -> Self {
         let timezone = cluster.effective_timezone();
         Self {
-            scanner: SessionScanner::new_in(
+            scanner: SessionScanner::new_with_gemini_in(
                 &config.claude_home,
                 &config.codex_home,
+                &config.gemini_home,
                 Some(timezone),
             ),
             quota: Arc::new(QuotaFetcher::new(
                 config.claude_home.clone(),
                 config.codex_home.clone(),
+                config.gemini_home.clone(),
                 config.statusline_cache.clone(),
                 config.quota_fetch_s,
                 store::QuotaStore::new_with_legacy(config.usage_db.clone(), &config.quota_cache),
@@ -105,6 +108,7 @@ impl LocalSource {
             listener_retry_at: None,
             claude_home: config.claude_home.clone(),
             codex_home: config.codex_home.clone(),
+            gemini_home: config.gemini_home.clone(),
             backfill_started: false,
             backfill_tz: None,
             backfill_generation: Arc::new(AtomicU64::new(0)),
@@ -142,8 +146,12 @@ impl LocalSource {
         if self.backfill_tz.is_some() && !same_target {
             // SessionScanner caches day buckets; a timezone change must drop
             // those caches before the next live scan.
-            self.scanner =
-                SessionScanner::new_in(&self.claude_home, &self.codex_home, Some(timezone));
+            self.scanner = SessionScanner::new_with_gemini_in(
+                &self.claude_home,
+                &self.codex_home,
+                &self.gemini_home,
+                Some(timezone),
+            );
         }
         self.backfill_started = true;
         self.backfill_tz = Some(timezone_id.clone());
@@ -153,18 +161,25 @@ impl LocalSource {
         let running = Arc::clone(&self.backfill_running);
         let claude_home = self.claude_home.clone();
         let codex_home = self.codex_home.clone();
+        let gemini_home = self.gemini_home.clone();
         std::thread::spawn(move || {
             let cutoff = epoch_now() - BACKFILL_DAYS * 86_400;
-            let (claude, codex) =
-                sessions::full_daily_totals_in(&claude_home, &codex_home, cutoff, Some(timezone));
+            let (claude, codex, gemini) = sessions::full_daily_totals_all_in(
+                &claude_home,
+                &codex_home,
+                &gemini_home,
+                cutoff,
+                Some(timezone),
+            );
             let old_explained = history.bucket_timezone().and_then(|source| {
                 if source == timezone_id {
                     return None;
                 }
                 source.parse().ok().map(|source_timezone| {
-                    sessions::full_daily_totals_in(
+                    sessions::full_daily_totals_all_in(
                         &claude_home,
                         &codex_home,
+                        &gemini_home,
                         cutoff,
                         Some(source_timezone),
                     )
@@ -174,7 +189,14 @@ impl LocalSource {
                 return;
             }
             let today = chrono::Utc::now().with_timezone(&timezone).date_naive();
-            let _ = history.apply_backfill(&timezone_id, claude, codex, old_explained, today);
+            let _ = history.apply_backfill_all(
+                &timezone_id,
+                claude,
+                codex,
+                gemini,
+                old_explained,
+                today,
+            );
             if generation_guard.load(Ordering::Acquire) == generation {
                 running.store(false, Ordering::Release);
             }
@@ -284,6 +306,13 @@ impl LocalSource {
                     &outcome.codex.model_categories,
                     &timezone,
                 );
+                history.record_day_in(
+                    "gemini",
+                    &today,
+                    &outcome.gemini.models,
+                    &outcome.gemini.model_categories,
+                    &timezone,
+                );
                 history.flush_if_dirty(now, self.cluster.today());
             }
         }
@@ -303,11 +332,18 @@ impl LocalSource {
         apply_usage(&mut codex, &self.quota.codex(now), now);
         self.hooks.apply("codex", &mut codex, now);
 
-        let usage_fetched_at = claude
-            .provider_usage_fetched_at
-            .into_iter()
-            .chain(codex.provider_usage_fetched_at)
-            .max();
+        let mut gemini = provider_status(outcome.gemini, &self.prices);
+        apply_usage(&mut gemini, &self.quota.gemini(now), now);
+        self.hooks.apply("gemini", &mut gemini, now);
+
+        let usage_fetched_at = [
+            claude.provider_usage_fetched_at,
+            codex.provider_usage_fetched_at,
+            gemini.provider_usage_fetched_at,
+        ]
+        .into_iter()
+        .flatten()
+        .max();
         let local = Snapshot {
             schema_version: 1,
             generated_at: Some(now),
@@ -315,6 +351,7 @@ impl LocalSource {
             cluster: None,
             claude,
             codex,
+            gemini,
         };
         let snapshot = self.cluster.aggregate(&local, self.history.as_deref());
         if let Ok(serialized) = serde_json::to_string(&snapshot) {
@@ -495,6 +532,7 @@ mod tests {
             quota_fetch_s: 120,
             claude_home: root.join("claude"),
             codex_home: root.join("codex"),
+            gemini_home: root.join("gemini"),
             statusline_cache: root.join("statusline.json"),
             usage_db: root.join("usage.db"),
             quota_cache: root.join("quota.json"),

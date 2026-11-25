@@ -11,8 +11,10 @@ enum ClaudeCredentialState {
 final class PanelModel: ObservableObject {
     @Published var claude = AgentStatus()
     @Published var codex = AgentStatus()
+    @Published var gemini = AgentStatus()
     @Published var claudeCost: CostSummary?
     @Published var codexCost: CostSummary?
+    @Published var geminiCost: CostSummary?
     @Published var updatedText = tr("用量更新中…", "Updating usage…")
     @Published var previewImage: NSImage?
     @Published var deviceSummary = tr("正在连接设备…", "Connecting to device…")
@@ -140,6 +142,20 @@ struct UsagePanelView: View {
                             }
                         }
                         .fixedSize(horizontal: false, vertical: true)
+                        if model.gemini.state != "offline"
+                            || model.gemini.primary.percent != nil
+                            || model.gemini.weekly.percent != nil
+                            || model.gemini.tokensToday > 0
+                            || model.gemini.error != nil {
+                            ProviderCard(name: "Gemini", pet: PixelPet.gemini,
+                                         accent: PanelTheme.geminiColor(dark: theme.dark),
+                                         status: model.gemini, theme: theme,
+                                         cost: model.geminiCost) {
+                                Log.user("open Gemini usage statistics")
+                                withAnimation(.easeOut(duration: 0.2)) { model.statsProvider = "gemini" }
+                            }
+                            .fixedSize(horizontal: false, vertical: true)
+                        }
                         if model.agentSessionsEnabled && !model.agentSessions.isEmpty {
                             AgentSessionsCard(sessions: model.agentSessions, theme: theme)
                         }
@@ -279,7 +295,7 @@ struct UsagePanelView: View {
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
-            HStack(spacing: 8) {
+            VStack(spacing: 8) {
                 Picker("", selection: Binding(
                     get: { model.mode },
                     set: { model.mode = $0; model.onSetMode?($0) }
@@ -287,17 +303,20 @@ struct UsagePanelView: View {
                     Text(tr("双栏", "Dual")).tag("dashboard")
                     Text("Claude").tag("claude")
                     Text("Codex").tag("codex")
+                    Text("Gemini").tag("gemini")
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
                 .tint(theme.controlAccent)
-                .frame(width: 180)
-                Spacer()
-                PillButton(title: tr("智能刷新", "Smart Refresh"), icon: "wand.and.stars", theme: theme) {
-                    model.onDeviceRefresh?("smart")
-                }
-                PillButton(title: tr("完整刷新", "Full Refresh"), icon: "arrow.triangle.2.circlepath", theme: theme) {
-                    model.onDeviceRefresh?("full")
+                .frame(maxWidth: .infinity)
+                HStack(spacing: 8) {
+                    Spacer()
+                    PillButton(title: tr("智能刷新", "Smart Refresh"), icon: "wand.and.stars", theme: theme) {
+                        model.onDeviceRefresh?("smart")
+                    }
+                    PillButton(title: tr("完整刷新", "Full Refresh"), icon: "arrow.triangle.2.circlepath", theme: theme) {
+                        model.onDeviceRefresh?("full")
+                    }
                 }
             }
             .disabled(model.busy)
@@ -313,17 +332,32 @@ struct UsagePanelView: View {
     }
 
     private func statsCard(_ provider: String, _ theme: PanelTheme) -> some View {
-        let claude = provider == "claude"
+        let title: String
+        let pet: [String]
+        let accent: Color
+        switch provider {
+        case "claude":
+            title = "Claude"
+            pet = PixelPet.claude
+            accent = PanelTheme.claudeColor(dark: theme.dark)
+        case "gemini":
+            title = "Gemini"
+            pet = PixelPet.gemini
+            accent = PanelTheme.geminiColor(dark: theme.dark)
+        default:
+            title = "Codex"
+            pet = PixelPet.codex
+            accent = PanelTheme.codexColor(dark: theme.dark)
+        }
         return UsageStatsView(
             provider: provider,
-            title: claude ? "Claude" : "Codex",
-            pet: claude ? PixelPet.claude : PixelPet.codex,
-            accent: claude ? PanelTheme.claudeColor(dark: theme.dark)
-                           : PanelTheme.codexColor(dark: theme.dark),
+            title: title,
+            pet: pet,
+            accent: accent,
             theme: theme,
             clusterNodes: cluster.enabled ? cluster.nodes : [],
             onBack: {
-                Log.user("close \(claude ? "Claude" : "Codex") usage statistics")
+                Log.user("close \(title) usage statistics")
                 withAnimation(.easeOut(duration: 0.2)) { model.statsProvider = nil }
             }
         )

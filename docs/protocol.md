@@ -5,11 +5,12 @@ The host bridge listens on TCP 8765 and the Raspberry Pi agent listens on TCP
 
 ## Bridge
 
-`GET /v1/status` returns `schema_version`, epoch timestamps, and `claude` and
-`codex` objects. Unknown percentages and reset times are JSON `null`, never
-zero. Each provider may also include `model_usage_today`, sorted by descending
-token count, as objects containing `model` and `tokens`. See
-`fixtures/status-v1.json` for the complete shape.
+`GET /v1/status` returns `schema_version`, epoch timestamps, `claude`, `codex`,
+and optional additive `gemini` objects. Unknown percentages and reset times are
+JSON `null`, never zero. Older bridges may omit `gemini` and clients must treat
+that as an offline provider with no quota data. Each provider may also include
+`model_usage_today`, sorted by descending token count, as objects containing
+`model` and `tokens`. See `fixtures/status-v1.json` for the complete shape.
 
 Each provider may also carry five additive fields. `scoped_limits` lists limits
 that apply to a single model (`id`, `title`, `pct`, `reset_min`) — these sit
@@ -71,7 +72,7 @@ new recent-event entries.
 
 - `GET /v1/device`
 - `GET /v1/preview.png`
-- `POST /v1/display/mode` with `{"mode":"dashboard|claude|codex"}`
+- `POST /v1/display/mode` with `{"mode":"dashboard|claude|codex|gemini"}`
 - `POST /v1/display/refresh` with `{"kind":"smart|partial|full"}`
 - `PUT /v1/config/bridge` with `{"bridge_url":"http://host:8765"}`
 
@@ -96,7 +97,7 @@ while the panel shows the device-monitor page and `"ai"` while it shows the
 AI dashboard; `monitor.enabled`, `monitor.idle_after_s`, and `monitor.idle`
 report whether the feature is on, the idle threshold, and whether the panel
 currently sits on the monitor page. The monitor page is an idle fill-in, not a
-new selectable `mode` — `mode` stays `dashboard|claude|codex`.
+new selectable `mode` — `mode` stays `dashboard|claude|codex|gemini`.
 
 No endpoint accepts or returns OAuth tokens or raw session logs.
 

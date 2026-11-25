@@ -45,7 +45,7 @@ pub struct HookRegistry {
 
 impl HookRegistry {
     pub fn record(&self, agent: &str, event: &str, message: Option<&str>, now: i64) {
-        if agent != "claude" && agent != "codex" {
+        if agent != "claude" && agent != "codex" && agent != "gemini" {
             return;
         }
         let Ok(mut state) = self.state.lock() else {
@@ -445,6 +445,11 @@ mod tests {
         registry.record("gemini", "PreToolUse", None, NOW);
         let mut value = status("idle");
         registry.apply("gemini", &mut value, NOW + 1);
+        assert_eq!(value.status, "working");
+
+        registry.record("unknown", "PreToolUse", None, NOW);
+        let mut value = status("idle");
+        registry.apply("unknown", &mut value, NOW + 1);
         assert_eq!(value.status, "idle");
     }
 

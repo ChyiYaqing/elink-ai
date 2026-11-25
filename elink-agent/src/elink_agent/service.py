@@ -141,8 +141,8 @@ class AgentService:
         self._wake.set()
 
     def set_mode(self, mode: str) -> None:
-        if mode not in {"dashboard", "claude", "codex"}:
-            raise ValueError("mode must be dashboard, claude, or codex")
+        if mode not in {"dashboard", "claude", "codex", "gemini"}:
+            raise ValueError("mode must be dashboard, claude, codex, or gemini")
         with self._lock:
             if self.runtime.mode != mode:
                 self.runtime.mode = mode
@@ -258,19 +258,20 @@ class AgentService:
             return "monitor"
         return "ai"
 
-    @staticmethod
-    def _needs_attention(snapshot: StatusSnapshot) -> bool:
+    def _needs_attention(self, snapshot: StatusSnapshot) -> bool:
         """有事情在等人处理（待审批）。这是唯一能打断监控页驻留的信号。"""
+        if self.runtime.mode == "gemini":
+            return snapshot.gemini.needs_input
         return snapshot.claude.needs_input or snapshot.codex.needs_input
 
-    @staticmethod
-    def _ai_active(snapshot: StatusSnapshot) -> bool:
+    def _ai_active(self, snapshot: StatusSnapshot) -> bool:
         """是否正处于需要占用屏幕的 AI 活动（working / 待审批）。
 
         只看当前状态，不看历史事件：recent_events 里的旧 idle 事件如果也算
         活动，AI 就永远不会进入真正的空闲，监控页也就永远出不来。
         """
-        for provider in (snapshot.claude, snapshot.codex):
+        providers = (snapshot.gemini,) if self.runtime.mode == "gemini" else (snapshot.claude, snapshot.codex)
+        for provider in providers:
             if provider.status == "working" or provider.needs_input:
                 return True
         return any(session.state == "working" for session in snapshot.current_sessions)
@@ -305,7 +306,9 @@ class AgentService:
             return RefreshDecision(True, "full", "content-switch")
         if self._content == "monitor":
             return self._monitor_decision(now_wall)
-        return self.policy.decide(self.snapshot, stale=stale, force=force)
+        return self.policy.decide(
+            self.snapshot, stale=stale, force=force, mode=self.runtime.mode
+        )
 
     def _monitor_decision(self, now_wall: float) -> RefreshDecision:
         """设备监控页在内容不变时的节奏：固定间隔 + 周期全刷维护。
@@ -479,7 +482,9 @@ class AgentService:
                     self._monitor_partials_since_full += 1
             else:
                 # 只有 AI 内容记录到策略签名；监控页不污染 AI 的变更判定
-                self.policy.record(snapshot, stale=stale, kind=policy_kind)
+                self.policy.record(
+                    snapshot, stale=stale, kind=policy_kind, mode=mode
+                )
             self.runtime.last_refresh_at = now_wall
             self.runtime.last_refresh_kind = plan.kind
             self.runtime.last_refresh_region_count = len(plan.regions)
@@ -536,7 +541,7 @@ class AgentService:
         if not isinstance(obj, dict):
             return
         mode = obj.get("mode")
-        if mode in {"dashboard", "claude", "codex"}:
+        if mode in {"dashboard", "claude", "codex", "gemini"}:
             self.runtime.mode = mode
         bridge = obj.get("bridge_url")
         if isinstance(bridge, str) and bridge and not self.config.bridge_url_env_override:
