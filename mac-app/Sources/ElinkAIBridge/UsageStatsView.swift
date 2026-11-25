@@ -52,6 +52,22 @@ struct DeviceUsage: Identifiable, Equatable {
     var id: String { nodeID ?? "" }
 }
 
+/// 当前窗口内的缓存效率统计：命中率 + 按官方 API 价差折算的缓存节省金额。
+struct CacheEfficiency: Equatable {
+    let hitRate: Double
+    let cacheReadTokens: Int
+    let savedCost: Double
+}
+
+/// 年视图日历热力图中的单天格子。
+struct HeatmapDay: Identifiable, Equatable {
+    let id: String        // "yyyy-MM-dd" 或填充占位键
+    let label: String
+    let tokens: Int
+    let level: Int        // 0...4，0 表示无用量
+    let isInRange: Bool
+}
+
 enum UsageStats {
     static func buckets(rows: [DailyModelUsage], range: StatsRange, now: Date = Date()) -> [StatsBucket] {
         let calendar = StatusService.aggregationCalendar
@@ -244,6 +260,84 @@ enum UsageStats {
         windowTokens > 0 ? min(1, Double(pricedTokens) / Double(windowTokens)) : 1
     }
 
+    /// 缓存命中率与按官方 API 单价差估算的缓存节省金额。
+    /// 分母为输入类 token（`input + cache_read + cache_write`），节省金额按每模型
+    /// `cache_read * max(0, inputPrice - cacheReadPrice)` 累加。
+    static func cacheEfficiency(rows: [ModelCategoryUsage], range: StatsRange,
+                                now: Date = Date(),
+                                table: [String: ModelPricing] = Pricing.table()) -> CacheEfficiency? {
+        let inWindow = windowFilter(range: range, now: now)
+        var promptTokens = 0
+        var cacheReadTokens = 0
+        var savedCost = 0.0
+        for row in rows where inWindow(row.day) && row.tokens > 0 {
+            switch row.category {
+            case "input", "cache_write":
+                promptTokens += row.tokens
+            case "cache_read":
+                promptTokens += row.tokens
+                cacheReadTokens += row.tokens
+                if let pricing = table[row.model] {
+                    let diff = max(0, pricing.input - pricing.cacheRead)
+                    savedCost += Double(row.tokens) / 1_000_000 * diff
+                }
+            default:
+                break
+            }
+        }
+        guard promptTokens > 0, cacheReadTokens > 0 else { return nil }
+        return CacheEfficiency(
+            hitRate: Double(cacheReadTokens) / Double(promptTokens),
+            cacheReadTokens: cacheReadTokens,
+            savedCost: savedCost
+        )
+    }
+
+    /// 近 366 天的日历热力图（按周分列、每列 7 天从周日到周六），供年视图渲染。
+    static func heatmapWeeks(rows: [DailyModelUsage], now: Date = Date()) -> [[HeatmapDay]] {
+        let calendar = StatusService.aggregationCalendar
+        var byDay: [String: Int] = [:]
+        for row in rows where row.tokens > 0 {
+            byDay[row.day, default: 0] += row.tokens
+        }
+        let today = calendar.startOfDay(for: now)
+        guard let startDate = calendar.date(byAdding: .day, value: -365, to: today) else { return [] }
+        // 向前补齐到周日（weekday == 1），保证每列严格 7 行对齐
+        let startWeekday = calendar.component(.weekday, from: startDate) // 1 = Sun ... 7 = Sat
+        let leadingPad = startWeekday - 1
+        var dailyTotals: [(day: String, label: String, tokens: Int)] = []
+        var maxTokens = 0
+        for offset in 0...365 {
+            guard let date = calendar.date(byAdding: .day, value: offset, to: startDate) else { continue }
+            let key = StatusService.dayKey(date)
+            let tokens = byDay[key] ?? 0
+            if tokens > maxTokens { maxTokens = tokens }
+            dailyTotals.append((key, key, tokens))
+        }
+        func level(for tokens: Int) -> Int {
+            guard tokens > 0, maxTokens > 0 else { return 0 }
+            let ratio = Double(tokens) / Double(maxTokens)
+            if ratio >= 0.75 { return 4 }
+            if ratio >= 0.50 { return 3 }
+            if ratio >= 0.25 { return 2 }
+            return 1
+        }
+        var flat: [HeatmapDay] = (0..<leadingPad).map {
+            HeatmapDay(id: "pad-lead-\($0)", label: "", tokens: 0, level: 0, isInRange: false)
+        }
+        flat.append(contentsOf: dailyTotals.map {
+            HeatmapDay(id: $0.day, label: $0.label, tokens: $0.tokens,
+                       level: level(for: $0.tokens), isInRange: true)
+        })
+        let remainder = flat.count % 7
+        if remainder != 0 {
+            for i in 0..<(7 - remainder) {
+                flat.append(HeatmapDay(id: "pad-tail-\(i)", label: "", tokens: 0, level: 0, isInRange: false))
+            }
+        }
+        return stride(from: 0, to: flat.count, by: 7).map { Array(flat[$0..<($0 + 7)]) }
+    }
+
     /// 金额文案。折算出来的等价成本一律按美元计——定价表就是美元标的。
     static func costText(_ cost: Double) -> String {
         UsageFormat.money(cost)
@@ -325,6 +419,7 @@ struct UsageStatsView: View {
     @State private var modelCategoryRows: [ModelCategoryUsage] = []
     @State private var loaded = false
     @State private var hoveredBucket: String?
+    @State private var hoveredHeatmapDay: HeatmapDay?
     @State private var selectedNodeID = ""
 
     var body: some View {
@@ -356,10 +451,14 @@ struct UsageStatsView: View {
                 ScrollView(.vertical, showsIndicators: false) {
                     VStack(spacing: 10) {
                         detail(buckets: buckets, order: order, colors: colors)
+                        if range == .year {
+                            heatmapSection(weeks: UsageStats.heatmapWeeks(rows: chartRows))
+                        }
                         categorySection(
                             UsageStats.categoryTotals(rows: categoryRows, range: range))
                         costSection(
                             UsageStats.costTotal(rows: modelCategoryRows, range: range),
+                            cacheEfficiency: UsageStats.cacheEfficiency(rows: modelCategoryRows, range: range),
                             // 与金额同一个窗口的 token 总量，用来判断覆盖了多少
                             windowTokens: buckets.reduce(0) { $0 + $1.total })
                         if UsageStats.showsDeviceShare(
@@ -387,9 +486,11 @@ struct UsageStatsView: View {
         .onChange(of: range) { value in
             Log.user("change \(provider) usage statistics range to \(value.rawValue)")
             hoveredBucket = nil
+            hoveredHeatmapDay = nil
         }
         .onChange(of: selectedNodeID) { _ in
             hoveredBucket = nil
+            hoveredHeatmapDay = nil
         }
         .onChange(of: clusterNodes.map(\.nodeID)) { ids in
             // 选中的节点离开集群后清空选择，回退为全部主机
@@ -591,26 +692,93 @@ struct UsageStatsView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
+    @ViewBuilder
+    private func heatmapSection(weeks: [[HeatmapDay]]) -> some View {
+        if !weeks.isEmpty {
+            let heading = hoveredHeatmapDay.map { day in
+                day.tokens > 0
+                    ? "\(day.label) · \(UsageFormat.tokens(day.tokens)) tokens"
+                    : tr("\(day.label) · 无用量", "\(day.label) · No usage")
+            } ?? tr("近一年每日活跃热力图 · 悬停查看单日", "365-day activity heatmap · hover a day")
+            VStack(alignment: .leading, spacing: 5) {
+                Text(heading)
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(theme.textSecondary)
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 2) {
+                        ForEach(weeks.indices, id: \.self) { col in
+                            VStack(spacing: 2) {
+                                ForEach(weeks[col]) { day in
+                                    RoundedRectangle(cornerRadius: 1.5)
+                                        .fill(heatmapColor(day))
+                                        .frame(width: 7, height: 7)
+                                        .onHover { inside in
+                                            guard day.isInRange else { return }
+                                            if inside {
+                                                hoveredHeatmapDay = day
+                                            } else if hoveredHeatmapDay?.id == day.id {
+                                                hoveredHeatmapDay = nil
+                                            }
+                                        }
+                                }
+                            }
+                        }
+                    }
+                    .padding(.vertical, 2)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private func heatmapColor(_ day: HeatmapDay) -> Color {
+        guard day.isInRange else { return Color.clear }
+        switch day.level {
+        case 0: return theme.progressTrack
+        case 1: return accent.opacity(theme.dark ? 0.28 : 0.22)
+        case 2: return accent.opacity(theme.dark ? 0.50 : 0.45)
+        case 3: return accent.opacity(theme.dark ? 0.75 : 0.72)
+        default: return accent
+        }
+    }
+
     /// Token 分类区块：占比条 + 各分类数量与百分比。分类数据仅本机记录，
     /// 按官方 API 价折算的等价成本。措辞必须点明是折算：这些用量走的是订阅，
     /// 显示成「费用」会被当成已经扣过的钱。没有定价的模型要说出来，
     /// 否则残缺的总额会被当成全部。
     @ViewBuilder
     private func costSection(_ result: (cost: Double, unpriced: Set<String>, pricedTokens: Int),
+                             cacheEfficiency: CacheEfficiency? = nil,
                              windowTokens: Int) -> some View {
         let coverage = UsageStats.costCoverage(pricedTokens: result.pricedTokens,
                                                windowTokens: windowTokens)
-        if result.cost > 0 || !result.unpriced.isEmpty {
+        if result.cost > 0 || !result.unpriced.isEmpty || cacheEfficiency != nil {
             VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 5) {
-                    Text(tr("\(range.summaryTitle) API 等价成本",
-                            "\(range.summaryTitle) API-equivalent cost"))
-                        .font(.system(size: 9, weight: .semibold))
-                        .foregroundStyle(theme.textSecondary)
-                    Spacer()
-                    Text(UsageStats.costText(result.cost))
-                        .font(.system(size: 11, weight: .bold, design: .monospaced))
-                        .foregroundStyle(theme.textPrimary)
+                if result.cost > 0 || !result.unpriced.isEmpty {
+                    HStack(spacing: 5) {
+                        Text(tr("\(range.summaryTitle) API 等价成本",
+                                "\(range.summaryTitle) API-equivalent cost"))
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundStyle(theme.textSecondary)
+                        Spacer()
+                        Text(UsageStats.costText(result.cost))
+                            .font(.system(size: 11, weight: .bold, design: .monospaced))
+                            .foregroundStyle(theme.textPrimary)
+                    }
+                }
+                if let eff = cacheEfficiency {
+                    HStack(spacing: 5) {
+                        Text(tr("缓存命中率", "Cache hit rate"))
+                            .font(.system(size: 9, weight: .medium))
+                            .foregroundStyle(theme.textSecondary)
+                        Spacer()
+                        Text(eff.savedCost > 0
+                             ? tr(String(format: "%.1f%% · 节省 %@", eff.hitRate * 100, UsageStats.costText(eff.savedCost)),
+                                  String(format: "%.1f%% · saved %@", eff.hitRate * 100, UsageStats.costText(eff.savedCost)))
+                             : String(format: "%.1f%%", eff.hitRate * 100))
+                            .font(.system(size: 9, weight: .bold, design: .monospaced))
+                            .foregroundStyle(theme.statusHealthy)
+                    }
                 }
                 Text(tr("按官方 API 价折算，非订阅实际扣费",
                         "Converted at list API prices — not what your subscription charged"))

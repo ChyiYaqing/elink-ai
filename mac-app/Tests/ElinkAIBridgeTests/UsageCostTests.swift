@@ -203,4 +203,50 @@ final class UsageCostTests: XCTestCase {
         XCTAssertEqual(UsageStats.costText(53.5), "$53.50")
         XCTAssertEqual(UsageStats.costText(1234.56), "$1235")
     }
+
+    func testCacheEfficiencyComputesHitRateAndSavings() throws {
+        let today = StatusService.dayKey(now)
+        // claude-opus-5: input=$5/M, cache_read=$0.5/M -> 每 1M cache_read 节省 $4.5
+        let rows = [
+            row(day: today, model: "claude-opus-5", category: "input", tokens: 200_000),
+            row(day: today, model: "claude-opus-5", category: "cache_write", tokens: 300_000),
+            row(day: today, model: "claude-opus-5", category: "cache_read", tokens: 1_500_000),
+            row(day: today, model: "claude-opus-5", category: "output", tokens: 100_000),
+        ]
+        let eff = try XCTUnwrap(UsageStats.cacheEfficiency(rows: rows, range: .day, now: now,
+                                                           table: Pricing.builtIn))
+        // 1.5M / (0.2M + 0.3M + 1.5M) = 75%
+        XCTAssertEqual(eff.hitRate, 0.75, accuracy: 0.000_001)
+        XCTAssertEqual(eff.cacheReadTokens, 1_500_000)
+        XCTAssertEqual(eff.savedCost, 6.75, accuracy: 0.000_001)
+
+        // 没有缓存读取时返回 nil
+        let noCache = [row(day: today, model: "claude-opus-5", category: "input", tokens: 500_000)]
+        XCTAssertNil(UsageStats.cacheEfficiency(rows: noCache, range: .day, now: now,
+                                                table: Pricing.builtIn))
+    }
+
+    func testYearlyHeatmapAlignsWeeksAndAssignsIntensityLevels() {
+        let calendar = StatusService.aggregationCalendar
+        let day = { (offset: Int) in
+            StatusService.dayKey(calendar.date(byAdding: .day, value: offset, to: self.now)!)
+        }
+        let rows = [
+            DailyModelUsage(day: day(0), provider: "claude", model: "claude-opus-5", tokens: 1_000_000),
+            DailyModelUsage(day: day(-1), provider: "claude", model: "claude-opus-5", tokens: 600_000),
+            DailyModelUsage(day: day(-2), provider: "claude", model: "claude-opus-5", tokens: 300_000),
+            DailyModelUsage(day: day(-3), provider: "claude", model: "claude-opus-5", tokens: 100_000),
+        ]
+        let weeks = UsageStats.heatmapWeeks(rows: rows, now: now)
+        XCTAssertFalse(weeks.isEmpty)
+        XCTAssertTrue(weeks.allSatisfy { $0.count == 7 })
+        let inRange = weeks.flatMap { $0 }.filter(\.isInRange)
+        XCTAssertEqual(inRange.count, 366)
+        let byID = Dictionary(uniqueKeysWithValues: inRange.map { ($0.id, $0) })
+        XCTAssertEqual(byID[day(0)]?.level, 4)
+        XCTAssertEqual(byID[day(-1)]?.level, 3)
+        XCTAssertEqual(byID[day(-2)]?.level, 2)
+        XCTAssertEqual(byID[day(-3)]?.level, 1)
+        XCTAssertEqual(byID[day(-4)]?.level, 0)
+    }
 }

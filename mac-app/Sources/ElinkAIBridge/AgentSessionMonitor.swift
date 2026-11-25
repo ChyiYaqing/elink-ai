@@ -24,6 +24,80 @@ struct TranscriptEntry: Identifiable {
     let text: String
 }
 
+/// 单会话轻量实时监控摘要（随每 3 秒轮询缓存计算，不常驻全量步骤数组）。
+struct SessionMetrics: Equatable {
+    /// 最新一次模型调用的上下文长度（含输入 + 缓存读取 + 缓存写入）；无法可靠获取时为 nil
+    var contextTokens: Int?
+    /// 模型上下文窗口上限；未知模型时为 nil（UI 仅展示绝对 token 数）
+    var contextWindow: Int?
+    /// 缓存命中率（0...1），分母 = 非缓存输入 + 缓存读取 + 缓存写入
+    var cacheHitRate: Double?
+    /// 按官方 API 单价折算的等价成本（美元）；无定价模型或无用量时为 nil
+    var sessionCost: Double?
+    /// 统计窗口内的累计总 token
+    var totalTokens: Int = 0
+
+    var contextRatio: Double? {
+        guard let ctx = contextTokens, let limit = contextWindow, limit > 0 else { return nil }
+        return min(1.0, Double(ctx) / Double(limit))
+    }
+}
+
+enum StepAnomaly: String, Hashable {
+    case lowCache
+    case slowResponse
+    case compaction
+
+    var label: String {
+        switch self {
+        case .lowCache: return tr("低缓存", "Low Cache")
+        case .slowResponse: return tr("慢响应", "Slow")
+        case .compaction: return tr("压缩", "Compaction")
+        }
+    }
+}
+
+/// 按需加载的单次模型调用步骤明细（仅在打开 SessionDetailView 时解析单文件最近 80 步）。
+struct SessionStep: Identifiable, Equatable {
+    let id: String
+    let index: Int
+    let timestamp: Date?
+    let model: String
+    let inputTokens: Int
+    let cacheReadTokens: Int
+    let cacheWriteTokens: Int
+    let outputTokens: Int
+    let reasoningTokens: Int
+    /// 该步上下文长度；Codex 缺少单步 last_token_usage 时为 nil
+    let contextTokens: Int?
+    let durationSeconds: TimeInterval?
+    let cost: Double?
+    var anomalies: [StepAnomaly] = []
+
+    var totalPromptTokens: Int { inputTokens + cacheReadTokens + cacheWriteTokens }
+    var totalGeneratedTokens: Int { outputTokens + reasoningTokens }
+    var totalTokens: Int { totalPromptTokens + totalGeneratedTokens }
+
+    var cacheHitRate: Double? {
+        guard totalPromptTokens > 0 else { return nil }
+        return Double(cacheReadTokens) / Double(totalPromptTokens)
+    }
+
+    var tokensPerSecond: Double? {
+        guard let duration = durationSeconds, duration > 0, totalGeneratedTokens > 0 else { return nil }
+        return Double(totalGeneratedTokens) / duration
+    }
+}
+
+/// 打开 SessionDetailView 时按需加载的单会话完整监控快照。
+struct SessionInspection: Equatable {
+    var metrics: SessionMetrics
+    /// 最近若干步明细，按时间倒序（最新步骤在顶部）
+    var steps: [SessionStep]
+    var unpricedModels: [String] = []
+    var totalStepCount: Int = 0
+}
+
 struct AgentSession: Identifiable {
     let id: String
     let kind: AgentKind
@@ -44,6 +118,8 @@ struct AgentSession: Identifiable {
     var lastActivity: Date?
     // 最近几次模型响应的输出速率；transcript 里拿不到可靠 usage 时为 nil
     var tokensPerSecond: Double?
+    // 实时监控轻量摘要（上下文占用、缓存命中率、会话等价成本）
+    var metrics: SessionMetrics = SessionMetrics()
     // 混合判定：busy = 进程存活且正在对话；存活但安静视为空闲而非完成
     var isBusy: Bool { isLive && Date().timeIntervalSince(lastActivity ?? lastModified) < 30 }
     var anyLive: Bool { isLive || children.contains { $0.isLive } }
@@ -293,16 +369,20 @@ final class SessionScanner {
     /// activity/rate 都来自文件内容，busy 在读取时才拿它和当前时间比，所以
     /// 内容不变就可以原样复用。只在所属监视器的串行队列上访问。
     private typealias TailInfo = (snippet: String, model: String, prompt: String,
-                                  transcript: [TranscriptEntry], activity: Date?, rate: Double?)
+                                  transcript: [TranscriptEntry], activity: Date?, rate: Double?,
+                                  metrics: SessionMetrics)
     private var tailCache: [String: (size: Int, mtime: Date, info: TailInfo)] = [:]
     /// Gemini 会话文件的解析结果，同样按大小与 mtime 复用。Gemini CLI 的 `.json`
     /// 会话是整份对话，长会话可达数 MB，不能每轮 poll 都整份重读。
     private typealias GeminiInfo = (title: String, sessionID: String, model: String,
-                                    snippet: String, activity: Date?, rate: Double?)
+                                    snippet: String, activity: Date?, rate: Double?,
+                                    metrics: SessionMetrics)
     private var geminiCache: [String: (size: Int, mtime: Date, info: GeminiInfo)] = [:]
     /// Antigravity 纯文本回复没有独立结束时间戳：在步骤落盘于文件末尾时记下
     /// 其 `mtime`，后续用户继续对话追加 `USER_INPUT` 后仍能保留已测样本。
     private var antigravityStepEnds: [String: [Int: Date]] = [:]
+    /// 单会话按需详情缓存（仅在打开 SessionDetailView 时写入，关闭或切换时由上层丢弃）
+    private var inspectionCache: (path: String, size: Int, mtime: Date, value: SessionInspection)?
     /// 本轮 scan 用到的路径；scan 结束时据此丢掉已不再扫描的文件
     private var touched = Set<String>()
 
@@ -324,12 +404,14 @@ final class SessionScanner {
     /// （claude 不持有 transcript fd 时的回退）；`geminiCwdCounts` = 进程 cwd →
     /// Gemini CLI 进程数；`antigravityLive` = Antigravity 进程数。它们是判活的唯一依据。
     func scan(live: Set<String>, claudeCwdCounts: [String: Int],
-              geminiCwdCounts: [String: Int] = [:], antigravityLive: Int = 0) -> [AgentSession] {
+              geminiCwdCounts: [String: Int] = [:], antigravityLive: Int = 0,
+              pricing: [String: ModelPricing] = Pricing.table()) -> [AgentSession] {
         let recent: (AgentSession) -> Bool = { $0.isLive || Date().timeIntervalSince($0.lastModified) < 6 * 3600 }
         touched = []
-        var sessions = scanClaude(live: live, cwdCounts: claudeCwdCounts).filter(recent)
-            + groupCodex(scanCodex(live: live).filter(recent))
-            + scanGemini(live: live, cwdCounts: geminiCwdCounts, antigravityLive: antigravityLive).filter(recent)
+        var sessions = scanClaude(live: live, cwdCounts: claudeCwdCounts, pricing: pricing).filter(recent)
+            + groupCodex(scanCodex(live: live, pricing: pricing).filter(recent))
+            + scanGemini(live: live, cwdCounts: geminiCwdCounts,
+                         antigravityLive: antigravityLive, pricing: pricing).filter(recent)
         tailCache = tailCache.filter { touched.contains($0.key) }
         geminiCache = geminiCache.filter { touched.contains($0.key) }
         antigravityStepEnds = antigravityStepEnds.filter { touched.contains($0.key) }
@@ -338,7 +420,8 @@ final class SessionScanner {
     }
 
     private func scanGemini(live: Set<String>, cwdCounts: [String: Int],
-                            antigravityLive: Int) -> [AgentSession] {
+                            antigravityLive: Int,
+                            pricing: [String: ModelPricing]) -> [AgentSession] {
         let files: [(url: URL, mtime: Date)] = (StatusService.geminiChatFiles(
             at: geminiRoot, antigravityRoots: antigravityRoots) ?? []).compactMap { f in
             guard let m = (try? f.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate else {
@@ -371,7 +454,7 @@ final class SessionScanner {
                 isLive = idx < liveByDir[dir, default: 0]
             }
             guard isLive || Date().timeIntervalSince(mtime) < 6 * 3600 else { continue }
-            let info = cachedGeminiInfo(of: file, mtime: mtime, antigravity: antigravity)
+            let info = cachedGeminiInfo(of: file, mtime: mtime, antigravity: antigravity, pricing: pricing)
             out.append(AgentSession(
                 id: file.path,
                 kind: .gemini,
@@ -382,7 +465,8 @@ final class SessionScanner {
                 threadID: info.sessionID,
                 isLive: isLive,
                 lastActivity: info.activity ?? mtime,
-                tokensPerSecond: info.rate
+                tokensPerSecond: info.rate,
+                metrics: info.metrics
             ))
         }
         return out
@@ -492,17 +576,19 @@ final class SessionScanner {
         return root["projects"] as? [String: String] ?? [:]
     }
 
-    private func cachedGeminiInfo(of file: URL, mtime: Date, antigravity: Bool) -> GeminiInfo {
+    private func cachedGeminiInfo(of file: URL, mtime: Date, antigravity: Bool,
+                                  pricing: [String: ModelPricing]) -> GeminiInfo {
         let path = file.path
         touched.insert(path)
         let size = (try? file.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? -1
         if let hit = geminiCache[path], hit.size == size, hit.mtime == mtime { return hit.info }
-        let info = geminiInfo(of: file, mtime: mtime, antigravity: antigravity)
+        let info = geminiInfo(of: file, mtime: mtime, antigravity: antigravity, pricing: pricing)
         geminiCache[path] = (size, mtime, info)
         return info
     }
 
-    private func geminiInfo(of file: URL, mtime: Date, antigravity: Bool) -> GeminiInfo {
+    private func geminiInfo(of file: URL, mtime: Date, antigravity: Bool,
+                            pricing: [String: ModelPricing]) -> GeminiInfo {
         // Antigravity 的文件名与上两级目录都是固定的，会话 ID 是 brain 下的目录名
         var projectName = antigravity
             ? "Antigravity"
@@ -511,7 +597,9 @@ final class SessionScanner {
             ? file.deletingLastPathComponent().deletingLastPathComponent()
                 .deletingLastPathComponent().lastPathComponent
             : file.deletingPathExtension().lastPathComponent
-        guard let data = try? Data(contentsOf: file) else { return (projectName, sessionID, "", "", nil, nil) }
+        guard let data = try? Data(contentsOf: file) else {
+            return (projectName, sessionID, "", "", nil, nil, SessionMetrics())
+        }
         // 读取后核对文件版本（新建 URL 绕过 Foundation 的 resourceValues 缓存），
         // 避免 stat 之后、读取之前落盘导致旧 mtime 被误缓存为新回复的结束时间
         let afterRead = try? URL(fileURLWithPath: file.path)
@@ -570,7 +658,12 @@ final class SessionScanner {
         let observedEnds = antigravity ? (antigravityStepEnds[file.path] ?? [:]) : [:]
         let rate = Self.geminiOutputRate(messages, antigravity: antigravity,
                                          fileModified: stableMtime, observedEnds: observedEnds)
-        return (projectName, sessionID, model, snippet, lastActivity, rate)
+        let parsed = Self.parseGeminiSteps(messages, antigravity: antigravity,
+                                           fileModified: stableMtime, observedEnds: observedEnds,
+                                           pricing: pricing)
+        let metrics = Self.summarizeMetrics(steps: parsed.steps, fallbackModel: model,
+                                            explicitContextWindow: nil)
+        return (projectName, sessionID, model, snippet, lastActivity, rate, metrics)
     }
 
     /// 计算 Gemini CLI / Antigravity 会话最近响应的输出速率（output tokens / 秒）。
@@ -680,7 +773,8 @@ final class SessionScanner {
         return out
     }
 
-    private func scanClaude(live: Set<String>, cwdCounts: [String: Int]) -> [AgentSession] {
+    private func scanClaude(live: Set<String>, cwdCounts: [String: Int],
+                            pricing: [String: ModelPricing]) -> [AgentSession] {
         var out: [AgentSession] = []
         guard let projects = try? fm.contentsOfDirectory(at: claudeRoot, includingPropertiesForKeys: nil) else { return out }
         for proj in projects {
@@ -699,22 +793,23 @@ final class SessionScanner {
                 // 与 scan() 的过滤条件一致：反正会被丢弃的旧文件不读内容
                 if !isLive && Date().timeIntervalSince(mtime) >= 6 * 3600 { continue }
                 let projName = proj.lastPathComponent.split(separator: "-").last.map(String.init) ?? proj.lastPathComponent
-                let info = cachedTailInfo(of: f, mtime: mtime)
+                let info = cachedTailInfo(of: f, kind: .claude, mtime: mtime, pricing: pricing)
                 var sess = AgentSession(id: f.path, kind: .claude, title: projName,
                                         snippet: info.snippet, model: info.model, lastModified: mtime)
                 sess.prompt = info.prompt
                 sess.transcript = info.transcript
                 sess.lastActivity = info.activity
                 sess.tokensPerSecond = info.rate
+                sess.metrics = info.metrics
                 sess.isLive = isLive
-                sess.children = claudeSubagents(sessionFile: f, parentLive: sess.isLive)
+                sess.children = claudeSubagents(sessionFile: f, parentLive: sess.isLive, pricing: pricing)
                 out.append(sess)
             }
         }
         return out
     }
 
-    private func scanCodex(live: Set<String>) -> [AgentSession] {
+    private func scanCodex(live: Set<String>, pricing: [String: ModelPricing]) -> [AgentSession] {
         var out: [AgentSession] = []
         guard let en = fm.enumerator(at: codexRoot, includingPropertiesForKeys: [.contentModificationDateKey]) else { return out }
         for case let f as URL in en where f.pathExtension == "jsonl" {
@@ -722,12 +817,13 @@ final class SessionScanner {
             // 旧文件提前跳过，避免读内容
             if Date().timeIntervalSince(mtime) > 6 * 3600 { continue }
             let meta = codexMeta(of: f)
-            let info = cachedTailInfo(of: f, mtime: mtime)
+            let info = cachedTailInfo(of: f, kind: .codex, mtime: mtime, pricing: pricing)
             var sess = AgentSession(id: f.path, kind: .codex, title: meta.title,
                                     snippet: info.snippet, model: info.model, lastModified: mtime)
             sess.prompt = info.prompt
             sess.transcript = info.transcript
             sess.tokensPerSecond = info.rate
+            sess.metrics = info.metrics
             sess.isLive = live.contains(f.path)
             sess.threadID = meta.id
             sess.parentID = meta.parentID
@@ -738,14 +834,15 @@ final class SessionScanner {
     }
 
     /// Claude Code 子代理 transcript 位于 <proj>/<session-uuid>/subagents/agent-*.jsonl
-    private func claudeSubagents(sessionFile f: URL, parentLive: Bool) -> [AgentSession] {
+    private func claudeSubagents(sessionFile f: URL, parentLive: Bool,
+                                 pricing: [String: ModelPricing]) -> [AgentSession] {
         let dir = f.deletingPathExtension().appendingPathComponent("subagents")
         guard let files = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey]) else { return [] }
         var kids: [AgentSession] = []
         for c in files where c.pathExtension == "jsonl" {
             guard let mtime = (try? c.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate,
                   Date().timeIntervalSince(mtime) < 6 * 3600 else { continue }
-            let info = cachedTailInfo(of: c, mtime: mtime)
+            let info = cachedTailInfo(of: c, kind: .claude, mtime: mtime, pricing: pricing)
             var kid = AgentSession(id: c.path, kind: .claude, title: "subagent",
                                    snippet: info.snippet, model: info.model, lastModified: mtime)
             // 这里没有昵称 —— 用它接到的任务做标签
@@ -755,6 +852,7 @@ final class SessionScanner {
             kid.isLive = parentLive
             kid.lastActivity = info.activity
             kid.tokensPerSecond = info.rate
+            kid.metrics = info.metrics
             kids.append(kid)
         }
         return kids.sorted { $0.lastModified > $1.lastModified }
@@ -783,23 +881,28 @@ final class SessionScanner {
     /// 展开区最多保留的条目数。倒序扫到这个数就停，因此长 transcript 反而
     /// 比原来更早退出，128KB 窗口是上界而非每次都要读满。
     static let maxTranscriptEntries = 40
+    /// SessionDetailView 最多保留的最近步骤数，避免超长会话撑爆 UI 与内存。
+    static let maxInspectionSteps = 80
 
-    private func cachedTailInfo(of file: URL, mtime: Date) -> TailInfo {
+    private func cachedTailInfo(of file: URL, kind: AgentKind, mtime: Date,
+                                pricing: [String: ModelPricing]) -> TailInfo {
         let path = file.path
         touched.insert(path)
         let size = (try? file.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? -1
         if let hit = tailCache[path], hit.size == size, hit.mtime == mtime { return hit.info }
-        let info = tailInfo(of: file)
+        let info = tailInfo(of: file, kind: kind, pricing: pricing)
         tailCache[path] = (size, mtime, info)
         return info
     }
 
     /// 读 jsonl transcript 末尾：最后一段可读文本 + 模型名 + 最后一条
     /// 对话（user/assistant）条目的时间戳，以及展开区滚动用的条目列表。
-    func tailInfo(of file: URL)
+    func tailInfo(of file: URL, kind: AgentKind = .claude,
+                  pricing: [String: ModelPricing] = Pricing.builtIn)
         -> (snippet: String, model: String, prompt: String,
-            transcript: [TranscriptEntry], activity: Date?, rate: Double?) {
-        let empty = ("", "", "", [TranscriptEntry](), Date?.none, Double?.none)
+            transcript: [TranscriptEntry], activity: Date?, rate: Double?,
+            metrics: SessionMetrics) {
+        let empty = ("", "", "", [TranscriptEntry](), Date?.none, Double?.none, SessionMetrics())
         guard let fh = try? FileHandle(forReadingFrom: file) else { return empty }
         defer { try? fh.close() }
         let size = (try? fh.seekToEnd()) ?? 0
@@ -850,7 +953,508 @@ final class SessionScanner {
                     .replacingOccurrences(of: "claude-", with: "")
             }
         }
-        return (snippet, model, prompt, transcript, activity, outputRate(lines))
+        let metrics: SessionMetrics
+        if kind == .codex {
+            let parsed = Self.parseCodexSteps(lines, pricing: pricing, fallbackModel: model)
+            metrics = Self.summarizeMetrics(steps: parsed.steps, fallbackModel: model,
+                                            explicitContextWindow: parsed.contextWindow)
+        } else {
+            let parsed = Self.parseClaudeSteps(lines, pricing: pricing)
+            metrics = Self.summarizeMetrics(steps: parsed.steps, fallbackModel: model,
+                                            explicitContextWindow: nil)
+        }
+        return (snippet, model, prompt, transcript, activity, outputRate(lines), metrics)
+    }
+
+    // MARK: - 会话指标与按需步骤明细
+
+    /// 常见模型上下文窗口上限；未知模型返回 nil，UI 仅展示绝对 token 数，不猜测百分比。
+    static func modelContextWindow(for rawModel: String) -> Int? {
+        let m = rawModel.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !m.isEmpty else { return nil }
+        if m.contains("[1m]") || m.contains("1m") { return 1_000_000 }
+        if m.contains("gemini") { return 1_000_000 }
+        if m.contains("claude") || m.contains("opus") || m.contains("sonnet")
+            || m.contains("haiku") || m.contains("fable") {
+            return 200_000
+        }
+        if m.contains("gpt-5") || m.contains("gpt-6") || m.contains("codex")
+            || m.contains("o3") || m.contains("o4") {
+            return 200_000
+        }
+        return nil
+    }
+
+    /// 按需读取单个会话文件并解析最近 80 步明细（仅在打开 SessionDetailView 时调用）。
+    func inspect(session: AgentSession,
+                 pricing: [String: ModelPricing] = Pricing.table()) -> SessionInspection {
+        let file = URL(fileURLWithPath: session.id)
+        let values = try? file.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
+        let size = values?.fileSize ?? -1
+        let mtime = values?.contentModificationDate ?? session.lastModified
+        if let hit = inspectionCache, hit.path == session.id, hit.size == size, hit.mtime == mtime {
+            return hit.value
+        }
+        let result = Self.inspectFile(file, kind: session.kind, fallbackModel: session.model,
+                                      mtime: mtime,
+                                      observedEnds: antigravityStepEnds[session.id] ?? [:],
+                                      pricing: pricing)
+        inspectionCache = (session.id, size, mtime, result)
+        return result
+    }
+
+    func clearInspectionCache() {
+        inspectionCache = nil
+    }
+
+    static func inspectFile(_ file: URL, kind: AgentKind, fallbackModel: String = "",
+                            mtime: Date? = nil, observedEnds: [Int: Date] = [:],
+                            pricing: [String: ModelPricing] = Pricing.table()) -> SessionInspection {
+        guard let data = try? Data(contentsOf: file) else {
+            return SessionInspection(metrics: SessionMetrics(), steps: [])
+        }
+        let afterRead = try? URL(fileURLWithPath: file.path)
+            .resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
+        let stableMtime: Date? = {
+            guard let mtime, afterRead?.contentModificationDate == mtime,
+                  afterRead?.fileSize == data.count else { return nil }
+            return mtime
+        }()
+        var steps: [SessionStep] = []
+        var unpriced = Set<String>()
+        var explicitWindow: Int?
+        switch kind {
+        case .claude:
+            if let text = String(data: data, encoding: .utf8) {
+                let parsed = parseClaudeSteps(text.split(separator: "\n"), pricing: pricing)
+                steps = parsed.steps
+                unpriced = parsed.unpriced
+            }
+        case .codex:
+            if let text = String(data: data, encoding: .utf8) {
+                let parsed = parseCodexSteps(text.split(separator: "\n"), pricing: pricing,
+                                             fallbackModel: fallbackModel)
+                steps = parsed.steps
+                unpriced = parsed.unpriced
+                explicitWindow = parsed.contextWindow
+            }
+        case .gemini:
+            let antigravity = isAntigravityTranscript(file)
+            var messages: [[String: Any]] = []
+            if file.pathExtension == "json" {
+                let root = (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+                messages = root["messages"] as? [[String: Any]] ?? []
+            } else if let text = String(data: data, encoding: .utf8) {
+                let records = text.split(separator: "\n").compactMap {
+                    try? JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any]
+                }
+                messages = antigravity ? records : replayGeminiLog(records).messages
+            }
+            let parsed = parseGeminiSteps(messages, antigravity: antigravity,
+                                          fileModified: stableMtime, observedEnds: observedEnds,
+                                          pricing: pricing)
+            steps = parsed.steps
+            unpriced = parsed.unpriced
+        }
+        annotateAnomalies(&steps)
+        let metrics = summarizeMetrics(steps: steps, fallbackModel: fallbackModel,
+                                       explicitContextWindow: explicitWindow)
+        let recent = Array(steps.suffix(maxInspectionSteps).reversed())
+        return SessionInspection(metrics: metrics, steps: recent,
+                                 unpricedModels: unpriced.sorted(),
+                                 totalStepCount: steps.count)
+    }
+
+    static func summarizeMetrics(steps: [SessionStep], fallbackModel: String,
+                                 explicitContextWindow: Int?) -> SessionMetrics {
+        guard !steps.isEmpty else { return SessionMetrics() }
+        let latestContext = steps.last(where: { $0.contextTokens != nil })?.contextTokens
+        let latestModel = steps.last(where: { !$0.model.isEmpty })?.model ?? fallbackModel
+        let window = explicitContextWindow ?? modelContextWindow(for: latestModel)
+        let totalPrompt = steps.reduce(0) { $0 + $1.totalPromptTokens }
+        let totalCacheRead = steps.reduce(0) { $0 + $1.cacheReadTokens }
+        let cacheHitRate = totalPrompt > 0 ? Double(totalCacheRead) / Double(totalPrompt) : nil
+        let pricedCosts = steps.compactMap(\.cost)
+        let sessionCost = pricedCosts.isEmpty ? nil : pricedCosts.reduce(0, +)
+        let totalTokens = steps.reduce(0) { $0 + $1.totalTokens }
+        return SessionMetrics(contextTokens: latestContext,
+                              contextWindow: window,
+                              cacheHitRate: cacheHitRate,
+                              sessionCost: sessionCost,
+                              totalTokens: totalTokens)
+    }
+
+    /// 确定性异常标记：低缓存（输入+缓存 ≥ 10K 且命中 < 50%）、慢响应（≥ 30s）、
+    /// 上下文压缩（较上一步下降 > 30% 且降幅 ≥ 10K）。
+    static func annotateAnomalies(_ steps: inout [SessionStep]) {
+        var previousContext: Int?
+        for i in steps.indices {
+            var flags: [StepAnomaly] = []
+            if steps[i].totalPromptTokens >= 10_000,
+               let hit = steps[i].cacheHitRate, hit < 0.5 {
+                flags.append(.lowCache)
+            }
+            if let duration = steps[i].durationSeconds, duration >= 30.0 {
+                flags.append(.slowResponse)
+            }
+            if let cur = steps[i].contextTokens {
+                if let prev = previousContext, prev > 0,
+                   prev - cur >= 10_000,
+                   Double(cur) / Double(prev) < 0.7 {
+                    flags.append(.compaction)
+                }
+                previousContext = cur
+            }
+            steps[i].anomalies = flags
+        }
+    }
+
+    private static func pricingModelKey(_ rawModel: String, kind: AgentKind,
+                                        pricing: [String: ModelPricing]) -> String {
+        switch kind {
+        case .gemini:
+            return StatusService.normalizedGeminiModel(rawModel)
+        case .claude:
+            let normalized = rawModel.trimmingCharacters(in: .whitespacesAndNewlines)
+            if pricing[normalized] != nil { return normalized }
+            let prefixed = normalized.hasPrefix("claude-") ? normalized : "claude-\(normalized)"
+            return pricing[prefixed] != nil ? prefixed : normalized
+        case .codex:
+            return rawModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+    }
+
+    private static func stepCost(rawModel: String, kind: AgentKind,
+                                 input: Int, cacheRead: Int, cacheWrite: Int,
+                                 output: Int, reasoning: Int,
+                                 pricing: [String: ModelPricing],
+                                 unpriced: inout Set<String>) -> Double? {
+        guard !rawModel.isEmpty else { return nil }
+        let key = pricingModelKey(rawModel, kind: kind, pricing: pricing)
+        var categories: [String: Int] = [:]
+        if input > 0 { categories["input"] = input }
+        if cacheRead > 0 { categories["cache_read"] = cacheRead }
+        if cacheWrite > 0 { categories["cache_write"] = cacheWrite }
+        if output > 0 { categories["output"] = output }
+        if reasoning > 0 { categories["reasoning"] = reasoning }
+        guard !categories.isEmpty else { return nil }
+        if let cost = Pricing.cost(model: key, categories: categories, table: pricing) {
+            return cost
+        }
+        unpriced.insert(key)
+        return nil
+    }
+
+    static func parseClaudeSteps(_ lines: [Substring], pricing: [String: ModelPricing])
+        -> (steps: [SessionStep], unpriced: Set<String>) {
+        struct Entry {
+            var start: Date?
+            var end: Date?
+            var model: String
+            var input: Int
+            var cacheRead: Int
+            var cacheWrite: Int
+            var output: Int
+            var final: Bool
+        }
+        var lastInput: Date?
+        var byID: [String: Entry] = [:]
+        var order: [String] = []
+        for line in lines {
+            guard let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any] else { continue }
+            let type = obj["type"] as? String
+            let ts = (obj["timestamp"] as? String).flatMap(StatusService.timestamp)
+            if type == "user" {
+                lastInput = ts
+            } else if type == "assistant", let msg = obj["message"] as? [String: Any],
+                      let id = msg["id"] as? String,
+                      let rawModel = msg["model"] as? String,
+                      rawModel != "<synthetic>" {
+                let usage = msg["usage"] as? [String: Any]
+                let input = max(0, (usage?["input_tokens"] as? NSNumber)?.intValue ?? 0)
+                let cacheRead = max(0, (usage?["cache_read_input_tokens"] as? NSNumber)?.intValue ?? 0)
+                let cacheWrite = max(0, (usage?["cache_creation_input_tokens"] as? NSNumber)?.intValue ?? 0)
+                let output = max(0, (usage?["output_tokens"] as? NSNumber)?.intValue ?? 0)
+                let final = msg["stop_reason"] is String
+                if var e = byID[id] {
+                    if let ts { e.end = ts }
+                    e.input = max(e.input, input)
+                    e.cacheRead = max(e.cacheRead, cacheRead)
+                    e.cacheWrite = max(e.cacheWrite, cacheWrite)
+                    e.output = max(e.output, output)
+                    e.final = e.final || final
+                    byID[id] = e
+                } else {
+                    byID[id] = Entry(start: lastInput, end: ts, model: rawModel,
+                                     input: input, cacheRead: cacheRead,
+                                     cacheWrite: cacheWrite, output: output, final: final)
+                    order.append(id)
+                }
+            }
+        }
+        var steps: [SessionStep] = []
+        var unpriced = Set<String>()
+        for id in order {
+            guard let e = byID[id] else { continue }
+            let prompt = e.input + e.cacheRead + e.cacheWrite
+            guard prompt + e.output > 0 else { continue }
+            let duration: TimeInterval? = {
+                guard e.final, let start = e.start, let end = e.end else { return nil }
+                let dt = end.timeIntervalSince(start)
+                return dt > 0 ? dt : nil
+            }()
+            let cost = stepCost(rawModel: e.model, kind: .claude,
+                                input: e.input, cacheRead: e.cacheRead, cacheWrite: e.cacheWrite,
+                                output: e.output, reasoning: 0,
+                                pricing: pricing, unpriced: &unpriced)
+            let displayModel = e.model.replacingOccurrences(of: "claude-", with: "")
+            steps.append(SessionStep(
+                id: "claude:\(id)",
+                index: steps.count + 1,
+                timestamp: e.end,
+                model: displayModel,
+                inputTokens: e.input,
+                cacheReadTokens: e.cacheRead,
+                cacheWriteTokens: e.cacheWrite,
+                outputTokens: e.output,
+                reasoningTokens: 0,
+                contextTokens: prompt > 0 ? prompt : nil,
+                durationSeconds: duration,
+                cost: cost
+            ))
+        }
+        return (steps, unpriced)
+    }
+
+    static func parseCodexSteps(_ lines: [Substring], pricing: [String: ModelPricing],
+                                fallbackModel: String)
+        -> (steps: [SessionStep], unpriced: Set<String>, contextWindow: Int?) {
+        var steps: [SessionStep] = []
+        var unpriced = Set<String>()
+        var currentModel = fallbackModel
+        var contextWindow: Int?
+        var lastInput: Date?
+        var codexStart: Date?
+        var inResponse = false
+        var previousTotal: Int?
+        var previousFields: [String: Int] = [:]
+
+        func appendStep(ts: Date?, fields: [String: Int], hasLastUsage: Bool, suffix: String) {
+            let rawInput = max(0, fields["input_tokens"] ?? 0)
+            let cached = max(0, fields["cached_input_tokens"] ?? 0)
+            let rawOutput = max(0, fields["output_tokens"] ?? 0)
+            let reasoning = max(0, fields["reasoning_output_tokens"] ?? 0)
+            let nonCachedInput = max(0, rawInput - cached)
+            let nonReasoningOutput = max(0, rawOutput - reasoning)
+            guard nonCachedInput + cached + nonReasoningOutput + reasoning > 0 else { return }
+            let duration: TimeInterval? = {
+                guard inResponse, let start = codexStart, let ts else { return nil }
+                let dt = ts.timeIntervalSince(start)
+                return dt > 0 ? dt : nil
+            }()
+            let cost = stepCost(rawModel: currentModel, kind: .codex,
+                                input: nonCachedInput, cacheRead: cached, cacheWrite: 0,
+                                output: nonReasoningOutput, reasoning: reasoning,
+                                pricing: pricing, unpriced: &unpriced)
+            // Codex 只有在存在单步 last_token_usage 时才能可靠得出上下文长度，
+            // 绝不拿会话累计 total_token_usage 冒充当前上下文。
+            let contextTokens = (hasLastUsage && rawInput > 0) ? rawInput : nil
+            steps.append(SessionStep(
+                id: "codex:\(steps.count + 1):\(suffix)",
+                index: steps.count + 1,
+                timestamp: ts,
+                model: currentModel,
+                inputTokens: nonCachedInput,
+                cacheReadTokens: cached,
+                cacheWriteTokens: 0,
+                outputTokens: nonReasoningOutput,
+                reasoningTokens: reasoning,
+                contextTokens: contextTokens,
+                durationSeconds: duration,
+                cost: cost
+            ))
+            codexStart = nil
+            inResponse = false
+        }
+
+        for line in lines {
+            guard let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                  let payload = obj["payload"] as? [String: Any] else { continue }
+            if let m = payload["model"] as? String, !m.isEmpty { currentModel = m }
+            let type = obj["type"] as? String
+            let ptype = payload["type"] as? String ?? ""
+            let ts = (obj["timestamp"] as? String).flatMap(StatusService.timestamp)
+            if type == "token_usage_record", let usage = payload["usage"] as? [String: Any] {
+                let fields = [
+                    "input_tokens": (usage["input_tokens"] as? NSNumber)?.intValue ?? 0,
+                    "cached_input_tokens": (usage["cached_input_tokens"] as? NSNumber)?.intValue ?? 0,
+                    "output_tokens": (usage["output_tokens"] as? NSNumber)?.intValue ?? 0,
+                    "reasoning_output_tokens": (usage["reasoning_output_tokens"] as? NSNumber)?.intValue ?? 0,
+                ]
+                appendStep(ts: ts, fields: fields, hasLastUsage: fields["input_tokens"] ?? 0 > 0,
+                           suffix: "rec")
+            } else if ptype == "token_count", let info = payload["info"] as? [String: Any] {
+                if let win = (info["model_context_window"] as? NSNumber)?.intValue, win > 0 {
+                    contextWindow = win
+                }
+                guard let total = info["total_token_usage"] as? [String: Any],
+                      let cumulative = (total["total_tokens"] as? NSNumber)?.intValue else { continue }
+                let lastUsage = info["last_token_usage"] as? [String: Any]
+                func extract(_ dict: [String: Any]) -> [String: Int] {
+                    [
+                        "input_tokens": (dict["input_tokens"] as? NSNumber)?.intValue ?? 0,
+                        "cached_input_tokens": (dict["cached_input_tokens"] as? NSNumber)?.intValue ?? 0,
+                        "output_tokens": (dict["output_tokens"] as? NSNumber)?.intValue ?? 0,
+                        "reasoning_output_tokens": (dict["reasoning_output_tokens"] as? NSNumber)?.intValue ?? 0,
+                    ]
+                }
+                let cumulativeFields = extract(total)
+                let deltaFields: [String: Int]
+                if let previousTotal, cumulative == previousTotal {
+                    deltaFields = [:]
+                } else if let lastUsage {
+                    deltaFields = extract(lastUsage)
+                } else if previousTotal != nil {
+                    deltaFields = cumulativeFields.reduce(into: [:]) { acc, entry in
+                        acc[entry.key] = max(0, entry.value - (previousFields[entry.key] ?? 0))
+                    }
+                } else {
+                    deltaFields = cumulativeFields
+                }
+                previousTotal = cumulative
+                previousFields = cumulativeFields
+                if !deltaFields.isEmpty {
+                    appendStep(ts: ts, fields: deltaFields, hasLastUsage: lastUsage != nil,
+                               suffix: "cnt")
+                }
+            } else if type == "response_item" {
+                if ptype.hasSuffix("_output")
+                    || (ptype == "message" && payload["role"] as? String != "assistant") {
+                    lastInput = ts
+                } else if !inResponse {
+                    inResponse = true
+                    codexStart = lastInput
+                }
+            } else if type == "event_msg", ptype == "user_message" {
+                lastInput = ts
+            }
+        }
+        return (steps, unpriced, contextWindow)
+    }
+
+    static func parseGeminiSteps(_ messages: [[String: Any]], antigravity: Bool,
+                                 fileModified: Date? = nil, observedEnds: [Int: Date] = [:],
+                                 pricing: [String: ModelPricing])
+        -> (steps: [SessionStep], unpriced: Set<String>) {
+        var steps: [SessionStep] = []
+        var unpriced = Set<String>()
+        if antigravity {
+            for i in messages.indices {
+                let msg = messages[i]
+                guard msg["type"] as? String == "PLANNER_RESPONSE",
+                      (msg["status"] as? String ?? "DONE") == "DONE" else { continue }
+                let input = max(0, (msg["input_tokens"] as? NSNumber)?.intValue ?? 0)
+                let cacheRead = max(0, (msg["cache_read_tokens"] as? NSNumber)?.intValue ?? 0)
+                let output = max(0, (msg["output_tokens"] as? NSNumber)?.intValue ?? 0)
+                guard input + cacheRead + output > 0 else { continue }
+                let start = StatusService.timestamp(msg["created_at"])
+                let stepIdx = (msg["step_index"] as? NSNumber)?.intValue
+                let end: Date? = {
+                    guard let start else { return nil }
+                    if messages.indices.contains(i + 1) {
+                        let next = messages[i + 1]
+                        if next["type"] as? String != "USER_INPUT",
+                           next["source"] as? String != "USER_EXPLICIT",
+                           next["source"] as? String != "SYSTEM" {
+                            return StatusService.timestamp(next["created_at"])
+                        } else if let stepIdx {
+                            return observedEnds[stepIdx]
+                        }
+                        return nil
+                    } else if let stepIdx, let recorded = observedEnds[stepIdx] {
+                        return recorded
+                    } else if let mtime = fileModified, mtime.timeIntervalSince(start) <= 600 {
+                        return mtime
+                    }
+                    return nil
+                }()
+                let duration: TimeInterval? = {
+                    guard let start, let end else { return nil }
+                    let dt = end.timeIntervalSince(start)
+                    return dt > 0 ? dt : nil
+                }()
+                let rawModel = msg["model"] as? String ?? ""
+                let cost = stepCost(rawModel: rawModel, kind: .gemini,
+                                    input: input, cacheRead: cacheRead, cacheWrite: 0,
+                                    output: output, reasoning: 0,
+                                    pricing: pricing, unpriced: &unpriced)
+                let context = input + cacheRead
+                steps.append(SessionStep(
+                    id: "agy:\(stepIdx ?? i)",
+                    index: steps.count + 1,
+                    timestamp: end ?? start,
+                    model: rawModel,
+                    inputTokens: input,
+                    cacheReadTokens: cacheRead,
+                    cacheWriteTokens: 0,
+                    outputTokens: output,
+                    reasoningTokens: 0,
+                    contextTokens: context > 0 ? context : nil,
+                    durationSeconds: duration,
+                    cost: cost
+                ))
+            }
+        } else {
+            var lastInput: Date?
+            for (i, msg) in messages.enumerated() {
+                let type = msg["type"] as? String
+                if type == "user" {
+                    lastInput = StatusService.timestamp(msg["timestamp"])
+                } else if type == "gemini" {
+                    let ts = StatusService.timestamp(msg["timestamp"])
+                    if let tokens = msg["tokens"] as? [String: Any] {
+                        let rawInput = max(0, (tokens["input"] as? NSNumber)?.intValue ?? 0)
+                        let cached = max(0, (tokens["cached"] as? NSNumber)?.intValue ?? 0)
+                        let output = max(0, (tokens["output"] as? NSNumber)?.intValue ?? 0)
+                        let thoughts = max(0, (tokens["thoughts"] as? NSNumber)?.intValue ?? 0)
+                        let tool = max(0, (tokens["tool"] as? NSNumber)?.intValue ?? 0)
+                        let nonCachedInput = max(0, rawInput - cached) + tool
+                        if nonCachedInput + cached + output + thoughts > 0 {
+                            let duration: TimeInterval? = {
+                                guard let start = lastInput, let end = ts else { return nil }
+                                let dt = end.timeIntervalSince(start)
+                                return dt > 0 ? dt : nil
+                            }()
+                            let rawModel = msg["model"] as? String ?? ""
+                            let cost = stepCost(rawModel: rawModel, kind: .gemini,
+                                                input: nonCachedInput, cacheRead: cached, cacheWrite: 0,
+                                                output: output, reasoning: thoughts,
+                                                pricing: pricing, unpriced: &unpriced)
+                            let id = (msg["id"] as? String) ?? "\(i)"
+                            steps.append(SessionStep(
+                                id: "gemini:\(id)",
+                                index: steps.count + 1,
+                                timestamp: ts,
+                                model: rawModel,
+                                inputTokens: nonCachedInput,
+                                cacheReadTokens: cached,
+                                cacheWriteTokens: 0,
+                                outputTokens: output,
+                                reasoningTokens: thoughts,
+                                contextTokens: rawInput > 0 ? rawInput : nil,
+                                durationSeconds: duration,
+                                cost: cost
+                            ))
+                        }
+                    }
+                    let toolEnd = (msg["toolCalls"] as? [[String: Any]])?
+                        .compactMap { StatusService.timestamp($0["timestamp"]) }
+                        .max()
+                    if let nextStart = toolEnd ?? ts { lastInput = nextStart }
+                }
+            }
+        }
+        return (steps, unpriced)
     }
 
     /// 参与速率计算的最近响应数。
@@ -1177,8 +1781,23 @@ final class AgentSessionMonitor {
         }
     }
 
+    func inspect(session: AgentSession, completion: @escaping (SessionInspection) -> Void) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            let result = self.scanner.inspect(session: session)
+            DispatchQueue.main.async { completion(result) }
+        }
+    }
+
+    func clearInspectionCache() {
+        queue.async { [weak self] in self?.scanner.clearInspectionCache() }
+    }
+
     /// 面板关闭时调用，避免重开时用陈旧的 miss 计数闪现过期存活状态。
     func reset() {
-        queue.async { [weak self] in self?.tracker.reset() }
+        queue.async { [weak self] in
+            self?.tracker.reset()
+            self?.scanner.clearInspectionCache()
+        }
     }
 }

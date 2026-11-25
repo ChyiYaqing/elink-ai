@@ -704,6 +704,121 @@ final class AgentSessionMonitorTests: XCTestCase {
         XCTAssertEqual(AgentSessionsCard.relativeTime(now.addingTimeInterval(-2 * 86_400), now: now), "2d")
     }
 
+    // MARK: - 会话监控指标与步骤明细
+
+    func testClaudeInspectionExtractsMetricsStepsAndAnomalies() throws {
+        let t0 = Date(timeIntervalSince1970: floor(Date().timeIntervalSince1970) - 300)
+        func at(_ s: Double) -> String { Self.iso.string(from: t0.addingTimeInterval(s)) }
+        try write([
+            #"{"type":"user","message":{"content":"start"},"timestamp":"\#(at(0))"}"#,
+            // 第 1 步：正常高缓存（90% cache hit, 100K context）
+            #"{"type":"assistant","message":{"id":"m1","model":"claude-opus-5","stop_reason":"end_turn","usage":{"input_tokens":5000,"cache_creation_input_tokens":5000,"cache_read_input_tokens":90000,"output_tokens":500},"content":[{"type":"text","text":"ok"}]},"timestamp":"\#(at(5))"}"#,
+            #"{"type":"user","message":{"content":"next"},"timestamp":"\#(at(10))"}"#,
+            // 第 2 步：低缓存（20% < 50% 且 prompt >= 10K）+ 慢响应（35s >= 30s）
+            #"{"type":"assistant","message":{"id":"m2","model":"claude-opus-5","stop_reason":"end_turn","usage":{"input_tokens":80000,"cache_creation_input_tokens":0,"cache_read_input_tokens":20000,"output_tokens":1000},"content":[{"type":"text","text":"slow"}]},"timestamp":"\#(at(45))"}"#,
+            #"{"type":"user","message":{"content":"compact"},"timestamp":"\#(at(50))"}"#,
+            // 第 3 步：上下文压缩（100K -> 40K，下降 60% 且 >= 10K）
+            #"{"type":"assistant","message":{"id":"m3","model":"claude-opus-5","stop_reason":"end_turn","usage":{"input_tokens":4000,"cache_creation_input_tokens":0,"cache_read_input_tokens":36000,"output_tokens":400},"content":[{"type":"text","text":"compacted"}]},"timestamp":"\#(at(54))"}"#,
+        ], to: "-Users-me-myproj/inspect.jsonl", under: claudeRoot)
+
+        let s = scanner()
+        let session = try XCTUnwrap(s.scan(live: [], claudeCwdCounts: [:], pricing: Pricing.builtIn).first)
+        XCTAssertEqual(session.metrics.contextTokens, 40_000)
+        XCTAssertEqual(session.metrics.contextWindow, 200_000)
+        XCTAssertEqual(try XCTUnwrap(session.metrics.contextRatio), 0.2, accuracy: 0.001)
+        // cache_read = 90k + 20k + 36k = 146k; prompt = 100k + 100k + 40k = 240k
+        XCTAssertEqual(try XCTUnwrap(session.metrics.cacheHitRate), 146.0 / 240.0, accuracy: 0.001)
+        XCTAssertNotNil(session.metrics.sessionCost)
+        XCTAssertNotNil(AgentSessionsCard.metricsSummaryText(session.metrics))
+
+        let inspection = s.inspect(session: session, pricing: Pricing.builtIn)
+        XCTAssertEqual(inspection.totalStepCount, 3)
+        // 倒序展示：最新第 3 步在最前
+        XCTAssertEqual(inspection.steps.map(\.index), [3, 2, 1])
+        XCTAssertEqual(inspection.steps[0].anomalies, [.compaction])
+        XCTAssertEqual(Set(inspection.steps[1].anomalies), Set([.lowCache, .slowResponse]))
+        XCTAssertTrue(inspection.steps[2].anomalies.isEmpty)
+    }
+
+    func testCodexInspectionUsesLastTokenUsageAndDegradesWithoutIt() throws {
+        let t0 = Date(timeIntervalSince1970: floor(Date().timeIntervalSince1970) - 200)
+        func at(_ s: Double) -> String { Self.iso.string(from: t0.addingTimeInterval(s)) }
+        // 含 last_token_usage 与 model_context_window 的现代 Codex 日志
+        try write([
+            #"{"payload":{"id":"r1","cwd":"/Users/me/proj","model":"gpt-6-sol"}}"#,
+            #"{"type":"event_msg","payload":{"type":"user_message","message":"hi"},"timestamp":"\#(at(0))"}"#,
+            #"{"type":"response_item","payload":{"type":"reasoning"},"timestamp":"\#(at(2))"}"#,
+            #"{"type":"event_msg","payload":{"type":"token_count","info":{"model_context_window":258400,"total_token_usage":{"input_tokens":50000,"cached_input_tokens":40000,"output_tokens":1000,"reasoning_output_tokens":400,"total_tokens":51000},"last_token_usage":{"input_tokens":50000,"cached_input_tokens":40000,"output_tokens":1000,"reasoning_output_tokens":400,"total_tokens":51000}}},"timestamp":"\#(at(10))"}"#,
+        ], to: "rollout-modern.jsonl", under: codexRoot)
+
+        let s = scanner()
+        let modern = try XCTUnwrap(s.scan(live: [], claudeCwdCounts: [:], pricing: Pricing.builtIn).first)
+        XCTAssertEqual(modern.metrics.contextTokens, 50_000)
+        XCTAssertEqual(modern.metrics.contextWindow, 258_400)
+        XCTAssertEqual(try XCTUnwrap(modern.metrics.cacheHitRate), 0.8, accuracy: 0.001)
+
+        let insp = s.inspect(session: modern, pricing: Pricing.builtIn)
+        XCTAssertEqual(insp.steps.count, 1)
+        XCTAssertEqual(insp.steps[0].reasoningTokens, 400)
+        XCTAssertEqual(insp.steps[0].outputTokens, 600)
+
+        // 老日志只有 total_token_usage 没有 last_token_usage：绝不拿累计值冒充当前上下文
+        let legacyFile = try write([
+            #"{"payload":{"id":"r2","cwd":"/Users/me/proj","model":"gpt-6-sol"}}"#,
+            #"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":900000,"cached_input_tokens":0,"output_tokens":1000,"reasoning_output_tokens":0,"total_tokens":901000}}},"timestamp":"\#(at(10))"}"#,
+        ], to: "rollout-legacy.jsonl", under: codexRoot)
+        let legacyInsp = SessionScanner.inspectFile(legacyFile, kind: .codex, fallbackModel: "gpt-6-sol",
+                                                    pricing: Pricing.builtIn)
+        XCTAssertNil(legacyInsp.metrics.contextTokens)
+        XCTAssertNil(legacyInsp.steps.first?.contextTokens)
+    }
+
+    func testGeminiAndAntigravityInspectionAndUnknownWindowFallback() throws {
+        let t0 = Date(timeIntervalSince1970: floor(Date().timeIntervalSince1970) - 200)
+        func at(_ s: Double) -> String { ISO8601DateFormatter().string(from: t0.addingTimeInterval(s)) }
+        try write([
+            #"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","created_at":"\#(at(0))","content":"hi"}"#,
+            #"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"\#(at(0))","model":"gemini-4-neon-medium","input_tokens":20000,"cache_read_tokens":80000,"output_tokens":500}"#,
+            #"{"step_index":2,"source":"MODEL","type":"GENERIC","created_at":"\#(at(10))","content":"ok"}"#,
+        ], to: "conv-insp/.system_generated/logs/transcript.jsonl", under: antigravityRoot,
+           mtime: t0.addingTimeInterval(10))
+
+        let s = scanner()
+        let agy = try XCTUnwrap(s.scan(live: [], claudeCwdCounts: [:], pricing: Pricing.builtIn).first)
+        XCTAssertEqual(agy.metrics.contextTokens, 100_000)
+        XCTAssertEqual(agy.metrics.contextWindow, 1_000_000)
+        XCTAssertEqual(try XCTUnwrap(agy.metrics.cacheHitRate), 0.8, accuracy: 0.001)
+        XCTAssertNotNil(agy.metrics.sessionCost)
+
+        // 未知模型不猜测上下文上限，UI 展示绝对 token 数而不是假百分比
+        XCTAssertNil(SessionScanner.modelContextWindow(for: "custom-mystery-model"))
+        let unknownMetrics = SessionMetrics(contextTokens: 142_000, contextWindow: nil,
+                                            cacheHitRate: nil, sessionCost: nil, totalTokens: 142_000)
+        XCTAssertEqual(SessionDetailView.contextValueText(unknownMetrics), "\(UsageFormat.tokens(142_000)) ctx")
+    }
+
+    func testInspectionCapsStepsToLatestEightyAndReusesCache() throws {
+        let t0 = Date(timeIntervalSince1970: floor(Date().timeIntervalSince1970) - 200)
+        let ts = Self.iso.string(from: t0)
+        let lines = (1...100).map { i in
+            #"{"type":"assistant","message":{"id":"m\#(i)","model":"claude-opus-5","stop_reason":"end_turn","usage":{"input_tokens":1000,"cache_read_input_tokens":4000,"output_tokens":100},"content":[{"type":"text","text":"ok"}]},"timestamp":"\#(ts)"}"#
+        }
+        let mtime = t0.addingTimeInterval(10)
+        let file = try write(lines, to: "-Users-me-big/sess.jsonl", under: claudeRoot, mtime: mtime)
+        let sess = AgentSession(id: file.path, kind: .claude, title: "big", snippet: "",
+                                model: "opus-5", lastModified: mtime)
+        let s = scanner()
+        let first = s.inspect(session: sess, pricing: Pricing.builtIn)
+        XCTAssertEqual(first.totalStepCount, 100)
+        XCTAssertEqual(first.steps.count, SessionScanner.maxInspectionSteps)
+        XCTAssertEqual(first.steps.first?.index, 100)
+        XCTAssertEqual(first.steps.last?.index, 21)
+
+        // 相同 size 与 mtime 命中缓存
+        let second = s.inspect(session: sess, pricing: Pricing.builtIn)
+        XCTAssertEqual(second, first)
+    }
+
     // MARK: - 子进程超时
 
     private func liveThreadCount() -> Int {
