@@ -577,6 +577,16 @@ final class AgentSessionMonitorTests: XCTestCase {
         // (400 + 600) tokens / (10s + 10s) = 50 tok/s
         XCTAssertEqual(try XCTUnwrap(s.tokensPerSecond), 50, accuracy: 0.001)
         XCTAssertTrue(AgentSessionsCard.tagText(s, now: t0.addingTimeInterval(25)).contains("50 tok/s"))
+
+        // 新用户消息缺少有效时间戳时必须清除上一轮起点，不能把跨轮空闲时间计入耗时
+        let brokenTurn: [[String: Any]] = [
+            ["type": "user", "timestamp": at(0)],
+            ["type": "gemini", "timestamp": at(10), "tokens": ["output": 500]],
+            ["type": "user"],
+            ["type": "gemini", "timestamp": at(200), "tokens": ["output": 100]],
+        ]
+        XCTAssertEqual(try XCTUnwrap(SessionScanner.geminiOutputRate(brokenTurn, antigravity: false)),
+                       50, accuracy: 0.001)
     }
 
     func testAntigravityOutputRatePairsPlannerWithNextModelStepAndFinalMtime() throws {

@@ -512,6 +512,12 @@ final class SessionScanner {
                 .deletingLastPathComponent().lastPathComponent
             : file.deletingPathExtension().lastPathComponent
         guard let data = try? Data(contentsOf: file) else { return (projectName, sessionID, "", "", nil, nil) }
+        // 读取后核对文件版本（新建 URL 绕过 Foundation 的 resourceValues 缓存），
+        // 避免 stat 之后、读取之前落盘导致旧 mtime 被误缓存为新回复的结束时间
+        let afterRead = try? URL(fileURLWithPath: file.path)
+            .resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
+        let stableMtime: Date? = (afterRead?.contentModificationDate == mtime
+                                  && afterRead?.fileSize == data.count) ? mtime : nil
         var meta: [String: Any] = [:]
         var messages: [[String: Any]] = []
         // 按扩展名分流：只有一行的 `.jsonl` 也能整份解析成对象，不能拿来判断格式
@@ -550,20 +556,20 @@ final class SessionScanner {
             }
             if !model.isEmpty && lastActivity != nil && !snippet.isEmpty { break }
         }
-        if antigravity, let last = messages.last,
+        if antigravity, let stableMtime, let last = messages.last,
            last["type"] as? String == "PLANNER_RESPONSE",
            (last["status"] as? String ?? "DONE") == "DONE",
            let step = (last["step_index"] as? NSNumber)?.intValue,
            antigravityStepEnds[file.path]?[step] == nil,
            let start = StatusService.timestamp(last["created_at"]) {
-            let dt = mtime.timeIntervalSince(start)
+            let dt = stableMtime.timeIntervalSince(start)
             if dt > 0 && dt <= 600 {
-                antigravityStepEnds[file.path, default: [:]][step] = mtime
+                antigravityStepEnds[file.path, default: [:]][step] = stableMtime
             }
         }
         let observedEnds = antigravity ? (antigravityStepEnds[file.path] ?? [:]) : [:]
         let rate = Self.geminiOutputRate(messages, antigravity: antigravity,
-                                         fileModified: mtime, observedEnds: observedEnds)
+                                         fileModified: stableMtime, observedEnds: observedEnds)
         return (projectName, sessionID, model, snippet, lastActivity, rate)
     }
 
@@ -620,7 +626,7 @@ final class SessionScanner {
             for msg in messages {
                 let type = msg["type"] as? String
                 if type == "user" {
-                    if let ts = StatusService.timestamp(msg["timestamp"]) { lastInput = ts }
+                    lastInput = StatusService.timestamp(msg["timestamp"])
                 } else if type == "gemini" {
                     let ts = StatusService.timestamp(msg["timestamp"])
                     if let start = lastInput, let end = ts,
