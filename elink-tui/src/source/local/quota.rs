@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
@@ -23,19 +24,15 @@ fn gemini_oauth_client_config() -> Option<(String, String)> {
             return Some((id, secret));
         }
     }
-    let dirs = [
-        "/opt/homebrew/lib/node_modules/@google/gemini-cli/bundle",
-        "/usr/local/lib/node_modules/@google/gemini-cli/bundle",
-        "/usr/lib/node_modules/@google/gemini-cli/bundle",
-    ];
-    for dir in dirs {
+    let path_var = std::env::var_os("PATH");
+    for dir in gemini_cli_bundle_dirs(dirs::home_dir().as_deref(), path_var.as_deref()) {
         let Ok(entries) = fs::read_dir(dir) else {
             continue;
         };
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if !name.starts_with("chunk-") || !name.ends_with(".js") {
+            if !name.ends_with(".js") {
                 continue;
             }
             let Ok(text) = fs::read_to_string(entry.path()) else {
@@ -55,17 +52,115 @@ fn gemini_oauth_client_config() -> Option<(String, String)> {
     None
 }
 
+/// Bundle directories that may hold `@google/gemini-cli`. The `gemini`
+/// symlinks on PATH and in the usual bin directories are followed first
+/// (Homebrew formula, ~/.npm-global, ...), then the default global npm,
+/// Homebrew Cellar and nvm / volta / fnm locations are added.
+fn gemini_cli_bundle_dirs(home: Option<&Path>, path_var: Option<&OsStr>) -> Vec<PathBuf> {
+    const PKG: &str = "@google/gemini-cli";
+    fn children(dir: &Path) -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> = fs::read_dir(dir)
+            .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
+            .unwrap_or_default();
+        out.sort_unstable_by(|a, b| b.cmp(a));
+        out
+    }
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut add = |dir: PathBuf| {
+        if dir.is_dir() && !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    };
+    let mut bins: Vec<PathBuf> = path_var
+        .map(|value| std::env::split_paths(value).collect())
+        .unwrap_or_default();
+    bins.extend(
+        [
+            "/usr/local/bin",
+            "/usr/bin",
+            "/opt/homebrew/bin",
+            "/home/linuxbrew/.linuxbrew/bin",
+        ]
+        .map(PathBuf::from),
+    );
+    if let Some(home) = home {
+        bins.extend([home.join(".local/bin"), home.join(".npm-global/bin")]);
+    }
+    for bin in bins {
+        let Ok(real) = fs::canonicalize(bin.join("gemini")) else {
+            continue;
+        };
+        let real = real.to_string_lossy();
+        if let Some(idx) = real.find(&format!("/{PKG}/")) {
+            add(PathBuf::from(format!("{}/{PKG}/bundle", &real[..idx])));
+        }
+    }
+    let mut roots: Vec<PathBuf> = [
+        "/usr/local/lib/node_modules",
+        "/usr/lib/node_modules",
+        "/opt/homebrew/lib/node_modules",
+        "/home/linuxbrew/.linuxbrew/lib/node_modules",
+    ]
+    .map(PathBuf::from)
+    .to_vec();
+    for cellar in [
+        "/opt/homebrew/Cellar/gemini-cli",
+        "/usr/local/Cellar/gemini-cli",
+        "/home/linuxbrew/.linuxbrew/Cellar/gemini-cli",
+    ] {
+        roots.extend(
+            children(Path::new(cellar))
+                .into_iter()
+                .map(|v| v.join("libexec/lib/node_modules")),
+        );
+    }
+    if let Some(home) = home {
+        roots.push(home.join(".npm-global/lib/node_modules"));
+        roots.push(
+            home.join(".volta/tools/image/packages")
+                .join(PKG)
+                .join("lib/node_modules"),
+        );
+        roots.extend(
+            children(&home.join(".nvm/versions/node"))
+                .into_iter()
+                .map(|v| v.join("lib/node_modules")),
+        );
+        for fnm in [
+            ".local/share/fnm/node-versions",
+            "Library/Application Support/fnm/node-versions",
+        ] {
+            roots.extend(
+                children(&home.join(fnm))
+                    .into_iter()
+                    .map(|v| v.join("installation/lib/node_modules")),
+            );
+        }
+    }
+    for root in roots {
+        add(root.join(PKG).join("bundle"));
+    }
+    dirs
+}
+
+/// Finds `NAME = "value"` (or single-quoted). Every occurrence is tried, not
+/// just the first: the name can appear in a reference such as
+/// `clientId: OAUTH_CLIENT_ID` before its declaration.
 fn extract_js_string_const(text: &str, name: &str) -> Option<String> {
-    let idx = text.find(name)?;
-    let rest = &text[idx + name.len()..];
-    let eq = rest.find('=')?;
-    let after_eq = rest[eq + 1..].trim_start();
-    let after_quote = after_eq.strip_prefix('"')?;
-    let end = after_quote.find('"')?;
-    let value = &after_quote[..end];
-    (!value.is_empty()).then(|| value.to_string())
+    text.match_indices(name).find_map(|(idx, _)| {
+        let rest = text[idx + name.len()..].trim_start();
+        let rest = rest.strip_prefix('=')?.trim_start();
+        let quote = rest.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+        let body = &rest[1..];
+        let value = &body[..body.find(quote)?];
+        (!value.is_empty()).then(|| value.to_string())
+    })
 }
 const STATUSLINE_MAX_AGE_SECONDS: i64 = 6 * 60 * 60;
+/// The Antigravity statusLine cache only refreshes while `agy` runs. Within
+/// this age it is used as is; past it the Code Assist API is asked first and the
+/// cache is only a fallback, so the weekly figure cannot freeze at an old value.
+const ANTIGRAVITY_CACHE_FRESH_SECONDS: i64 = 10 * 60;
 /// Fallback when the installed Claude Code version cannot be resolved: a
 /// slightly stale version is harmless, a missing User-Agent is not.
 const FALLBACK_CLAUDE_CODE_VERSION: &str = "2.1.0";
@@ -280,7 +375,11 @@ pub fn gemini_usage(json: &Value, fetched_at: i64, now: i64) -> ProviderUsage {
         if item.group_id.is_empty() {
             continue;
         }
-        let key = format!("{}:{}", item.group_id, if item.is_weekly { "w" } else { "p" });
+        let key = format!(
+            "{}:{}",
+            item.group_id,
+            if item.is_weekly { "w" } else { "p" }
+        );
         match grouped.get_mut(&key) {
             Some(existing) => {
                 if item.window.percent.unwrap_or(-1.0) > existing.2.percent.unwrap_or(-1.0) {
@@ -419,10 +518,7 @@ pub fn antigravity_statusline_gemini_usage(
             || lower.contains("seven_day")
         {
             true
-        } else if lower.contains("5h")
-            || lower.contains("5_hour")
-            || lower.contains("five_hour")
-        {
+        } else if lower.contains("5h") || lower.contains("5_hour") || lower.contains("five_hour") {
             false
         } else if let Some(reset) = reset_at {
             reset - now > GEMINI_WEEKLY_THRESHOLD_SECONDS
@@ -1152,7 +1248,11 @@ impl QuotaFetcher {
         codex_usage(&json, now, now)
     }
 
-    fn resolve_gemini_token(&self, now: i64, force_refresh: bool) -> Result<Option<String>, String> {
+    fn resolve_gemini_token(
+        &self,
+        now: i64,
+        force_refresh: bool,
+    ) -> Result<Option<String>, String> {
         if !force_refresh {
             if let Some((token, expires_at)) = self.state().gemini_access_token.clone() {
                 if expires_at - now > 60 {
@@ -1238,7 +1338,8 @@ impl QuotaFetcher {
         Some(project)
     }
 
-    fn cached_antigravity_gemini_usage(&self, now: i64) -> Option<ProviderUsage> {
+    /// The `bool` is true while the cache is fresh enough to skip the API.
+    fn cached_antigravity_gemini_usage(&self, now: i64) -> Option<(ProviderUsage, bool)> {
         let path = self
             .statusline_cache
             .parent()
@@ -1261,16 +1362,27 @@ impl QuotaFetcher {
             return None;
         }
         let has_reset = usage.primary.reset_at.is_some() || usage.weekly.reset_at.is_some();
-        if !has_reset && now - modified > STATUSLINE_MAX_AGE_SECONDS {
+        let age = now - modified;
+        if !has_reset && age > STATUSLINE_MAX_AGE_SECONDS {
             return None;
         }
-        Some(usage)
+        Some((usage, age <= ANTIGRAVITY_CACHE_FRESH_SECONDS))
     }
 
     fn fetch_gemini(&self, now: i64) -> ProviderUsage {
-        if let Some(cached) = self.cached_antigravity_gemini_usage(now) {
-            return cached;
+        let stale = match self.cached_antigravity_gemini_usage(now) {
+            Some((usage, true)) => return usage,
+            Some((usage, false)) => Some(usage),
+            None => None,
+        };
+        let live = self.fetch_gemini_api(now);
+        match stale {
+            Some(usage) if live.primary.percent.is_none() && live.weekly.percent.is_none() => usage,
+            _ => live,
         }
+    }
+
+    fn fetch_gemini_api(&self, now: i64) -> ProviderUsage {
         let mut token = match self.resolve_gemini_token(now, false) {
             Ok(Some(token)) => token,
             Ok(None) => return ProviderUsage::default(),
@@ -1278,6 +1390,8 @@ impl QuotaFetcher {
         };
         let mut project_id = self.resolve_gemini_project_id(&token);
         let url = format!("{GEMINI_CODE_ASSIST_BASE_URL}:retrieveUserQuota");
+        // The error is boxed while it is passed around: `ureq::Error` is 272+
+        // bytes (clippy::result_large_err). It is unboxed again for the match.
         let call = |token: &str, project_id: Option<&str>| {
             let body = match project_id {
                 Some(project) => serde_json::json!({ "project": project }),
@@ -1288,9 +1402,10 @@ impl QuotaFetcher {
                 .set("Authorization", &format!("Bearer {token}"))
                 .set("Accept", "application/json")
                 .send_json(body)
+                .map_err(Box::new)
         };
         let mut response = call(&token, project_id.as_deref());
-        if matches!(response, Err(ureq::Error::Status(401, _))) {
+        if matches!(&response, Err(error) if matches!(**error, ureq::Error::Status(401, _))) {
             match self.resolve_gemini_token(now, true) {
                 Ok(Some(refreshed)) => {
                     token = refreshed;
@@ -1303,13 +1418,15 @@ impl QuotaFetcher {
                 Err(error) => return ProviderUsage::with_error(error),
             }
         }
-        let json: Value = match response {
+        let json: Value = match response.map_err(|error| *error) {
             Ok(response) => match response.into_json() {
                 Ok(json) => json,
                 Err(_) => return ProviderUsage::with_error("gemini usage response parse failed"),
             },
             Err(ureq::Error::Status(401, _)) => {
-                return ProviderUsage::with_error("gemini credentials expired; run gemini to log in")
+                return ProviderUsage::with_error(
+                    "gemini credentials expired; run gemini to log in",
+                )
             }
             Err(ureq::Error::Status(code, response)) => {
                 self.note_retry_after(retry_after_seconds(response.header("Retry-After"), now));
@@ -1806,6 +1923,88 @@ mod tests {
 
         assert!(!fetcher.due(false));
         assert!(!fetcher.due(true));
+    }
+
+    #[test]
+    fn extracts_js_const_declaration_after_earlier_references() {
+        let text = r#"x={clientId:OAUTH_CLIENT_ID};var a="decoy";var OAUTH_CLIENT_ID = "the-id";
+            var OAUTH_CLIENT_SECRET='the-secret';if(OAUTH_CLIENT_ID=="x"){}"#;
+        assert_eq!(
+            extract_js_string_const(text, "OAUTH_CLIENT_ID").as_deref(),
+            Some("the-id")
+        );
+        assert_eq!(
+            extract_js_string_const(text, "OAUTH_CLIENT_SECRET").as_deref(),
+            Some("the-secret")
+        );
+        assert_eq!(
+            extract_js_string_const("OAUTH_CLIENT_ID == \"x\"", "OAUTH_CLIENT_ID"),
+            None
+        );
+    }
+
+    #[test]
+    fn finds_gemini_bundle_through_path_symlink_and_nvm() {
+        let root = std::env::temp_dir().join(format!("elink-gemini-bundle-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let home = root.join("home");
+        let nvm =
+            home.join(".nvm/versions/node/v22.1.0/lib/node_modules/@google/gemini-cli/bundle");
+        fs::create_dir_all(&nvm).unwrap();
+        // A formula-style install reached only through a `gemini` symlink on PATH.
+        let cellar =
+            root.join("Cellar/gemini-cli/1.0/libexec/lib/node_modules/@google/gemini-cli/bundle");
+        fs::create_dir_all(&cellar).unwrap();
+        let bin = root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        std::os::unix::fs::symlink(cellar.join("gemini.js"), bin.join("gemini")).unwrap();
+        fs::write(cellar.join("gemini.js"), "").unwrap();
+
+        let dirs = gemini_cli_bundle_dirs(Some(&home), Some(bin.as_os_str()));
+        let canon = |p: &Path| fs::canonicalize(p).unwrap();
+        let dirs: Vec<PathBuf> = dirs.iter().map(|d| canon(d)).collect();
+        assert!(dirs.contains(&canon(&cellar)), "{dirs:?}");
+        assert!(dirs.contains(&canon(&nvm)), "{dirs:?}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stale_antigravity_cache_is_only_a_fallback() {
+        let root = std::env::temp_dir().join(format!("elink-agy-cache-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("antigravity.json");
+        let body = json!({"quota": {"gemini-weekly": {
+            "remaining_fraction": 0.5, "reset_time": "2099-01-01T00:00:00Z"
+        }}});
+        fs::write(&path, body.to_string()).unwrap();
+        let modified = fs::metadata(&path)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let fetcher = QuotaFetcher::new(
+            PathBuf::new(),
+            PathBuf::new(),
+            PathBuf::new(),
+            root.join("last.json"),
+            120,
+            super::super::store::QuotaStore::new(PathBuf::new()),
+        );
+
+        let (usage, fresh) = fetcher
+            .cached_antigravity_gemini_usage(modified + 60)
+            .unwrap();
+        assert!(fresh);
+        assert_eq!(usage.weekly.percent, Some(50.0));
+        // A future reset time no longer keeps an old file "fresh".
+        let (usage, fresh) = fetcher
+            .cached_antigravity_gemini_usage(modified + ANTIGRAVITY_CACHE_FRESH_SECONDS + 1)
+            .unwrap();
+        assert!(!fresh);
+        assert_eq!(usage.weekly.percent, Some(50.0));
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

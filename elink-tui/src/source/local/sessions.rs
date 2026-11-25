@@ -105,6 +105,8 @@ pub type ClaudeMessages = HashMap<String, ClaudeMessage>;
 /// token_count event. Categories are disjoint: `cached` is subtracted out of
 /// `input` and `reasoning` out of `output`, so they sum back to the total.
 pub type CodexEvent = (i64, String, u64, BTreeMap<String, u64>);
+/// `(epoch, model, total_tokens, category_breakdown)` from one Gemini message.
+pub type GeminiEvent = (i64, String, u64, BTreeMap<String, u64>);
 
 /// A Codex event before the file's model is known: subagent files emit
 /// token_count lines before declaring a model, so it stays optional until the
@@ -432,10 +434,12 @@ pub struct ScanOutcome {
 pub struct SessionScanner {
     claude_files: FileIndex,
     codex_files: FileIndex,
-    gemini_root: PathBuf,
+    /// `None` when no Gemini home is configured: an empty path would make the
+    /// scan look in `tmp` and `antigravity-cli/brain` under the working directory.
+    gemini_root: Option<PathBuf>,
     claude_cache: HashMap<PathBuf, CacheEntry<ClaudeMessages>>,
     codex_cache: HashMap<PathBuf, CacheEntry<CodexParsed>>,
-    gemini_cache: HashMap<PathBuf, CacheEntry<Vec<(i64, String, u64, BTreeMap<String, u64>)>>>,
+    gemini_cache: HashMap<PathBuf, CacheEntry<Vec<GeminiEvent>>>,
     timezone: Option<Tz>,
 }
 
@@ -445,7 +449,7 @@ impl SessionScanner {
     }
 
     pub fn new_in(claude_home: &Path, codex_home: &Path, timezone: Option<Tz>) -> Self {
-        Self::new_with_gemini_in(claude_home, codex_home, &PathBuf::new(), timezone)
+        Self::build(claude_home, codex_home, None, timezone)
     }
 
     pub fn new_with_gemini_in(
@@ -454,10 +458,24 @@ impl SessionScanner {
         gemini_home: &Path,
         timezone: Option<Tz>,
     ) -> Self {
+        Self::build(
+            claude_home,
+            codex_home,
+            Some(gemini_home.join("tmp")),
+            timezone,
+        )
+    }
+
+    fn build(
+        claude_home: &Path,
+        codex_home: &Path,
+        gemini_root: Option<PathBuf>,
+        timezone: Option<Tz>,
+    ) -> Self {
         Self {
             claude_files: FileIndex::new(claude_home.join("projects")),
             codex_files: FileIndex::new(codex_home.join("sessions")),
-            gemini_root: gemini_home.join("tmp"),
+            gemini_root,
             claude_cache: HashMap::new(),
             codex_cache: HashMap::new(),
             gemini_cache: HashMap::new(),
@@ -535,7 +553,11 @@ impl SessionScanner {
         let codex_rate_limits = latest_limits
             .and_then(|(timestamp, limits)| Some((parse_iso_epoch(&timestamp)?, limits)));
 
-        let gemini_files = gemini_chat_files(&self.gemini_root);
+        let gemini_files = self
+            .gemini_root
+            .as_deref()
+            .map(gemini_chat_files)
+            .unwrap_or_default();
         let gemini_state = activity_state(latest_mtime(&gemini_files));
         let gemini_today_files: Vec<&(PathBuf, SystemTime, u64)> = gemini_files
             .iter()
@@ -544,7 +566,13 @@ impl SessionScanner {
         let mut gemini_totals: HashMap<String, u64> = HashMap::new();
         let mut gemini_categories: HashMap<String, HashMap<String, u64>> = HashMap::new();
         for (path, mtime, len) in &gemini_today_files {
-            let events = cached_parse(&mut self.gemini_cache, path, *mtime, *len, parse_gemini_file);
+            let events = cached_parse(
+                &mut self.gemini_cache,
+                path,
+                *mtime,
+                *len,
+                parse_gemini_file,
+            );
             for (timestamp, model, tokens, categories) in &events {
                 if day_key_in(*timestamp, self.timezone) == today {
                     *gemini_totals.entry(model.clone()).or_insert(0) += tokens;
@@ -634,20 +662,36 @@ fn normalize_gemini_model(raw: &str) -> String {
     trimmed.to_string()
 }
 
+/// The messages one Gemini session record carries. Gemini CLI `.jsonl` is an
+/// append-only operation log: message lines carry an `id`, `$set.messages`
+/// replaces the whole list, and metadata lines and `.json` files may embed
+/// `messages`. Usage is de-duplicated by message id, so flattening every source
+/// is enough; tokens of messages later dropped by `$rewindTo` were still spent
+/// and stay counted. `$patch` records carry no tokens and are skipped later.
+fn gemini_record_messages(mut obj: Value) -> Vec<Value> {
+    if let Some(set) = obj.get_mut("$set") {
+        // `get_mut`, not indexing: `IndexMut` panics on a non-object `$set`.
+        return match set.get_mut("messages").map(Value::take) {
+            Some(Value::Array(messages)) => messages,
+            _ => Vec::new(),
+        };
+    }
+    match obj.get_mut("messages").map(Value::take) {
+        Some(Value::Array(messages)) => messages,
+        _ => vec![obj],
+    }
+}
+
 /// Parses a Gemini CLI session transcript (`.json`/`.jsonl`) or Antigravity
 /// `transcript.jsonl` into `(epoch, model, total_tokens, category_breakdown)`.
 pub fn parse_gemini_file(text: &str) -> Vec<(i64, String, u64, BTreeMap<String, u64>)> {
     let mut objects: Vec<Value> = Vec::new();
     if let Ok(root) = serde_json::from_str::<Value>(text) {
-        if let Some(messages) = root["messages"].as_array() {
-            objects.extend(messages.iter().cloned());
-        } else {
-            objects.push(root);
-        }
+        objects.extend(gemini_record_messages(root));
     } else {
         for line in text.lines() {
             if let Ok(obj) = serde_json::from_str::<Value>(line) {
-                objects.push(obj);
+                objects.extend(gemini_record_messages(obj));
             }
         }
     }
@@ -1607,5 +1651,40 @@ mod tests {
         scanner.claude_files.last_full_refresh = Some(Instant::now() - FULL_INDEX_REFRESH_INTERVAL);
 
         assert_eq!(scanner.scan().claude.tokens_today, 25);
+    }
+
+    #[test]
+    fn scanner_without_gemini_home_skips_the_gemini_scan() {
+        let (claude, codex) = temp_homes();
+        assert!(SessionScanner::new(&claude, &codex).gemini_root.is_none());
+        let gemini = claude.parent().unwrap().join("gemini");
+        let scanner = SessionScanner::new_with_gemini_in(&claude, &codex, &gemini, None);
+        assert_eq!(scanner.gemini_root, Some(gemini.join("tmp")));
+    }
+
+    #[test]
+    fn gemini_jsonl_operation_log_counts_every_message_once() {
+        let msg = |id: &str, output: u64| {
+            format!(
+                r#"{{"id":"{id}","timestamp":"2026-11-25T02:00:00Z","type":"gemini","model":"gemini-3.5-pro","content":"x","tokens":{{"input":10,"output":{output},"total":{}}}}}"#,
+                10 + output
+            )
+        };
+        let text = [
+            r#"{"sessionId":"s","projectHash":"h","startTime":"2026-11-25T01:59:00Z","kind":"main"}"#.to_string(),
+            // `$set.messages` replaces the list; m1 appears again below.
+            format!(r#"{{"$set":{{"messages":[{}],"lastUpdated":"2026-11-25T02:00:00Z"}}}}"#, msg("m1", 5)),
+            msg("m1", 5),
+            msg("m2", 7),
+            r#"{"$patch":{"id":"m2","content":"y"}}"#.to_string(),
+            // m2 was rewound away, but its tokens were already spent.
+            r#"{"$rewindTo":"m2"}"#.to_string(),
+            r#"{"$set":5}"#.to_string(),
+        ]
+        .join("\n");
+        let events = parse_gemini_file(&text);
+        let totals: Vec<u64> = events.iter().map(|event| event.2).collect();
+        assert_eq!(totals, vec![15, 17]);
+        assert!(events.iter().all(|event| event.1 == "gemini-3.5-pro"));
     }
 }

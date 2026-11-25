@@ -258,20 +258,23 @@ class AgentService:
             return "monitor"
         return "ai"
 
-    def _needs_attention(self, snapshot: StatusSnapshot) -> bool:
-        """有事情在等人处理（待审批）。这是唯一能打断监控页驻留的信号。"""
-        if self.runtime.mode == "gemini":
-            return snapshot.gemini.needs_input
-        return snapshot.claude.needs_input or snapshot.codex.needs_input
+    @staticmethod
+    def _needs_attention(snapshot: StatusSnapshot) -> bool:
+        """有事情在等人处理（待审批）。这是唯一能打断监控页驻留的信号。
 
-    def _ai_active(self, snapshot: StatusSnapshot) -> bool:
+        与显示模式无关：哪家在等审批都要把人叫回来，单 provider 模式下也一样。
+        """
+        return (snapshot.claude.needs_input or snapshot.codex.needs_input
+                or snapshot.gemini.needs_input)
+
+    @staticmethod
+    def _ai_active(snapshot: StatusSnapshot) -> bool:
         """是否正处于需要占用屏幕的 AI 活动（working / 待审批）。
 
         只看当前状态，不看历史事件：recent_events 里的旧 idle 事件如果也算
         活动，AI 就永远不会进入真正的空闲，监控页也就永远出不来。
         """
-        providers = (snapshot.gemini,) if self.runtime.mode == "gemini" else (snapshot.claude, snapshot.codex)
-        for provider in providers:
+        for provider in (snapshot.claude, snapshot.codex, snapshot.gemini):
             if provider.status == "working" or provider.needs_input:
                 return True
         return any(session.state == "working" for session in snapshot.current_sessions)

@@ -571,6 +571,20 @@ def test_needs_input_breaks_the_monitor_dwell_immediately():
     assert decision.reason == "content-switch"
 
 
+def test_any_provider_approval_needs_attention_in_every_mode():
+    """待审批与显示模式无关：Gemini 模式下 Claude 的审批、dashboard 模式下
+    Gemini 的审批都要把屏幕叫回来。"""
+    gemini_waiting = StatusSnapshot(gemini=ProviderStatus(status="idle", needs_input=True))
+    claude_waiting = StatusSnapshot(claude=ProviderStatus(status="idle", needs_input=True))
+    for mode in ("dashboard", "claude", "codex", "gemini"):
+        service = _make_service()
+        service.runtime.mode = mode
+        for snapshot in (gemini_waiting, claude_waiting):
+            assert service._needs_attention(snapshot), mode
+            assert service._ai_active(snapshot), mode
+    assert _make_service()._ai_active(StatusSnapshot(gemini=ProviderStatus(status="working")))
+
+
 def test_the_dwell_clock_starts_when_the_monitor_page_reaches_the_panel():
     service = _make_service(monitor_idle_after_s=5, monitor_min_dwell_s=300)
     service._last_ai_activity_at = 0.0

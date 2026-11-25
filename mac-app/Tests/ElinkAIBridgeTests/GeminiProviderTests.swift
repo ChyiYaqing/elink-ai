@@ -71,6 +71,26 @@ final class GeminiProviderTests: XCTestCase {
         XCTAssertFalse(creds.accessTokenIsValid(at: now.addingTimeInterval(3600)))
     }
 
+    /// Gemini CLI `.jsonl` 是操作日志：`$set.messages` 里的消息也要计入，
+    /// 同一 id 只算一次，`$rewindTo` 回退掉的消息 token 已经花出去，照样计入。
+    func testGeminiJSONLOperationLogCountsEveryMessageOnce() throws {
+        func msg(_ id: String, _ output: Int) -> String {
+            #"{"id":"\#(id)","timestamp":"2026-11-25T02:00:00Z","type":"gemini","model":"gemini-3.5-pro","content":"x","tokens":{"input":10,"output":\#(output),"total":\#(10 + output)}}"#
+        }
+        let lines = [
+            #"{"sessionId":"s","projectHash":"h","startTime":"2026-11-25T01:59:00Z","kind":"main"}"#,
+            #"{"$set":{"messages":[\#(msg("m1", 5))],"lastUpdated":"2026-11-25T02:00:00Z"}}"#,
+            msg("m1", 5),
+            msg("m2", 7),
+            #"{"$patch":{"id":"m2","content":"y"}}"#,
+            #"{"$rewindTo":"m2"}"#,
+        ]
+        let events = try XCTUnwrap(StatusService.geminiUsageEvents(
+            data: Data(lines.joined(separator: "\n").utf8), isJSONL: true))
+        XCTAssertEqual(events.map(\.tokens), [15, 17])
+        XCTAssertEqual(Set(events.map(\.model)), ["gemini-3.5-pro"])
+    }
+
     func testParsesGeminiSessionUsageEvents() throws {
         let data = Data("""
         {

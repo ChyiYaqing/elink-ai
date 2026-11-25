@@ -15,7 +15,7 @@ use crate::util::{epoch_now, format_age, format_minutes, format_tokens};
 const STACK_BELOW_WIDTH: u16 = 70;
 const THREE_COL_STACK_BELOW_WIDTH: u16 = 96;
 
-fn has_gemini_activity(snapshot: Option<&Snapshot>) -> bool {
+pub fn has_gemini_activity(snapshot: Option<&Snapshot>) -> bool {
     snapshot.is_some_and(|s| {
         s.gemini.status != "offline"
             || s.gemini.primary_pct.is_some()
@@ -1206,10 +1206,7 @@ mod tests {
         snapshot.codex.status = "idle".to_string();
         snapshot.codex.needs_input = true;
 
-        assert_eq!(
-            compact_line(&snapshot),
-            "C● 43%/68% | X○ -/- ⚠ | G· -/-"
-        );
+        assert_eq!(compact_line(&snapshot), "C● 43%/68% | X○ -/- ⚠ | G· -/-");
     }
 
     #[test]

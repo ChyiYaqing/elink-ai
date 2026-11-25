@@ -691,15 +691,12 @@ final class UsageFetcher {
            let secret = env["GEMINI_OAUTH_CLIENT_SECRET"], !secret.isEmpty {
             return (id, secret)
         }
-        let candidates = [
-            "/opt/homebrew/lib/node_modules/@google/gemini-cli/bundle",
-            "/usr/local/lib/node_modules/@google/gemini-cli/bundle",
-        ]
-        let idRegex = try? NSRegularExpression(pattern: #"OAUTH_CLIENT_ID\s*=\s*"([^"]+)""#)
-        let secretRegex = try? NSRegularExpression(pattern: #"OAUTH_CLIENT_SECRET\s*=\s*"([^"]+)""#)
+        let candidates = geminiCLIBundleDirs()
+        let idRegex = try? NSRegularExpression(pattern: #"OAUTH_CLIENT_ID\s*=\s*["']([^"']+)["']"#)
+        let secretRegex = try? NSRegularExpression(pattern: #"OAUTH_CLIENT_SECRET\s*=\s*["']([^"']+)["']"#)
         for dir in candidates {
             guard let files = try? FileManager.default.contentsOfDirectory(atPath: dir) else { continue }
-            for name in files where name.hasPrefix("chunk-") && name.hasSuffix(".js") {
+            for name in files where name.hasSuffix(".js") {
                 let path = (dir as NSString).appendingPathComponent(name)
                 guard let text = try? String(contentsOfFile: path, encoding: .utf8),
                       text.contains("OAUTH_CLIENT_SECRET") else { continue }
@@ -715,6 +712,50 @@ final class UsageFetcher {
             }
         }
         return nil
+    }
+
+    /// 本机可能装有 `@google/gemini-cli` 的 bundle 目录。先顺着 PATH 与常见 bin
+    /// 目录里 `gemini` 的符号链接找到真实安装（覆盖 Homebrew formula、
+    /// ~/.npm-global 等），再补上全局 npm、Homebrew Cellar 与 nvm / volta / fnm
+    /// 的默认位置：Finder 启动的 app 拿不到 shell 里的 PATH。
+    static func geminiCLIBundleDirs(
+        home: String = NSHomeDirectory(),
+        path: String? = ProcessInfo.processInfo.environment["PATH"]
+    ) -> [String] {
+        let fm = FileManager.default
+        let pkg = "@google/gemini-cli"
+        var dirs: [String] = []
+        func add(_ dir: String) {
+            if !dirs.contains(dir), fm.fileExists(atPath: dir) { dirs.append(dir) }
+        }
+        func children(_ dir: String) -> [String] {
+            ((try? fm.contentsOfDirectory(atPath: dir)) ?? []).sorted(by: >)
+                .map { (dir as NSString).appendingPathComponent($0) }
+        }
+        let binDirs = (path ?? "").split(separator: ":").map(String.init) + [
+            "/opt/homebrew/bin", "/usr/local/bin", "\(home)/.local/bin", "\(home)/.npm-global/bin",
+        ]
+        for bin in binDirs {
+            let link = (bin as NSString).appendingPathComponent("gemini")
+            guard fm.fileExists(atPath: link) else { continue }
+            let real = URL(fileURLWithPath: link).resolvingSymlinksInPath().path
+            if let r = real.range(of: "/\(pkg)/") { add(String(real[..<r.upperBound]) + "bundle") }
+        }
+        var roots = [
+            "/opt/homebrew/lib/node_modules", "/usr/local/lib/node_modules",
+            "\(home)/.npm-global/lib/node_modules",
+            "\(home)/.volta/tools/image/packages/\(pkg)/lib/node_modules",
+        ]
+        for cellar in ["/opt/homebrew/Cellar/gemini-cli", "/usr/local/Cellar/gemini-cli"] {
+            roots += children(cellar).map { "\($0)/libexec/lib/node_modules" }
+        }
+        roots += children("\(home)/.nvm/versions/node").map { "\($0)/lib/node_modules" }
+        for fnm in ["\(home)/.local/share/fnm/node-versions",
+                    "\(home)/Library/Application Support/fnm/node-versions"] {
+            roots += children(fnm).map { "\($0)/installation/lib/node_modules" }
+        }
+        for root in roots { add("\(root)/\(pkg)/bundle") }
+        return dirs
     }
 
     struct GeminiCredentials: Equatable {
@@ -858,9 +899,18 @@ final class UsageFetcher {
     private func fetchGemini() -> ProviderUsage {
         // 优先读 Antigravity CLI statusLine 写入的本地缓存：官方文档化路径，
         // 直接包含 gemini-5h / gemini-weekly，且不受旧 Gemini CLI 个人账号 403 限制。
-        if let cached = Self.cachedAntigravityGeminiUsage() {
-            return cached
+        // 缓存只在 agy 运行时刷新，过了新鲜期就改问 Code Assist API，API 拿不到
+        // 数据时才退回旧缓存，否则周额度会一直停在旧值。
+        let cached = Self.cachedAntigravityGeminiUsage()
+        if let cached, cached.fresh { return cached.usage }
+        let live = fetchGeminiFromAPI()
+        if let cached, live.primary.percent == nil, live.weekly.percent == nil {
+            return cached.usage
         }
+        return live
+    }
+
+    private func fetchGeminiFromAPI() -> ProviderUsage {
         guard let tokenResult = resolveGeminiAccessToken() else {
             return ProviderUsage()
         }
@@ -907,10 +957,14 @@ final class UsageFetcher {
         ("~/.cache/statusline/antigravity.json" as NSString).expandingTildeInPath
     }
 
+    /// statusLine 缓存在这个时长内视为新鲜，直接使用而不请求 API。
+    static let antigravityCacheFreshness: TimeInterval = 10 * 60
+
+    /// `fresh` 为 false 表示缓存仍可作兜底，但应先尝试 API。
     static func cachedAntigravityGeminiUsage(
         path: String = antigravityStatuslinePath,
         now: Date = Date()
-    ) -> ProviderUsage? {
+    ) -> (usage: ProviderUsage, fresh: Bool)? {
         guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
               let modified = attrs[.modificationDate] as? Date,
               modified <= now,
@@ -921,8 +975,9 @@ final class UsageFetcher {
         let usage = antigravityStatuslineGeminiUsage(json, fetchedAt: modified, now: now)
         guard usage.primary.percent != nil || usage.weekly.percent != nil else { return nil }
         let hasReset = usage.primary.resetAt != nil || usage.weekly.resetAt != nil
-        if !hasReset && now.timeIntervalSince(modified) > 6 * 3600 { return nil }
-        return usage
+        let age = now.timeIntervalSince(modified)
+        if !hasReset && age > 6 * 3600 { return nil }
+        return (usage, age <= antigravityCacheFreshness)
     }
 
     /// 解析 Antigravity CLI `statusLine` 管道输出的 JSON：

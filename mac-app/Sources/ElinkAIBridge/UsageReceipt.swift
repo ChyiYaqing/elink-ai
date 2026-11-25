@@ -118,7 +118,8 @@ struct UsageReceipt: Equatable {
         claudeRoot: URL,
         codexRoot: URL,
         geminiRoot: URL = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".gemini/tmp")
+            .appendingPathComponent(".gemini/tmp"),
+        antigravityRoots: [URL] = StatusService.antigravityBrainRoots
     ) -> Int {
         let fm = FileManager.default
         func modified(_ url: URL) -> Date? {
@@ -137,7 +138,7 @@ struct UsageReceipt: Equatable {
                 if !isCodexSubagent(file) { count += 1 }
             }
         }
-        for file in StatusService.geminiChatFiles(at: geminiRoot) ?? []
+        for file in StatusService.geminiChatFiles(at: geminiRoot, antigravityRoots: antigravityRoots) ?? []
         where (modified(file) ?? .distantPast) >= since {
             count += 1
         }

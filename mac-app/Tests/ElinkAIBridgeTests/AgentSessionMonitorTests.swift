@@ -4,6 +4,8 @@ import XCTest
 final class AgentSessionMonitorTests: XCTestCase {
     private var claudeRoot: URL!
     private var codexRoot: URL!
+    private var geminiRoot: URL!
+    private var antigravityRoot: URL!
 
     private static let iso: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
@@ -16,6 +18,8 @@ final class AgentSessionMonitorTests: XCTestCase {
             .appendingPathComponent("elink-agent-sessions-\(UUID().uuidString)")
         claudeRoot = base.appendingPathComponent("claude/projects")
         codexRoot = base.appendingPathComponent("codex/sessions")
+        geminiRoot = base.appendingPathComponent("gemini/tmp")
+        antigravityRoot = base.appendingPathComponent("gemini/antigravity-cli/brain")
         try FileManager.default.createDirectory(at: claudeRoot, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: codexRoot, withIntermediateDirectories: true)
     }
@@ -31,7 +35,9 @@ final class AgentSessionMonitorTests: XCTestCase {
     }
 
     private func scanner() -> SessionScanner {
-        SessionScanner(claudeRoot: claudeRoot, codexRoot: codexRoot)
+        // Gemini 两个根目录也指向临时目录，否则会扫到本机真实会话
+        SessionScanner(claudeRoot: claudeRoot, codexRoot: codexRoot,
+                       geminiRoot: geminiRoot, antigravityRoots: [antigravityRoot])
     }
 
     @discardableResult
@@ -380,6 +386,120 @@ final class AgentSessionMonitorTests: XCTestCase {
             claudeCwdCounts: tracked.claudeCwdCounts
         ).first)
         XCTAssertTrue(session.isLive)
+    }
+
+    // MARK: - Gemini / Antigravity
+
+    func testLivenessTrackerGeminiFallbackKeys() {
+        var tracker = LivenessTracker()
+        let cli = ProcessDiscovery.Snapshot(kind: .gemini, transcriptPath: nil, cwd: "/Users/me/a#b")
+        let agy = ProcessDiscovery.Snapshot(kind: .gemini, transcriptPath: nil, cwd: "/x", antigravity: true)
+        let result = tracker.update(snapshots: [cli, cli, agy, agy, agy])
+        XCTAssertTrue(result.live.isEmpty)
+        XCTAssertEqual(result.geminiCwdCounts, ["/Users/me/a#b": 2])
+        XCTAssertEqual(result.antigravityCount, 3)
+        XCTAssertTrue(result.claudeCwdCounts.isEmpty)
+    }
+
+    func testGeminiCwdFallbackMatchesHashedAndNamedProjectDirectories() throws {
+        let line = #"{"sessionId":"s","messages":[{"type":"user","content":"hi"}]}"#
+        // 旧版：目录名是 cwd 的 sha256
+        let hashed = "d2f01f8f40d3d60692694bafcc7b2ac97bf4dbec581bd35e9407df956fb4a1fa"
+        try write([line], to: "\(hashed)/chats/session-old.json", under: geminiRoot,
+                  mtime: Date().addingTimeInterval(-600))
+        let hashedNewest = try write([line], to: "\(hashed)/chats/session-new.json", under: geminiRoot,
+                                     mtime: Date().addingTimeInterval(-60))
+        // 新版：projects.json 登记的短名
+        try #"{"projects":{"/Users/me/named":"named"}}"#.write(
+            to: geminiRoot.deletingLastPathComponent().appendingPathComponent("projects.json"),
+            atomically: true, encoding: .utf8)
+        let named = try write([line], to: "named/chats/session-1.json", under: geminiRoot,
+                              mtime: Date().addingTimeInterval(-60))
+        try write([line], to: "other/chats/session-1.json", under: geminiRoot,
+                  mtime: Date().addingTimeInterval(-30))
+
+        let sessions = scanner().scan(live: [], claudeCwdCounts: [:], geminiCwdCounts: [
+            "/Users/chyiyaqing/chyi/github/elink-ai": 1,
+            "/Users/me/named": 1,
+        ])
+        let liveIDs = try Set(sessions.filter(\.isLive).map { try canonicalPath(URL(fileURLWithPath: $0.id)) })
+        XCTAssertEqual(liveIDs, [try canonicalPath(hashedNewest), try canonicalPath(named)])
+    }
+
+    func testAntigravityTranscriptTitleIDAndActivity() throws {
+        let created = Date().addingTimeInterval(-90)
+        let ts = ISO8601DateFormatter().string(from: created)
+        let later = ISO8601DateFormatter().string(from: Date().addingTimeInterval(-5))
+        try write([
+            #"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","created_at":"\#(ts)","content":"补充 gemini"}"#,
+            #"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","created_at":"\#(ts)","model":"gemini-4-neon","content":"已完成"}"#,
+            #"{"step_index":2,"source":"SYSTEM","type":"SYSTEM_MESSAGE","created_at":"\#(later)","content":"<SYSTEM_MESSAGE>"}"#,
+        ], to: "conv-1/.system_generated/logs/transcript.jsonl", under: antigravityRoot)
+
+        let s = try XCTUnwrap(scanner().scan(live: [], claudeCwdCounts: [:]).first)
+        XCTAssertEqual(s.kind, .gemini)
+        XCTAssertEqual(s.title, "Antigravity")
+        XCTAssertEqual(s.threadID, "conv-1")
+        XCTAssertEqual(s.model, "gemini-4-neon")
+        XCTAssertEqual(s.snippet, "已完成")
+        // 系统注入行不算活动；活动时间来自 created_at 而不是 mtime
+        let activity = try XCTUnwrap(s.lastActivity)
+        XCTAssertEqual(activity.timeIntervalSince1970, created.timeIntervalSince1970, accuracy: 1)
+    }
+
+    func testAntigravityProcessCountMarksNewestTranscriptsLive() throws {
+        let line = #"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","content":"hi"}"#
+        try write([line], to: "old/.system_generated/logs/transcript.jsonl", under: antigravityRoot,
+                  mtime: Date().addingTimeInterval(-600))
+        let newest = try write([line], to: "new/.system_generated/logs/transcript.jsonl",
+                               under: antigravityRoot, mtime: Date().addingTimeInterval(-10))
+
+        let sessions = scanner().scan(live: [], claudeCwdCounts: [:], antigravityLive: 1)
+        let liveIDs = try sessions.filter(\.isLive).map { try canonicalPath(URL(fileURLWithPath: $0.id)) }
+        XCTAssertEqual(liveIDs, [try canonicalPath(newest)])
+    }
+
+    func testGeminiJSONLReplayFollowsSetPatchAndRewind() throws {
+        let ts = Self.iso.string(from: Date().addingTimeInterval(-30))
+        func msg(_ id: String, _ type: String, _ content: String) -> String {
+            #"{"id":"\#(id)","timestamp":"\#(ts)","type":"\#(type)","model":"gemini-3.5-pro","content":\#(content)}"#
+        }
+        try write([
+            #"{"sessionId":"sess-1","projectHash":"h","startTime":"\#(ts)","kind":"main","directories":["/Users/me/proj"]}"#,
+            #"{"$set":{"messages":[\#(msg("ctx", "user", #"[{"text":"<session_context>..."}]"#))]}}"#,
+            msg("u1", "user", #"[{"text":"修复 "},{"text":"bug"}]"#),
+            msg("g1", "gemini", #""草稿""#),
+            #"{"$patch":{"id":"g1","content":"已修复"}}"#,
+            msg("u2", "user", #""这条会被回退""#),
+            #"{"$rewindTo":"u2"}"#,
+        ], to: "proj/chats/session-1.jsonl", under: geminiRoot)
+
+        let s = try XCTUnwrap(scanner().scan(live: [], claudeCwdCounts: [:]).first)
+        XCTAssertEqual(s.title, "proj")
+        XCTAssertEqual(s.threadID, "sess-1")
+        XCTAssertEqual(s.model, "gemini-3.5-pro")
+        XCTAssertEqual(s.snippet, "已修复")
+
+        let (_, messages) = SessionScanner.replayGeminiLog([
+            ["id": "a"], ["id": "b"], ["id": "c"],
+            ["$patch": ["removeIds": ["b"], "orderIds": ["c", "a", "c"]]],
+        ])
+        XCTAssertEqual(messages.compactMap { $0["id"] as? String }, ["c", "a"])
+    }
+
+    func testGeminiSessionReparsedOnlyWhenFileChanges() throws {
+        let mtime = Date().addingTimeInterval(-60)
+        try write([#"{"sessionId":"s","messages":[{"type":"gemini","content":"第一版"}]}"#],
+                  to: "p/chats/session-1.json", under: geminiRoot, mtime: mtime)
+        let s = scanner()
+        XCTAssertEqual(s.scan(live: [], claudeCwdCounts: [:]).first?.snippet, "第一版")
+        // 大小与 mtime 都不变：复用缓存
+        try write([#"{"sessionId":"s","messages":[{"type":"gemini","content":"第二版"}]}"#],
+                  to: "p/chats/session-1.json", under: geminiRoot, mtime: mtime)
+        XCTAssertEqual(s.scan(live: [], claudeCwdCounts: [:]).first?.snippet, "第一版")
+        try write([#"{"sessionId":"s","messages":[{"type":"gemini","content":"第三版内容"}]}"#],
+                  to: "p/chats/session-1.json", under: geminiRoot)
+        XCTAssertEqual(s.scan(live: [], claudeCwdCounts: [:]).first?.snippet, "第三版内容")
     }
 
     // MARK: - 设置开关

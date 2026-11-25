@@ -104,7 +104,11 @@ final class UsageReceiptTests: XCTestCase {
         try write(codex.appendingPathComponent("2026/09/23/rollout-kid.jsonl"),
                   #"{"payload":{"id":"kid","parent_thread_id":"root"}}"# + "\n{}")
 
-        XCTAssertEqual(UsageReceipt.sessionCount(since: since, claudeRoot: claude, codexRoot: codex), 2)
+        // Gemini 根目录指向不存在的临时路径，否则会数到本机真实的 Gemini / Antigravity 会话
+        XCTAssertEqual(UsageReceipt.sessionCount(
+            since: since, claudeRoot: claude, codexRoot: codex,
+            geminiRoot: base.appendingPathComponent("gemini/tmp"),
+            antigravityRoots: [base.appendingPathComponent("gemini/antigravity-cli/brain")]), 2)
     }
 
     /// 超长模型名只截断，不把小票撑宽——撕下来的 PNG 宽度必须固定。
