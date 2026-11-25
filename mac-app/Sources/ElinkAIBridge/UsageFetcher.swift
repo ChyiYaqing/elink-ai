@@ -856,6 +856,11 @@ final class UsageFetcher {
     }
 
     private func fetchGemini() -> ProviderUsage {
+        // 优先读 Antigravity CLI statusLine 写入的本地缓存：官方文档化路径，
+        // 直接包含 gemini-5h / gemini-weekly，且不受旧 Gemini CLI 个人账号 403 限制。
+        if let cached = Self.cachedAntigravityGeminiUsage() {
+            return cached
+        }
         guard let tokenResult = resolveGeminiAccessToken() else {
             return ProviderUsage()
         }
@@ -896,6 +901,115 @@ final class UsageFetcher {
             return ProviderUsage(error: tr("Gemini 用量响应解析失败", "Failed to parse Gemini usage response"))
         }
         return Self.geminiUsage(json, fetchedAt: Date())
+    }
+
+    static var antigravityStatuslinePath: String {
+        ("~/.cache/statusline/antigravity.json" as NSString).expandingTildeInPath
+    }
+
+    static func cachedAntigravityGeminiUsage(
+        path: String = antigravityStatuslinePath,
+        now: Date = Date()
+    ) -> ProviderUsage? {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+              let modified = attrs[.modificationDate] as? Date,
+              modified <= now,
+              let data = FileManager.default.contents(atPath: path),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        let usage = antigravityStatuslineGeminiUsage(json, fetchedAt: modified, now: now)
+        guard usage.primary.percent != nil || usage.weekly.percent != nil else { return nil }
+        let hasReset = usage.primary.resetAt != nil || usage.weekly.resetAt != nil
+        if !hasReset && now.timeIntervalSince(modified) > 6 * 3600 { return nil }
+        return usage
+    }
+
+    /// 解析 Antigravity CLI `statusLine` 管道输出的 JSON：
+    /// `quota` 字典映射 bucket ID（如 `gemini-5h`、`gemini-weekly`）到
+    /// `{ remaining_fraction, reset_time, reset_in_seconds }`。
+    static func antigravityStatuslineGeminiUsage(
+        _ json: [String: Any],
+        fetchedAt: Date = Date(),
+        now: Date = Date()
+    ) -> ProviderUsage {
+        guard let quota = json["quota"] as? [String: Any] else { return ProviderUsage() }
+        var primaryWindows: [UsageWindow] = []
+        var weeklyWindows: [UsageWindow] = []
+        var scopedLimits: [ScopedLimit] = []
+
+        for key in quota.keys.sorted() {
+            let lower = key.lowercased()
+            // 只取 Gemini 相关 bucket（跳过 claude / gpt 等第三方池）
+            if lower.contains("claude") || lower.contains("gpt") || lower.contains("openai") {
+                continue
+            }
+            guard let entry = quota[key] as? [String: Any] else { continue }
+            if entry["disabled"] as? Bool == true { continue }
+            guard let remaining = flexibleDouble(entry["remaining_fraction"])
+                ?? flexibleDouble(entry["remainingFraction"]) else { continue }
+            let clampedRemaining = min(1.0, max(0.0, remaining))
+            let usedPercent = min(100.0, max(0.0, (1.0 - clampedRemaining) * 100.0))
+
+            var resetAt = (entry["reset_time"] as? String).flatMap(Self.isoDate)
+                ?? (entry["resetTime"] as? String).flatMap(Self.isoDate)
+            let resetInSeconds = flexibleDouble(entry["reset_in_seconds"])
+                ?? flexibleDouble(entry["resetInSeconds"])
+            if resetAt == nil, let seconds = resetInSeconds, seconds > 0 {
+                resetAt = fetchedAt.addingTimeInterval(seconds)
+            }
+            let window = UsageWindow(
+                percent: usedPercent,
+                resetMinutes: resetAt.flatMap {
+                    Self.remainingMinutes(untilEpoch: $0.timeIntervalSince1970, now: now)
+                },
+                resetAt: resetAt
+            ).discardingIfExpired(at: now)
+            guard window.percent != nil else { continue }
+
+            let isWeekly: Bool
+            if lower.contains("week") || lower.contains("7d") || lower.contains("seven_day") {
+                isWeekly = true
+            } else if lower.contains("5h") || lower.contains("5_hour") || lower.contains("five_hour") {
+                isWeekly = false
+            } else if let resetAt {
+                isWeekly = resetAt.timeIntervalSince(now) > 26 * 3600
+            } else if let seconds = resetInSeconds {
+                isWeekly = seconds > 26 * 3600
+            } else {
+                isWeekly = false
+            }
+
+            if isWeekly {
+                weeklyWindows.append(window)
+            } else {
+                primaryWindows.append(window)
+            }
+
+            // 特定模型子限额写入 scopedLimits（通用 gemini-5h / gemini-weekly 不重复列出）
+            if lower != "gemini-5h" && lower != "gemini-weekly" {
+                scopedLimits.append(ScopedLimit(id: key, title: key, window: window))
+            }
+        }
+
+        func pickWorst(_ windows: [UsageWindow]) -> UsageWindow {
+            windows.max { lhs, rhs in
+                let lp = lhs.percent ?? -1
+                let rp = rhs.percent ?? -1
+                if lp != rp { return lp < rp }
+                let lr = lhs.resetAt ?? .distantFuture
+                let rr = rhs.resetAt ?? .distantFuture
+                return lr > rr
+            } ?? UsageWindow()
+        }
+
+        return ProviderUsage(
+            primary: pickWorst(primaryWindows),
+            weekly: pickWorst(weeklyWindows),
+            scopedLimits: scopedLimits,
+            fetchedAt: fetchedAt,
+            isCached: false
+        )
     }
 
     static func geminiQuotaRequest(token: String, projectID: String?) -> URLRequest {

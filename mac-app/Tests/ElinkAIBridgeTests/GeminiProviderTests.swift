@@ -122,4 +122,33 @@ final class GeminiProviderTests: XCTestCase {
             82
         )
     }
+
+    func testParsesAntigravityStatuslineGeminiQuota() {
+        let now = Date(timeIntervalSince1970: 1_783_933_200) // 2026-07-13T09:00:00Z
+        let payload: [String: Any] = [
+            "product": "antigravity",
+            "quota": [
+                "gemini-5h": [
+                    "remaining_fraction": 0.85,
+                    "reset_time": "2026-07-13T12:00:00Z",
+                    "reset_in_seconds": 10800,
+                ],
+                "gemini-weekly": [
+                    "remaining_fraction": 0.9378,
+                    "reset_time": "2026-07-18T09:00:00Z",
+                    "reset_in_seconds": 432000,
+                ],
+                "claude-sonnet": [
+                    "remaining_fraction": 0.1,
+                    "reset_time": "2026-07-13T11:00:00Z",
+                ],
+            ],
+        ]
+        let usage = UsageFetcher.antigravityStatuslineGeminiUsage(payload, fetchedAt: now, now: now)
+        XCTAssertEqual(usage.primary.percent ?? -1, 15.0, accuracy: 0.01)
+        XCTAssertEqual(usage.primary.resetMinutes, 180)
+        XCTAssertEqual(usage.weekly.percent ?? -1, 6.22, accuracy: 0.01)
+        XCTAssertEqual(usage.weekly.resetMinutes, 5 * 24 * 60)
+        XCTAssertTrue(usage.scopedLimits.isEmpty)
+    }
 }

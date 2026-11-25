@@ -364,6 +364,110 @@ fn gemini_tier_group(model_id: &str) -> (String, String) {
     (lower, cleaned.to_string())
 }
 
+/// Parses Antigravity CLI `statusLine` JSON (`quota` map keyed by bucket ID
+/// such as `gemini-5h` and `gemini-weekly`).
+pub fn antigravity_statusline_gemini_usage(
+    json: &Value,
+    fetched_at: i64,
+    now: i64,
+) -> ProviderUsage {
+    let Some(quota) = json["quota"].as_object() else {
+        return ProviderUsage::default();
+    };
+    let mut keys: Vec<&String> = quota.keys().collect();
+    keys.sort();
+    let mut primary_windows = Vec::new();
+    let mut weekly_windows = Vec::new();
+    let mut scoped_limits = Vec::new();
+
+    for key in keys {
+        let lower = key.to_lowercase();
+        if lower.contains("claude") || lower.contains("gpt") || lower.contains("openai") {
+            continue;
+        }
+        let entry = &quota[key];
+        if entry["disabled"].as_bool() == Some(true) {
+            continue;
+        }
+        let Some(remaining) = flexible_f64(&entry["remaining_fraction"])
+            .or_else(|| flexible_f64(&entry["remainingFraction"]))
+        else {
+            continue;
+        };
+        let used_percent = ((1.0 - remaining.clamp(0.0, 1.0)) * 100.0).clamp(0.0, 100.0);
+        let reset_in_seconds = flexible_f64(&entry["reset_in_seconds"])
+            .or_else(|| flexible_f64(&entry["resetInSeconds"]));
+        let reset_at = entry["reset_time"]
+            .as_str()
+            .or_else(|| entry["resetTime"].as_str())
+            .and_then(parse_iso_epoch)
+            .or_else(|| {
+                reset_in_seconds
+                    .filter(|s| *s > 0.0)
+                    .map(|s| fetched_at + s as i64)
+            });
+        let window = UsageWindow {
+            percent: Some(used_percent),
+            reset_at,
+        }
+        .discard_if_expired(now);
+        if window.percent.is_none() {
+            continue;
+        }
+        let is_weekly = if lower.contains("week")
+            || lower.contains("7d")
+            || lower.contains("seven_day")
+        {
+            true
+        } else if lower.contains("5h")
+            || lower.contains("5_hour")
+            || lower.contains("five_hour")
+        {
+            false
+        } else if let Some(reset) = reset_at {
+            reset - now > GEMINI_WEEKLY_THRESHOLD_SECONDS
+        } else {
+            reset_in_seconds.is_some_and(|s| s > GEMINI_WEEKLY_THRESHOLD_SECONDS as f64)
+        };
+        if is_weekly {
+            weekly_windows.push(window);
+        } else {
+            primary_windows.push(window);
+        }
+        if lower != "gemini-5h" && lower != "gemini-weekly" {
+            scoped_limits.push(ScopedLimit {
+                id: key.clone(),
+                title: key.clone(),
+                window,
+            });
+        }
+    }
+
+    let pick_worst = |windows: &[UsageWindow]| -> UsageWindow {
+        windows
+            .iter()
+            .copied()
+            .max_by(|lhs, rhs| {
+                let lp = lhs.percent.unwrap_or(-1.0);
+                let rp = rhs.percent.unwrap_or(-1.0);
+                lp.total_cmp(&rp).then_with(|| {
+                    let lr = lhs.reset_at.unwrap_or(i64::MAX);
+                    let rr = rhs.reset_at.unwrap_or(i64::MAX);
+                    rr.cmp(&lr)
+                })
+            })
+            .unwrap_or_default()
+    };
+
+    ProviderUsage {
+        primary: pick_worst(&primary_windows),
+        weekly: pick_worst(&weekly_windows),
+        scoped_limits,
+        fetched_at: Some(fetched_at),
+        ..ProviderUsage::default()
+    }
+}
+
 /// Codex's spend-control limit. Three places may carry it; take the first
 /// usable one in this order: response root, inside `rate_limit`, inside
 /// `spend_control`.
@@ -1134,7 +1238,39 @@ impl QuotaFetcher {
         Some(project)
     }
 
+    fn cached_antigravity_gemini_usage(&self, now: i64) -> Option<ProviderUsage> {
+        let path = self
+            .statusline_cache
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("antigravity.json");
+        let metadata = fs::metadata(&path).ok()?;
+        let modified = metadata
+            .modified()
+            .ok()?
+            .duration_since(UNIX_EPOCH)
+            .ok()?
+            .as_secs() as i64;
+        if modified > now {
+            return None;
+        }
+        let data = fs::read(&path).ok()?;
+        let json: Value = serde_json::from_slice(&data).ok()?;
+        let usage = antigravity_statusline_gemini_usage(&json, modified, now);
+        if usage.primary.percent.is_none() && usage.weekly.percent.is_none() {
+            return None;
+        }
+        let has_reset = usage.primary.reset_at.is_some() || usage.weekly.reset_at.is_some();
+        if !has_reset && now - modified > STATUSLINE_MAX_AGE_SECONDS {
+            return None;
+        }
+        Some(usage)
+    }
+
     fn fetch_gemini(&self, now: i64) -> ProviderUsage {
+        if let Some(cached) = self.cached_antigravity_gemini_usage(now) {
+            return cached;
+        }
         let mut token = match self.resolve_gemini_token(now, false) {
             Ok(Some(token)) => token,
             Ok(None) => return ProviderUsage::default(),
