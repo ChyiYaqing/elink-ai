@@ -51,7 +51,7 @@ final class StatusService {
         fileURLWithPath: ("~/.codex/sessions" as NSString).expandingTildeInPath)
     private static let geminiRoot = URL(
         fileURLWithPath: ("~/.gemini/tmp" as NSString).expandingTildeInPath)
-    private static let antigravityBrainRoots = [
+    static let antigravityBrainRoots = [
         URL(fileURLWithPath: ("~/.gemini/antigravity-cli/brain" as NSString).expandingTildeInPath),
         URL(fileURLWithPath: ("~/.gemini/antigravity/brain" as NSString).expandingTildeInPath),
     ]
@@ -544,6 +544,19 @@ final class StatusService {
         return name
     }
 
+    /// 一条 Gemini 会话记录里的消息。Gemini CLI 的 `.jsonl` 是追加式操作日志：
+    /// 消息行自带 `id`，`$set.messages` 整体替换消息列表，元数据行与 `.json`
+    /// 整包也可能内嵌 `messages`。用量按消息 id 去重，所以把这些来源都摊平即可；
+    /// `$rewindTo` 回退掉的消息 token 已经花出去了，照样计入。`$patch` 只改内容，
+    /// 不带 token，原样返回后会被跳过。
+    static func geminiRecordMessages(_ obj: [String: Any]) -> [[String: Any]] {
+        if let set = obj["$set"] as? [String: Any] {
+            return set["messages"] as? [[String: Any]] ?? []
+        }
+        if let messages = obj["messages"] as? [[String: Any]] { return messages }
+        return [obj]
+    }
+
     /// 解析单个 Gemini CLI 会话文件或 Antigravity `transcript.jsonl`（兼容 `.json`
     /// 整包与 `.jsonl` 流式格式）。`.json` 写入半截解析失败时返回 nil，调用方可保留缓存。
     static func geminiUsageEvents(
@@ -558,17 +571,13 @@ final class StatusService {
                       let obj = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any] else {
                     continue
                 }
-                objects.append(obj)
+                objects.append(contentsOf: geminiRecordMessages(obj))
             }
         } else {
             guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                 return nil
             }
-            if let messages = root["messages"] as? [[String: Any]] {
-                objects = messages
-            } else {
-                objects = [root]
-            }
+            objects = geminiRecordMessages(root)
         }
         var byID: [String: (date: Date, model: String, tokens: Int, categories: [String: Int])] = [:]
         var idOrder: [String] = []

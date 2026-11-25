@@ -571,6 +571,24 @@ def test_needs_input_breaks_the_monitor_dwell_immediately():
     assert decision.reason == "content-switch"
 
 
+def test_only_providers_the_layout_draws_can_wake_the_screen():
+    """待审批和活动只看当前布局画得出来的 provider：dashboard 只画 Claude 和
+    Codex，单 provider 模式只画所选那家。叫醒屏幕却看不到是谁在等，等于白刷。"""
+    waiting = {name: StatusSnapshot(**{name: ProviderStatus(status="idle", needs_input=True)})
+               for name in ("claude", "codex", "gemini")}
+    working = {name: StatusSnapshot(**{name: ProviderStatus(status="working")})
+               for name in ("claude", "codex", "gemini")}
+    visible = {"dashboard": {"claude", "codex"}, "claude": {"claude"},
+               "codex": {"codex"}, "gemini": {"gemini"}}
+    for mode, shown in visible.items():
+        service = _make_service()
+        service.runtime.mode = mode
+        for name in ("claude", "codex", "gemini"):
+            assert service._needs_attention(waiting[name]) == (name in shown), (mode, name)
+            assert service._ai_active(waiting[name]) == (name in shown), (mode, name)
+            assert service._ai_active(working[name]) == (name in shown), (mode, name)
+
+
 def test_the_dwell_clock_starts_when_the_monitor_page_reaches_the_panel():
     service = _make_service(monitor_idle_after_s=5, monitor_min_dwell_s=300)
     service._last_ai_activity_at = 0.0

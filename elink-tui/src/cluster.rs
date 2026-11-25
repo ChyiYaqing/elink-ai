@@ -1765,7 +1765,10 @@ impl ClusterService {
         }
         let local_node = state.stored.credentials.node_id.clone();
         for snapshot in snapshots {
-            if !matches!(snapshot.key.provider.as_str(), "claude" | "codex" | "gemini") {
+            if !matches!(
+                snapshot.key.provider.as_str(),
+                "claude" | "codex" | "gemini"
+            ) {
                 continue;
             }
             validate_snapshot(&snapshot)?;

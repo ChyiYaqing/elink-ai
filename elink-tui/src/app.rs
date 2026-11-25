@@ -239,14 +239,15 @@ impl App {
                 self.set_hint("refreshing…");
             }
             KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
-                self.focus = (self.focus + 1) % 3;
+                self.focus = (self.focus + 1) % self.focus_slots();
             }
             KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
-                self.focus = (self.focus + 2) % 3;
+                let slots = self.focus_slots();
+                self.focus = (self.focus + slots - 1) % slots;
             }
             KeyCode::Char('1') => self.focus = 0,
             KeyCode::Char('2') => self.focus = 1,
-            KeyCode::Char('3') => self.focus = 2,
+            KeyCode::Char('3') if self.focus_slots() == 3 => self.focus = 2,
             KeyCode::Up | KeyCode::Char('k') => {
                 self.scroll[self.focus] = self.scroll[self.focus].saturating_sub(1);
             }
@@ -334,8 +335,26 @@ impl App {
         }
     }
 
+    /// Cards focus can move between: the dashboard hides the Gemini card until
+    /// Gemini shows any activity, the stats view always draws all three.
+    fn focus_slots(&self) -> usize {
+        if self.view == View::Stats || crate::ui::has_gemini_activity(self.snapshot.as_ref()) {
+            3
+        } else {
+            2
+        }
+    }
+
+    /// Moves focus off a card that is no longer drawn.
+    fn clamp_focus(&mut self) {
+        if self.focus >= self.focus_slots() {
+            self.focus = 0;
+        }
+    }
+
     fn set_view(&mut self, view: View) {
         self.view = view;
+        self.clamp_focus();
         if let Some(device) = &self.device {
             device.set_active(view == View::Device);
         }
@@ -391,6 +410,7 @@ impl App {
     }
 
     fn clamp_scroll(&mut self) {
+        self.clamp_focus();
         let Some(snapshot) = &self.snapshot else {
             return;
         };
@@ -524,5 +544,38 @@ mod tests {
         });
 
         assert_eq!(app.view, View::Dashboard);
+    }
+
+    #[test]
+    fn focus_skips_the_hidden_gemini_card() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut app = test_app(SourceKind::Local, "0.0.0.0:8765", true);
+        app.apply(Update {
+            kind: SourceKind::Local,
+            result: Ok(snapshot()),
+        });
+        app.on_key(key(KeyCode::Tab), &tx);
+        app.on_key(key(KeyCode::Tab), &tx);
+        assert_eq!(app.focus, 0);
+        app.on_key(key(KeyCode::BackTab), &tx);
+        assert_eq!(app.focus, 1);
+        app.on_key(key(KeyCode::Char('3')), &tx);
+        assert_eq!(app.focus, 1);
+
+        let mut active = snapshot();
+        active.gemini.status = "idle".to_string();
+        app.apply(Update {
+            kind: SourceKind::Local,
+            result: Ok(active),
+        });
+        app.on_key(key(KeyCode::Char('3')), &tx);
+        assert_eq!(app.focus, 2);
+        // The card disappears again: focus must not stay on it.
+        app.apply(Update {
+            kind: SourceKind::Local,
+            result: Ok(snapshot()),
+        });
+        assert_eq!(app.focus, 0);
     }
 }

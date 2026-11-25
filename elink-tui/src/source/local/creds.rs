@@ -65,7 +65,10 @@ pub struct GeminiCredentials {
 
 impl GeminiCredentials {
     pub fn access_token_usable(&self, now: i64) -> Option<&str> {
-        let token = self.access_token.as_deref().filter(|value| !value.is_empty())?;
+        let token = self
+            .access_token
+            .as_deref()
+            .filter(|value| !value.is_empty())?;
         match self.expires_at {
             Some(expiry) if expiry - now <= 60 => None,
             _ => Some(token),

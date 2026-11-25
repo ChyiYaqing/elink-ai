@@ -2,6 +2,36 @@ import XCTest
 @testable import ElinkAIBridge
 
 final class GeminiProviderTests: XCTestCase {
+    func testGeminiFallbackOnlyWhenAPIHasNoWindowAndKeepsAPIError() {
+        let now = Date()
+        func window(_ percent: Double) -> UsageWindow {
+            UsageWindow(percent: percent, resetMinutes: 60, resetAt: now.addingTimeInterval(3600))
+        }
+        let stale = ProviderUsage(primary: window(10), weekly: window(40),
+                                  fetchedAt: now.addingTimeInterval(-1800))
+
+        // API 只给了短窗口：不拿旧缓存的周窗口冒充本轮数据
+        let partial = UsageFetcher.mergeGeminiFallback(
+            live: ProviderUsage(primary: window(20), fetchedAt: now), stale: stale)
+        XCTAssertEqual(partial.primary.percent, 20)
+        XCTAssertNil(partial.weekly.percent)
+        XCTAssertFalse(partial.isCached)
+
+        // API 429：旧缓存兜底，标为缓存，错误保留给退避识别
+        let fallback = UsageFetcher.mergeGeminiFallback(
+            live: ProviderUsage(error: "Gemini usage HTTP 429"), stale: stale)
+        XCTAssertTrue(fallback.isCached)
+        XCTAssertEqual(fallback.weekly.percent, 40)
+        XCTAssertEqual(fallback.error, "Gemini usage HTTP 429")
+
+        // 内存里更新的 API 值不被更旧的缓存覆盖
+        let newer = ProviderUsage(primary: window(30), weekly: window(50),
+                                  fetchedAt: now.addingTimeInterval(-60))
+        let kept = UsageFetcher.keepLastGood(old: newer, new: fallback)
+        XCTAssertEqual(kept.primary.percent, 30)
+        XCTAssertEqual(kept.error, "Gemini usage HTTP 429")
+    }
+
     func testParsesGeminiFiveHourAndWeeklyQuotaBuckets() {
         let now = Date(timeIntervalSince1970: 1_783_933_200) // 2026-07-13T09:00:00Z
         let payload: [String: Any] = [
@@ -69,6 +99,26 @@ final class GeminiProviderTests: XCTestCase {
         XCTAssertEqual(creds.refreshToken, "1//refresh")
         XCTAssertTrue(creds.accessTokenIsValid(at: now))
         XCTAssertFalse(creds.accessTokenIsValid(at: now.addingTimeInterval(3600)))
+    }
+
+    /// Gemini CLI `.jsonl` 是操作日志：`$set.messages` 里的消息也要计入，
+    /// 同一 id 只算一次，`$rewindTo` 回退掉的消息 token 已经花出去，照样计入。
+    func testGeminiJSONLOperationLogCountsEveryMessageOnce() throws {
+        func msg(_ id: String, _ output: Int) -> String {
+            #"{"id":"\#(id)","timestamp":"2026-11-25T02:00:00Z","type":"gemini","model":"gemini-3.5-pro","content":"x","tokens":{"input":10,"output":\#(output),"total":\#(10 + output)}}"#
+        }
+        let lines = [
+            #"{"sessionId":"s","projectHash":"h","startTime":"2026-11-25T01:59:00Z","kind":"main"}"#,
+            #"{"$set":{"messages":[\#(msg("m1", 5))],"lastUpdated":"2026-11-25T02:00:00Z"}}"#,
+            msg("m1", 5),
+            msg("m2", 7),
+            #"{"$patch":{"id":"m2","content":"y"}}"#,
+            #"{"$rewindTo":"m2"}"#,
+        ]
+        let events = try XCTUnwrap(StatusService.geminiUsageEvents(
+            data: Data(lines.joined(separator: "\n").utf8), isJSONL: true))
+        XCTAssertEqual(events.map(\.tokens), [15, 17])
+        XCTAssertEqual(Set(events.map(\.model)), ["gemini-3.5-pro"])
     }
 
     func testParsesGeminiSessionUsageEvents() throws {
