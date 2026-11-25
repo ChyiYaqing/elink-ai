@@ -566,31 +566,53 @@ impl SessionScanner {
     }
 }
 
-/// Finds `<gemini_tmp>/<project>/chats/session-*.json(l)` files.
+/// Finds `<gemini_home>/tmp/<project>/chats/session-*.json(l)` as well as
+/// Antigravity `<gemini_home>/antigravity{,-cli}/brain/<id>/.system_generated/logs/transcript.jsonl`.
 pub fn gemini_chat_files(root: &Path) -> Vec<(PathBuf, SystemTime, u64)> {
     let mut out = Vec::new();
-    let Ok(projects) = fs::read_dir(root) else {
-        return out;
-    };
-    for project in projects.flatten() {
-        let chats_dir = project.path().join("chats");
-        let Ok(entries) = fs::read_dir(&chats_dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Some(name) = path.file_name().and_then(|v| v.to_str()) else {
+    if let Ok(projects) = fs::read_dir(root) {
+        for project in projects.flatten() {
+            let chats_dir = project.path().join("chats");
+            let Ok(entries) = fs::read_dir(&chats_dir) else {
                 continue;
             };
-            if !name.starts_with("session-")
-                || !(name.ends_with(".json") || name.ends_with(".jsonl"))
-            {
-                continue;
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Some(name) = path.file_name().and_then(|v| v.to_str()) else {
+                    continue;
+                };
+                if !name.starts_with("session-")
+                    || !(name.ends_with(".json") || name.ends_with(".jsonl"))
+                {
+                    continue;
+                }
+                if let Ok(meta) = entry.metadata() {
+                    if meta.is_file() {
+                        if let Ok(mtime) = meta.modified() {
+                            out.push((path, mtime, meta.len()));
+                        }
+                    }
+                }
             }
-            if let Ok(meta) = entry.metadata() {
-                if meta.is_file() {
-                    if let Ok(mtime) = meta.modified() {
-                        out.push((path, mtime, meta.len()));
+        }
+    }
+    if let Some(gemini_home) = root.parent() {
+        for sub in ["antigravity-cli/brain", "antigravity/brain"] {
+            let brain_dir = gemini_home.join(sub);
+            let Ok(convs) = fs::read_dir(&brain_dir) else {
+                continue;
+            };
+            for conv in convs.flatten() {
+                let transcript = conv
+                    .path()
+                    .join(".system_generated")
+                    .join("logs")
+                    .join("transcript.jsonl");
+                if let Ok(meta) = fs::metadata(&transcript) {
+                    if meta.is_file() {
+                        if let Ok(mtime) = meta.modified() {
+                            out.push((transcript, mtime, meta.len()));
+                        }
                     }
                 }
             }
@@ -599,8 +621,21 @@ pub fn gemini_chat_files(root: &Path) -> Vec<(PathBuf, SystemTime, u64)> {
     out
 }
 
-/// Parses a Gemini CLI session transcript (`.json` conversation record or
-/// `.jsonl` stream) into `(epoch, model, total_tokens, category_breakdown)`.
+fn normalize_gemini_model(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return "unknown".to_string();
+    }
+    for suffix in ["-xhigh", "-medium", "-high", "-low", "-max", "-tiered"] {
+        if let Some(stripped) = trimmed.strip_suffix(suffix) {
+            return stripped.to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
+/// Parses a Gemini CLI session transcript (`.json`/`.jsonl`) or Antigravity
+/// `transcript.jsonl` into `(epoch, model, total_tokens, category_breakdown)`.
 pub fn parse_gemini_file(text: &str) -> Vec<(i64, String, u64, BTreeMap<String, u64>)> {
     let mut objects: Vec<Value> = Vec::new();
     if let Ok(root) = serde_json::from_str::<Value>(text) {
@@ -620,52 +655,86 @@ pub fn parse_gemini_file(text: &str) -> Vec<(i64, String, u64, BTreeMap<String, 
     let mut id_order: Vec<String> = Vec::new();
     let mut anonymous = Vec::new();
     for obj in objects {
-        let Some(tokens) = obj["tokens"].as_object() else {
-            continue;
-        };
-        let Some(timestamp) = obj["timestamp"].as_str().and_then(parse_iso_epoch) else {
-            continue;
-        };
-        let get_u64 = |key: &str| tokens.get(key).and_then(Value::as_u64).unwrap_or(0);
-        let raw_input = get_u64("input");
-        let cached = get_u64("cached");
-        let output = get_u64("output");
-        let thoughts = get_u64("thoughts");
-        let tool = get_u64("tool");
-        let raw_total = get_u64("total");
-        let non_cached_input = raw_input.saturating_sub(cached).saturating_add(tool);
-        let mut categories = BTreeMap::new();
-        if non_cached_input > 0 {
-            categories.insert("input".to_string(), non_cached_input);
-        }
-        if output > 0 {
-            categories.insert("output".to_string(), output);
-        }
-        if cached > 0 {
-            categories.insert("cache_read".to_string(), cached);
-        }
-        if thoughts > 0 {
-            categories.insert("reasoning".to_string(), thoughts);
-        }
-        let sum = non_cached_input + output + cached + thoughts;
-        let total = if raw_total > 0 { raw_total } else { sum };
-        if total == 0 {
-            continue;
-        }
-        let model = obj["model"]
-            .as_str()
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .unwrap_or("unknown")
-            .to_string();
-        let event = (timestamp, model, total, categories);
-        if let Some(id) = obj["id"].as_str().filter(|v| !v.is_empty()) {
-            if !by_id.contains_key(id) {
-                id_order.push(id.to_string());
+        if let Some(tokens) = obj["tokens"].as_object() {
+            let Some(timestamp) = obj["timestamp"].as_str().and_then(parse_iso_epoch) else {
+                continue;
+            };
+            let get_u64 = |key: &str| tokens.get(key).and_then(Value::as_u64).unwrap_or(0);
+            let raw_input = get_u64("input");
+            let cached = get_u64("cached");
+            let output = get_u64("output");
+            let thoughts = get_u64("thoughts");
+            let tool = get_u64("tool");
+            let raw_total = get_u64("total");
+            let non_cached_input = raw_input.saturating_sub(cached).saturating_add(tool);
+            let mut categories = BTreeMap::new();
+            if non_cached_input > 0 {
+                categories.insert("input".to_string(), non_cached_input);
             }
-            by_id.insert(id.to_string(), event);
-        } else {
-            anonymous.push(event);
+            if output > 0 {
+                categories.insert("output".to_string(), output);
+            }
+            if cached > 0 {
+                categories.insert("cache_read".to_string(), cached);
+            }
+            if thoughts > 0 {
+                categories.insert("reasoning".to_string(), thoughts);
+            }
+            let sum = non_cached_input + output + cached + thoughts;
+            let total = if raw_total > 0 { raw_total } else { sum };
+            if total == 0 {
+                continue;
+            }
+            let model = normalize_gemini_model(obj["model"].as_str().unwrap_or(""));
+            let event = (timestamp, model, total, categories);
+            if let Some(id) = obj["id"].as_str().filter(|v| !v.is_empty()) {
+                if !by_id.contains_key(id) {
+                    id_order.push(id.to_string());
+                }
+                by_id.insert(id.to_string(), event);
+            } else {
+                anonymous.push(event);
+            }
+            continue;
+        }
+
+        // Antigravity transcript.jsonl:
+        // { step_index, created_at, model, input_tokens, cache_read_tokens, output_tokens }
+        if let Some(raw_model) = obj["model"].as_str() {
+            if !raw_model.to_lowercase().contains("gemini") {
+                continue;
+            }
+            let Some(timestamp) = obj["created_at"].as_str().and_then(parse_iso_epoch) else {
+                continue;
+            };
+            let input = obj["input_tokens"].as_u64().unwrap_or(0);
+            let cache_read = obj["cache_read_tokens"].as_u64().unwrap_or(0);
+            let output = obj["output_tokens"].as_u64().unwrap_or(0);
+            let total = input + cache_read + output;
+            if total == 0 {
+                continue;
+            }
+            let mut categories = BTreeMap::new();
+            if input > 0 {
+                categories.insert("input".to_string(), input);
+            }
+            if cache_read > 0 {
+                categories.insert("cache_read".to_string(), cache_read);
+            }
+            if output > 0 {
+                categories.insert("output".to_string(), output);
+            }
+            let model = normalize_gemini_model(raw_model);
+            let event = (timestamp, model, total, categories);
+            if let Some(step) = obj["step_index"].as_i64() {
+                let key = format!("step:{step}");
+                if !by_id.contains_key(&key) {
+                    id_order.push(key.clone());
+                }
+                by_id.insert(key, event);
+            } else {
+                anonymous.push(event);
+            }
         }
     }
     let mut events: Vec<_> = id_order

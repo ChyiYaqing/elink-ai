@@ -161,4 +161,23 @@ final class GeminiProviderTests: XCTestCase {
         XCTAssertEqual(usage.weekly.resetMinutes, 5 * 24 * 60)
         XCTAssertTrue(usage.scopedLimits.isEmpty)
     }
+
+    func testParsesAntigravityTranscriptUsageAndPricesGeminiModels() throws {
+        let jsonl = """
+        {"step_index": 0, "type": "USER_INPUT", "created_at": "2026-11-25T02:19:20Z"}
+        {"step_index": 1, "type": "PLANNER_RESPONSE", "created_at": "2026-11-25T02:19:29Z", "model": "gemini-4-neon-medium", "input_tokens": 1000000, "cache_read_tokens": 1000000, "output_tokens": 100000}
+        {"step_index": 2, "type": "PLANNER_RESPONSE", "created_at": "2026-11-25T02:19:35Z", "model": "claude-opus-5-5", "input_tokens": 500000, "cache_read_tokens": 0, "output_tokens": 50000}
+        """
+        let events = try XCTUnwrap(
+            StatusService.geminiUsageEvents(data: Data(jsonl.utf8), isJSONL: true)
+        )
+        XCTAssertEqual(events.count, 1)
+        XCTAssertEqual(events[0].model, "gemini-4-neon")
+        XCTAssertEqual(events[0].tokens, 2_100_000)
+        // 1M input ($3.00) + 1M cache_read ($0.15) + 0.1M output ($1.50) = $4.65
+        let cost = try XCTUnwrap(
+            Pricing.cost(model: events[0].model, categories: events[0].categories, table: Pricing.builtIn)
+        )
+        XCTAssertEqual(cost, 4.65, accuracy: 0.001)
+    }
 }

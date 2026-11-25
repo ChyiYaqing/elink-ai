@@ -51,6 +51,10 @@ final class StatusService {
         fileURLWithPath: ("~/.codex/sessions" as NSString).expandingTildeInPath)
     private static let geminiRoot = URL(
         fileURLWithPath: ("~/.gemini/tmp" as NSString).expandingTildeInPath)
+    private static let antigravityBrainRoots = [
+        URL(fileURLWithPath: ("~/.gemini/antigravity-cli/brain" as NSString).expandingTildeInPath),
+        URL(fileURLWithPath: ("~/.gemini/antigravity/brain" as NSString).expandingTildeInPath),
+    ]
 
     init(usage: UsageFetcher, store: UsageStore? = nil, cluster: ClusterManager? = nil) {
         self.usage = usage
@@ -486,32 +490,62 @@ final class StatusService {
         return status
     }
 
-    static func geminiChatFiles(at root: URL) -> [URL]? {
+    static func geminiChatFiles(
+        at root: URL,
+        antigravityRoots: [URL] = antigravityBrainRoots
+    ) -> [URL]? {
         let fm = FileManager.default
-        guard fm.fileExists(atPath: root.path) else { return [] }
-        guard let projects = try? fm.contentsOfDirectory(
-            at: root,
-            includingPropertiesForKeys: [.isDirectoryKey]
-        ) else { return nil }
         var result: [URL] = []
-        for project in projects {
-            let chatsDir = project.appendingPathComponent("chats", isDirectory: true)
-            guard let files = try? fm.contentsOfDirectory(
-                at: chatsDir,
-                includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey]
+        if fm.fileExists(atPath: root.path),
+           let projects = try? fm.contentsOfDirectory(
+               at: root,
+               includingPropertiesForKeys: [.isDirectoryKey]
+           ) {
+            for project in projects {
+                let chatsDir = project.appendingPathComponent("chats", isDirectory: true)
+                guard let files = try? fm.contentsOfDirectory(
+                    at: chatsDir,
+                    includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey]
+                ) else { continue }
+                for url in files {
+                    let name = url.lastPathComponent
+                    guard name.hasPrefix("session-"),
+                          url.pathExtension == "json" || url.pathExtension == "jsonl" else { continue }
+                    result.append(url)
+                }
+            }
+        }
+        for brainRoot in antigravityRoots where fm.fileExists(atPath: brainRoot.path) {
+            guard let conversations = try? fm.contentsOfDirectory(
+                at: brainRoot,
+                includingPropertiesForKeys: [.isDirectoryKey]
             ) else { continue }
-            for url in files {
-                let name = url.lastPathComponent
-                guard name.hasPrefix("session-"),
-                      url.pathExtension == "json" || url.pathExtension == "jsonl" else { continue }
-                result.append(url)
+            for conv in conversations {
+                let transcript = conv
+                    .appendingPathComponent(".system_generated/logs/transcript.jsonl")
+                if fm.fileExists(atPath: transcript.path) {
+                    result.append(transcript)
+                }
             }
         }
         return result
     }
 
-    /// 解析单个 Gemini CLI 会话文件（兼容 `.json` 整包和 `.jsonl` 流式格式）。
-    /// `.json` 写入半截导致解析失败时返回 nil，调用方可保留上一次缓存。
+    /// 规范化 Gemini 模型名：去掉 Antigravity 附加的 effort/tier 后缀（如 `-medium`、
+    /// `-high`、`-tiered`），便于合并统计并命中官方 API 定价表。
+    static func normalizedGeminiModel(_ raw: String?) -> String {
+        var name = normalizedModel(raw)
+        for suffix in ["-xhigh", "-medium", "-high", "-low", "-max", "-tiered"] {
+            if name.hasSuffix(suffix) {
+                name = String(name.dropLast(suffix.count))
+                break
+            }
+        }
+        return name
+    }
+
+    /// 解析单个 Gemini CLI 会话文件或 Antigravity `transcript.jsonl`（兼容 `.json`
+    /// 整包与 `.jsonl` 流式格式）。`.json` 写入半截解析失败时返回 nil，调用方可保留缓存。
     static func geminiUsageEvents(
         data: Data,
         isJSONL: Bool = false
@@ -540,30 +574,58 @@ final class StatusService {
         var idOrder: [String] = []
         var anonymous: [(date: Date, model: String, tokens: Int, categories: [String: Int])] = []
         for obj in objects {
-            guard let tokens = obj["tokens"] as? [String: Any] else { continue }
-            guard let date = timestamp(obj["timestamp"]) else { continue }
-            let rawInput = max(0, (tokens["input"] as? NSNumber)?.intValue ?? 0)
-            let cached = max(0, (tokens["cached"] as? NSNumber)?.intValue ?? 0)
-            let output = max(0, (tokens["output"] as? NSNumber)?.intValue ?? 0)
-            let thoughts = max(0, (tokens["thoughts"] as? NSNumber)?.intValue ?? 0)
-            let tool = max(0, (tokens["tool"] as? NSNumber)?.intValue ?? 0)
-            let rawTotal = max(0, (tokens["total"] as? NSNumber)?.intValue ?? 0)
-            let nonCachedInput = max(0, rawInput - cached) + tool
-            var categories: [String: Int] = [:]
-            if nonCachedInput > 0 { categories["input"] = nonCachedInput }
-            if output > 0 { categories["output"] = output }
-            if cached > 0 { categories["cache_read"] = cached }
-            if thoughts > 0 { categories["reasoning"] = thoughts }
-            let sum = nonCachedInput + output + cached + thoughts
-            let total = rawTotal > 0 ? rawTotal : sum
-            guard total > 0 else { continue }
-            let model = normalizedModel(obj["model"] as? String)
-            let event = (date: date, model: model, tokens: total, categories: categories)
-            if let id = obj["id"] as? String, !id.isEmpty {
-                if byID[id] == nil { idOrder.append(id) }
-                byID[id] = event
-            } else {
-                anonymous.append(event)
+            // 1. Gemini CLI 格式：{ timestamp, model, tokens: { input, cached, output, thoughts, tool, total } }
+            if let tokens = obj["tokens"] as? [String: Any] {
+                guard let date = timestamp(obj["timestamp"]) else { continue }
+                let rawInput = max(0, (tokens["input"] as? NSNumber)?.intValue ?? 0)
+                let cached = max(0, (tokens["cached"] as? NSNumber)?.intValue ?? 0)
+                let output = max(0, (tokens["output"] as? NSNumber)?.intValue ?? 0)
+                let thoughts = max(0, (tokens["thoughts"] as? NSNumber)?.intValue ?? 0)
+                let tool = max(0, (tokens["tool"] as? NSNumber)?.intValue ?? 0)
+                let rawTotal = max(0, (tokens["total"] as? NSNumber)?.intValue ?? 0)
+                let nonCachedInput = max(0, rawInput - cached) + tool
+                var categories: [String: Int] = [:]
+                if nonCachedInput > 0 { categories["input"] = nonCachedInput }
+                if output > 0 { categories["output"] = output }
+                if cached > 0 { categories["cache_read"] = cached }
+                if thoughts > 0 { categories["reasoning"] = thoughts }
+                let sum = nonCachedInput + output + cached + thoughts
+                let total = rawTotal > 0 ? rawTotal : sum
+                guard total > 0 else { continue }
+                let model = normalizedGeminiModel(obj["model"] as? String)
+                let event = (date: date, model: model, tokens: total, categories: categories)
+                if let id = obj["id"] as? String, !id.isEmpty {
+                    if byID[id] == nil { idOrder.append(id) }
+                    byID[id] = event
+                } else {
+                    anonymous.append(event)
+                }
+                continue
+            }
+
+            // 2. Antigravity transcript.jsonl 格式：
+            // { step_index, created_at, model, input_tokens, cache_read_tokens, output_tokens }
+            if let rawModel = obj["model"] as? String,
+               rawModel.lowercased().contains("gemini"),
+               let date = timestamp(obj["created_at"]) {
+                let input = max(0, (obj["input_tokens"] as? NSNumber)?.intValue ?? 0)
+                let cacheRead = max(0, (obj["cache_read_tokens"] as? NSNumber)?.intValue ?? 0)
+                let output = max(0, (obj["output_tokens"] as? NSNumber)?.intValue ?? 0)
+                let total = input + cacheRead + output
+                guard total > 0 else { continue }
+                var categories: [String: Int] = [:]
+                if input > 0 { categories["input"] = input }
+                if cacheRead > 0 { categories["cache_read"] = cacheRead }
+                if output > 0 { categories["output"] = output }
+                let model = normalizedGeminiModel(rawModel)
+                let event = (date: date, model: model, tokens: total, categories: categories)
+                if let step = (obj["step_index"] as? NSNumber)?.intValue {
+                    let key = "step:\(step)"
+                    if byID[key] == nil { idOrder.append(key) }
+                    byID[key] = event
+                } else {
+                    anonymous.append(event)
+                }
             }
         }
         return idOrder.compactMap { byID[$0] } + anonymous
@@ -686,7 +748,8 @@ final class StatusService {
     /// v3：分类明细的历史回填。解析没变，但已经装过前一版的库里，集群表缺这份
     /// 数据——金额读的正是集群表，不重跑一次，本机当天没用过的 provider 会在所有
     /// 区间里都没有金额。
-    static let usageParserVersion = "3"
+    /// v4：接入 Gemini / Antigravity transcript 历史回填。
+    static let usageParserVersion = "4"
 
     /// 启动时后台回填近一年历史，让统计页首次打开就有周/月/年数据
     @discardableResult

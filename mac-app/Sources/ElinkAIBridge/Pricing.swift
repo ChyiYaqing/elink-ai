@@ -53,6 +53,11 @@ enum Pricing {
         "gemini-2.5-flash-lite": ModelPricing(input: 0.10, output: 0.40, cacheRead: 0.01, cacheWrite: 0),
         "gemini-3-pro-preview": ModelPricing(input: 2.0, output: 12.0, cacheRead: 0.2, cacheWrite: 0),
         "gemini-3-flash-preview": ModelPricing(input: 0.5, output: 3.0, cacheRead: 0.05, cacheWrite: 0),
+        "gemini-3.5-flash": ModelPricing(input: 1.50, output: 9.0, cacheRead: 0.15, cacheWrite: 0),
+        "gemini-3.5-flash-lite": ModelPricing(input: 0.10, output: 0.40, cacheRead: 0.01, cacheWrite: 0),
+        "gemini-3.8-flash": ModelPricing(input: 0.75, output: 3.75, cacheRead: 0.0375, cacheWrite: 0),
+        "gemini-4-neon": ModelPricing(input: 3.0, output: 15.0, cacheRead: 0.15, cacheWrite: 0),
+        "gemini-4-argon": ModelPricing(input: 2.0, output: 10.0, cacheRead: 0.10, cacheWrite: 0),
     ]
 
     /// 用户覆盖表所在位置，与 usage.db 同目录。
