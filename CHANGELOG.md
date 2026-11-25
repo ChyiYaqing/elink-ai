@@ -6,6 +6,21 @@ and `Removed`.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## 0.1.21
+
+### Added
+
+- Agent Sessions now shows recent output speed (`tok/s`) for Gemini CLI and
+  Antigravity (`agy`) sessions alongside Claude Code and Codex. Gemini CLI
+  counts both output and thinking tokens across tool-call turns, and
+  Antigravity retains per-turn completion timestamps so multi-turn text
+  conversations keep showing output speed.
+- First stable release promoting the `0.1.21-rc1` through `0.1.21-rc19`
+  milestones, including Gemini CLI and Antigravity provider tracking across the
+  Mac app, Linux TUI, e-paper display, and cluster sync, signed in-app macOS
+  updates, self-updating Raspberry Pi agent packages, and editable VPS server
+  monitoring.
+
 ## 0.1.21-rc19
 
 ### Added

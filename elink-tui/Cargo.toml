@@ -2,7 +2,7 @@
 name = "elink-tui"
 # Kept in sync with the repo release version; the update check compares it
 # against the latest GitHub release tag.
-version = "0.1.21-rc19"
+version = "0.1.21"
 edition = "2021"
 license = "GPL-3.0-only"
 description = "Keyboard-driven terminal dashboard for Claude Code and Codex usage"
