@@ -300,6 +300,9 @@ final class SessionScanner {
     private typealias GeminiInfo = (title: String, sessionID: String, model: String,
                                     snippet: String, activity: Date?, rate: Double?)
     private var geminiCache: [String: (size: Int, mtime: Date, info: GeminiInfo)] = [:]
+    /// Antigravity 纯文本回复没有独立结束时间戳：在步骤落盘于文件末尾时记下
+    /// 其 `mtime`，后续用户继续对话追加 `USER_INPUT` 后仍能保留已测样本。
+    private var antigravityStepEnds: [String: [Int: Date]] = [:]
     /// 本轮 scan 用到的路径；scan 结束时据此丢掉已不再扫描的文件
     private var touched = Set<String>()
 
@@ -329,6 +332,7 @@ final class SessionScanner {
             + scanGemini(live: live, cwdCounts: geminiCwdCounts, antigravityLive: antigravityLive).filter(recent)
         tailCache = tailCache.filter { touched.contains($0.key) }
         geminiCache = geminiCache.filter { touched.contains($0.key) }
+        antigravityStepEnds = antigravityStepEnds.filter { touched.contains($0.key) }
         sessions.sort { $0.effectiveLastModified > $1.effectiveLastModified }
         return sessions
     }
@@ -546,7 +550,20 @@ final class SessionScanner {
             }
             if !model.isEmpty && lastActivity != nil && !snippet.isEmpty { break }
         }
-        let rate = Self.geminiOutputRate(messages, antigravity: antigravity, fileModified: mtime)
+        if antigravity, let last = messages.last,
+           last["type"] as? String == "PLANNER_RESPONSE",
+           (last["status"] as? String ?? "DONE") == "DONE",
+           let step = (last["step_index"] as? NSNumber)?.intValue,
+           antigravityStepEnds[file.path]?[step] == nil,
+           let start = StatusService.timestamp(last["created_at"]) {
+            let dt = mtime.timeIntervalSince(start)
+            if dt > 0 && dt <= 600 {
+                antigravityStepEnds[file.path, default: [:]][step] = mtime
+            }
+        }
+        let observedEnds = antigravity ? (antigravityStepEnds[file.path] ?? [:]) : [:]
+        let rate = Self.geminiOutputRate(messages, antigravity: antigravity,
+                                         fileModified: mtime, observedEnds: observedEnds)
         return (projectName, sessionID, model, snippet, lastActivity, rate)
     }
 
@@ -557,11 +574,12 @@ final class SessionScanner {
     /// - Antigravity：`PLANNER_RESPONSE` 的 `created_at` 是生成起点；紧跟工具/模型
     ///   步骤时以下一条的 `created_at` 为生成终点；若处于文件末尾且已 `DONE`，
     ///   `transcript.jsonl` 是在步骤完成时落盘的，用文件 `mtime` 作终点（设 10 分钟
-    ///   上限，避免文件被事后触碰导致失真），从而覆盖纯文本回复。
+    ///   上限，避免文件被事后触碰导致失真），并按 `step_index` 缓存供后续轮次复用。
     static func geminiOutputRate(
         _ messages: [[String: Any]],
         antigravity: Bool,
-        fileModified: Date? = nil
+        fileModified: Date? = nil,
+        observedEnds: [Int: Date] = [:]
     ) -> Double? {
         var samples: [(tokens: Int, seconds: TimeInterval)] = []
         if antigravity {
@@ -571,13 +589,21 @@ final class SessionScanner {
                       (msg["status"] as? String ?? "DONE") == "DONE",
                       let out = (msg["output_tokens"] as? NSNumber)?.intValue, out > 0,
                       let start = StatusService.timestamp(msg["created_at"]) else { continue }
+                let step = (msg["step_index"] as? NSNumber)?.intValue
                 let end: Date?
                 if messages.indices.contains(i + 1) {
                     let next = messages[i + 1]
-                    guard next["type"] as? String != "USER_INPUT",
-                          next["source"] as? String != "USER_EXPLICIT",
-                          next["source"] as? String != "SYSTEM" else { continue }
-                    end = StatusService.timestamp(next["created_at"])
+                    if next["type"] as? String != "USER_INPUT",
+                       next["source"] as? String != "USER_EXPLICIT",
+                       next["source"] as? String != "SYSTEM" {
+                        end = StatusService.timestamp(next["created_at"])
+                    } else if let step {
+                        end = observedEnds[step]
+                    } else {
+                        end = nil
+                    }
+                } else if let step, let recorded = observedEnds[step] {
+                    end = recorded
                 } else if let mtime = fileModified,
                           mtime.timeIntervalSince(start) <= 600 {
                     end = mtime

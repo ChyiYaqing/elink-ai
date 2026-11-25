@@ -601,23 +601,37 @@ final class AgentSessionMonitorTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(s.tokensPerSecond), 60.0, accuracy: 0.001)
     }
 
-    func testAntigravityPureTextChatUsesFinalMtimeAndIgnoresStaleTouch() throws {
-        let t0 = Date(timeIntervalSince1970: floor(Date().timeIntervalSince1970) - 100)
-        let start = ISO8601DateFormatter().string(from: t0)
-        let lines = [
-            #"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","created_at":"\#(start)","content":"解释一下"}"#,
-            #"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"\#(start)","model":"gemini-4-neon-high","output_tokens":1000,"content":"回答"}"#,
+    func testAntigravityPureTextChatRetainsObservedRatesAcrossTurns() throws {
+        let t0 = Date(timeIntervalSince1970: floor(Date().timeIntervalSince1970) - 200)
+        func at(_ s: Double) -> String { ISO8601DateFormatter().string(from: t0.addingTimeInterval(s)) }
+        let path = "conv-chat/.system_generated/logs/transcript.jsonl"
+        let scanner = scanner()
+
+        // 第一轮纯文本回复完成：1000 tokens / 20s = 50 tok/s
+        var lines = [
+            #"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","created_at":"\#(at(0))","content":"解释一下"}"#,
+            #"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"\#(at(0))","model":"gemini-4-neon-high","output_tokens":1000,"content":"回答"}"#,
         ]
-        try write(lines, to: "conv-chat/.system_generated/logs/transcript.jsonl", under: antigravityRoot,
-                  mtime: t0.addingTimeInterval(20))
-        let s = try XCTUnwrap(scanner().scan(live: [], claudeCwdCounts: [:]).first)
-        // 1000 tokens / 20s = 50 tok/s
-        XCTAssertEqual(try XCTUnwrap(s.tokensPerSecond), 50.0, accuracy: 0.001)
+        try write(lines, to: path, under: antigravityRoot, mtime: t0.addingTimeInterval(20))
+        XCTAssertEqual(try XCTUnwrap(scanner.scan(live: [], claudeCwdCounts: [:]).first?.tokensPerSecond),
+                       50.0, accuracy: 0.001)
+
+        // 用户 100 秒后发出下一条问题，模型尚在生成中：第一轮已测得的速率不该消失
+        lines.append(#"{"step_index":2,"source":"USER_EXPLICIT","type":"USER_INPUT","created_at":"\#(at(120))","content":"继续"}"#)
+        try write(lines, to: path, under: antigravityRoot, mtime: t0.addingTimeInterval(120))
+        XCTAssertEqual(try XCTUnwrap(scanner.scan(live: [], claudeCwdCounts: [:]).first?.tokensPerSecond),
+                       50.0, accuracy: 0.001)
+
+        // 第二轮纯文本回复完成：2000 tokens / 20s；两轮合并 (1000 + 2000) / (20 + 20) = 75 tok/s
+        lines.append(#"{"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"\#(at(120))","model":"gemini-4-neon-high","output_tokens":2000,"content":"继续回答"}"#)
+        try write(lines, to: path, under: antigravityRoot, mtime: t0.addingTimeInterval(140))
+        XCTAssertEqual(try XCTUnwrap(scanner.scan(live: [], claudeCwdCounts: [:]).first?.tokensPerSecond),
+                       75.0, accuracy: 0.001)
 
         // 事后很久才被触碰的文件（mtime 晚于 created_at 超过 10 分钟）不应算出失真速率
         let staleStart = ISO8601DateFormatter().string(from: Date().addingTimeInterval(-3600))
         let staleMsgs: [[String: Any]] = [
-            ["type": "PLANNER_RESPONSE", "status": "DONE", "created_at": staleStart, "output_tokens": 1000],
+            ["step_index": 1, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": staleStart, "output_tokens": 1000],
         ]
         XCTAssertNil(SessionScanner.geminiOutputRate(staleMsgs, antigravity: true, fileModified: Date()))
     }
