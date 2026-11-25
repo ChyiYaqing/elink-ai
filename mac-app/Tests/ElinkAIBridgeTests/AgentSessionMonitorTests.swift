@@ -579,25 +579,47 @@ final class AgentSessionMonitorTests: XCTestCase {
         XCTAssertTrue(AgentSessionsCard.tagText(s, now: t0.addingTimeInterval(25)).contains("50 tok/s"))
     }
 
-    func testAntigravityOutputRatePairsPlannerWithNextModelStepAndSkipsUserWait() throws {
-        let t0 = Date().addingTimeInterval(-200)
+    func testAntigravityOutputRatePairsPlannerWithNextModelStepAndFinalMtime() throws {
+        let t0 = Date(timeIntervalSince1970: floor(Date().timeIntervalSince1970) - 200)
         func at(_ s: Double) -> String { ISO8601DateFormatter().string(from: t0.addingTimeInterval(s)) }
         try write([
             #"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","created_at":"\#(at(0))","content":"hi"}"#,
-            #"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","created_at":"\#(at(0))","model":"gemini-4-neon-medium","output_tokens":300}"#,
+            #"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"\#(at(0))","model":"gemini-4-neon-medium","output_tokens":300}"#,
             #"{"step_index":2,"source":"MODEL","type":"GENERIC","created_at":"\#(at(5))","content":"tool output"}"#,
-            #"{"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","created_at":"\#(at(6))","model":"gemini-4-neon-medium","output_tokens":700}"#,
+            #"{"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"\#(at(6))","model":"gemini-4-neon-medium","output_tokens":700}"#,
             // 后面隔了 120 秒才是用户输入：这段等待不能算进模型生成耗时
             #"{"step_index":4,"source":"USER_EXPLICIT","type":"USER_INPUT","created_at":"\#(at(126))","content":"next"}"#,
-            #"{"step_index":5,"source":"MODEL","type":"PLANNER_RESPONSE","created_at":"\#(at(126))","model":"gemini-4-neon-medium","output_tokens":500}"#,
+            #"{"step_index":5,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"\#(at(126))","model":"gemini-4-neon-medium","output_tokens":500}"#,
             #"{"step_index":6,"source":"MODEL","type":"GENERIC","created_at":"\#(at(136))","content":"tool output 2"}"#,
-            // 最后一条没有后续步骤，不参与计算
-            #"{"step_index":7,"source":"MODEL","type":"PLANNER_RESPONSE","created_at":"\#(at(138))","model":"gemini-4-neon-medium","output_tokens":400,"content":"done"}"#,
-        ], to: "conv-rate/.system_generated/logs/transcript.jsonl", under: antigravityRoot)
+            // 末尾纯文本回复：步骤完成时写入文件，以 mtime (at(143)) 作为结束时间
+            #"{"step_index":7,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"\#(at(138))","model":"gemini-4-neon-medium","output_tokens":400,"content":"done"}"#,
+        ], to: "conv-rate/.system_generated/logs/transcript.jsonl", under: antigravityRoot,
+           mtime: t0.addingTimeInterval(143))
 
         let s = try XCTUnwrap(scanner().scan(live: [], claudeCwdCounts: [:]).first)
-        // (300 + 500) tokens / (5s + 10s) = 53.333 tok/s
-        XCTAssertEqual(try XCTUnwrap(s.tokensPerSecond), 800.0 / 15.0, accuracy: 0.001)
+        // (300 + 500 + 400) tokens / (5s + 10s + 5s) = 60 tok/s
+        XCTAssertEqual(try XCTUnwrap(s.tokensPerSecond), 60.0, accuracy: 0.001)
+    }
+
+    func testAntigravityPureTextChatUsesFinalMtimeAndIgnoresStaleTouch() throws {
+        let t0 = Date(timeIntervalSince1970: floor(Date().timeIntervalSince1970) - 100)
+        let start = ISO8601DateFormatter().string(from: t0)
+        let lines = [
+            #"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","created_at":"\#(start)","content":"解释一下"}"#,
+            #"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"\#(start)","model":"gemini-4-neon-high","output_tokens":1000,"content":"回答"}"#,
+        ]
+        try write(lines, to: "conv-chat/.system_generated/logs/transcript.jsonl", under: antigravityRoot,
+                  mtime: t0.addingTimeInterval(20))
+        let s = try XCTUnwrap(scanner().scan(live: [], claudeCwdCounts: [:]).first)
+        // 1000 tokens / 20s = 50 tok/s
+        XCTAssertEqual(try XCTUnwrap(s.tokensPerSecond), 50.0, accuracy: 0.001)
+
+        // 事后很久才被触碰的文件（mtime 晚于 created_at 超过 10 分钟）不应算出失真速率
+        let staleStart = ISO8601DateFormatter().string(from: Date().addingTimeInterval(-3600))
+        let staleMsgs: [[String: Any]] = [
+            ["type": "PLANNER_RESPONSE", "status": "DONE", "created_at": staleStart, "output_tokens": 1000],
+        ]
+        XCTAssertNil(SessionScanner.geminiOutputRate(staleMsgs, antigravity: true, fileModified: Date()))
     }
 
     func testGeminiSessionReparsedOnlyWhenFileChanges() throws {

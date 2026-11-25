@@ -493,12 +493,12 @@ final class SessionScanner {
         touched.insert(path)
         let size = (try? file.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? -1
         if let hit = geminiCache[path], hit.size == size, hit.mtime == mtime { return hit.info }
-        let info = geminiInfo(of: file, antigravity: antigravity)
+        let info = geminiInfo(of: file, mtime: mtime, antigravity: antigravity)
         geminiCache[path] = (size, mtime, info)
         return info
     }
 
-    private func geminiInfo(of file: URL, antigravity: Bool) -> GeminiInfo {
+    private func geminiInfo(of file: URL, mtime: Date, antigravity: Bool) -> GeminiInfo {
         // Antigravity 的文件名与上两级目录都是固定的，会话 ID 是 brain 下的目录名
         var projectName = antigravity
             ? "Antigravity"
@@ -546,7 +546,7 @@ final class SessionScanner {
             }
             if !model.isEmpty && lastActivity != nil && !snippet.isEmpty { break }
         }
-        let rate = Self.geminiOutputRate(messages, antigravity: antigravity)
+        let rate = Self.geminiOutputRate(messages, antigravity: antigravity, fileModified: mtime)
         return (projectName, sessionID, model, snippet, lastActivity, rate)
     }
 
@@ -555,23 +555,39 @@ final class SessionScanner {
     ///   消息或上一轮 `toolCalls` 的最晚完成时间；输出 token 合并 `output + thoughts`
     ///   （与 Claude/Codex 把思维链计入 `output_tokens` 的口径一致）。
     /// - Antigravity：`PLANNER_RESPONSE` 的 `created_at` 是生成起点；紧跟工具/模型
-    ///   步骤时下一条的 `created_at` 是本轮生成结束时间，用户再次输入不计入。
-    static func geminiOutputRate(_ messages: [[String: Any]], antigravity: Bool) -> Double? {
+    ///   步骤时以下一条的 `created_at` 为生成终点；若处于文件末尾且已 `DONE`，
+    ///   `transcript.jsonl` 是在步骤完成时落盘的，用文件 `mtime` 作终点（设 10 分钟
+    ///   上限，避免文件被事后触碰导致失真），从而覆盖纯文本回复。
+    static func geminiOutputRate(
+        _ messages: [[String: Any]],
+        antigravity: Bool,
+        fileModified: Date? = nil
+    ) -> Double? {
         var samples: [(tokens: Int, seconds: TimeInterval)] = []
         if antigravity {
             for i in messages.indices {
                 let msg = messages[i]
                 guard msg["type"] as? String == "PLANNER_RESPONSE",
+                      (msg["status"] as? String ?? "DONE") == "DONE",
                       let out = (msg["output_tokens"] as? NSNumber)?.intValue, out > 0,
-                      let start = StatusService.timestamp(msg["created_at"]),
-                      messages.indices.contains(i + 1) else { continue }
-                let next = messages[i + 1]
-                guard next["type"] as? String != "USER_INPUT",
-                      next["source"] as? String != "USER_EXPLICIT",
-                      next["source"] as? String != "SYSTEM",
-                      let end = StatusService.timestamp(next["created_at"]) else { continue }
-                let dt = end.timeIntervalSince(start)
-                if dt > 0 { samples.append((out, dt)) }
+                      let start = StatusService.timestamp(msg["created_at"]) else { continue }
+                let end: Date?
+                if messages.indices.contains(i + 1) {
+                    let next = messages[i + 1]
+                    guard next["type"] as? String != "USER_INPUT",
+                          next["source"] as? String != "USER_EXPLICIT",
+                          next["source"] as? String != "SYSTEM" else { continue }
+                    end = StatusService.timestamp(next["created_at"])
+                } else if let mtime = fileModified,
+                          mtime.timeIntervalSince(start) <= 600 {
+                    end = mtime
+                } else {
+                    end = nil
+                }
+                if let end {
+                    let dt = end.timeIntervalSince(start)
+                    if dt > 0 { samples.append((out, dt)) }
+                }
             }
         } else {
             var lastInput: Date?
