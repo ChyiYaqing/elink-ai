@@ -956,6 +956,25 @@ pub fn statusline_usage(json: &Value, fetched_at: i64, now: i64) -> Option<Provi
     })
 }
 
+/// Takes the API result whole once it has any window: the two sources' windows
+/// were captured at different times and `UsageWindow` carries no timestamp, so
+/// splicing them would pass an old window off as this round's data. Only when
+/// the API has nothing does the stale statusLine cache stand in, flagged cached
+/// so `keep_last_good`'s timestamp check keeps fresher in-memory values, and
+/// keeping the API error, which the 429 backoff is detected from.
+fn merge_gemini_fallback(live: ProviderUsage, stale: Option<ProviderUsage>) -> ProviderUsage {
+    match stale {
+        Some(stale) if live.primary.percent.is_none() && live.weekly.percent.is_none() => {
+            ProviderUsage {
+                error: live.error,
+                is_cached: true,
+                ..stale
+            }
+        }
+        _ => live,
+    }
+}
+
 /// Retains the previous good windows when a fetch fails or a stale cache would
 /// overwrite fresher in-memory data (port of UsageFetcher.keepLastGood).
 pub fn keep_last_good(old: &ProviderUsage, new: ProviderUsage, now: i64) -> ProviderUsage {
@@ -1375,11 +1394,7 @@ impl QuotaFetcher {
             Some((usage, false)) => Some(usage),
             None => None,
         };
-        let live = self.fetch_gemini_api(now);
-        match stale {
-            Some(usage) if live.primary.percent.is_none() && live.weekly.percent.is_none() => usage,
-            _ => live,
-        }
+        merge_gemini_fallback(self.fetch_gemini_api(now), stale)
     }
 
     fn fetch_gemini_api(&self, now: i64) -> ProviderUsage {
@@ -1966,6 +1981,50 @@ mod tests {
         assert!(dirs.contains(&canon(&cellar)), "{dirs:?}");
         assert!(dirs.contains(&canon(&nvm)), "{dirs:?}");
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn gemini_fallback_only_when_api_has_no_window_and_keeps_api_error() {
+        let window = |percent| UsageWindow {
+            percent: Some(percent),
+            reset_at: Some(NOW + 3600),
+        };
+        let stale = ProviderUsage {
+            primary: window(10.0),
+            weekly: window(40.0),
+            fetched_at: Some(NOW - 1800),
+            ..ProviderUsage::default()
+        };
+        // The API only knows the short window: the stale weekly one is not
+        // passed off as this round's data.
+        let live = ProviderUsage {
+            primary: window(20.0),
+            fetched_at: Some(NOW),
+            ..ProviderUsage::default()
+        };
+        let merged = merge_gemini_fallback(live, Some(stale.clone()));
+        assert_eq!(merged.primary.percent, Some(20.0));
+        assert_eq!(merged.weekly.percent, None);
+        assert!(!merged.is_cached);
+
+        // The API failed with a 429: the cache fills in, flagged as cached, and
+        // the error survives for the backoff.
+        let failed = ProviderUsage::with_error("gemini usage HTTP 429");
+        let merged = merge_gemini_fallback(failed, Some(stale.clone()));
+        assert!(merged.is_cached);
+        assert_eq!(merged.weekly.percent, Some(40.0));
+        assert!(merged.error.as_deref().unwrap().contains("429"));
+
+        // A newer API value already in memory beats the older cache.
+        let newer = ProviderUsage {
+            primary: window(30.0),
+            weekly: window(50.0),
+            fetched_at: Some(NOW - 60),
+            ..ProviderUsage::default()
+        };
+        let kept = keep_last_good(&newer, merged, NOW);
+        assert_eq!(kept.primary.percent, Some(30.0));
+        assert!(kept.error.as_deref().unwrap().contains("429"));
     }
 
     #[test]

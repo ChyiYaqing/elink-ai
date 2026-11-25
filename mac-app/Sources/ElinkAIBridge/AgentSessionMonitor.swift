@@ -63,6 +63,9 @@ final class ProcessDiscovery {
         let transcriptPath: String?
         let cwd: String?
         var antigravity = false
+        /// Gemini CLI 的会话身份：一个终端一个会话。它默认会派生一个共用
+        /// 终端的 node 子进程，按 pid 算会把同一次启动算成两个。
+        var tty = ""
     }
 
     // 高负载下 Process 启动开销可能超过短超时导致所有 agent 误判为死亡，
@@ -83,11 +86,12 @@ final class ProcessDiscovery {
             if isClaude(command) { candidates.append((pid, tty, .claude, false)) }
             else if isCodex(command) { candidates.append((pid, tty, .codex, false)) }
             else if isAntigravity(command) { candidates.append((pid, tty, .gemini, true)) }
-            else if isGemini(command) { candidates.append((pid, tty, .gemini, false)) }
+            else if Self.isGemini(command) { candidates.append((pid, tty, .gemini, false)) }
         }
         let chunks = lsofChunks(pids: candidates.map(\.pid))
         var out: [Snapshot] = []
         var claimed = Set<String>()
+        var geminiByTTY: [String: Snapshot] = [:]
         for (pid, tty, kind, antigravity) in candidates {
             guard let lsof = chunks[pid] else { continue }
             let cwd = workingDirectory(from: lsof)
@@ -111,11 +115,12 @@ final class ProcessDiscovery {
             case .gemini:
                 let path = bestGeminiTranscript(in: lsof)
                 guard path != nil || cwd != nil else { continue }
-                guard claimed.insert("gemini:\(path ?? tty)").inserted else { continue }
-                out.append(Snapshot(kind: kind, transcriptPath: path, cwd: cwd))
+                // 同一终端的启动器和子进程合并成一个，有打开的会话文件的优先
+                if geminiByTTY[tty]?.transcriptPath != nil { continue }
+                geminiByTTY[tty] = Snapshot(kind: kind, transcriptPath: path, cwd: cwd, tty: tty)
             }
         }
-        return out
+        return out + geminiByTTY.keys.sorted().compactMap { geminiByTTY[$0] }
     }
 
     /// 所有 pid 一次 lsof；-Fn 输出按 `p<pid>` 标记切分。
@@ -158,12 +163,19 @@ final class ProcessDiscovery {
         return first == "agy" || first.hasSuffix("/agy")
     }
 
-    private func isGemini(_ command: String) -> Bool {
+    static func isGemini(_ command: String) -> Bool {
         let lowered = command.lowercased()
         if lowered.contains("@google/gemini-cli") || lowered.contains("/gemini.js") { return true }
-        return lowered.split(separator: " ").contains { token in
-            token == "gemini" || token.hasSuffix("/gemini")
-        }
+        // 只认可执行文件本身，或 node 直接运行的 gemini 脚本；`vim gemini`
+        // 这类恰好带 gemini 参数的进程不算
+        let tokens = lowered.split(separator: " ")
+        func isGeminiToken(_ token: Substring) -> Bool { token == "gemini" || token.hasSuffix("/gemini") }
+        guard let first = tokens.first else { return false }
+        if isGeminiToken(first) { return true }
+        // node 前面可能有任意启动选项（`node --require x /opt/homebrew/bin/gemini`），
+        // 不去解析选项，只要参数里有 gemini 入口就算
+        guard first == "node" || first.hasSuffix("/node") else { return false }
+        return tokens.dropFirst().contains(where: isGeminiToken)
     }
 
     private func workingDirectory(from lsof: String) -> String? {
@@ -343,15 +355,16 @@ final class SessionScanner {
         var out: [AgentSession] = []
         for (file, mtime) in files {
             let antigravity = Self.isAntigravityTranscript(file)
+            // 已按打开的文件精确判活的会话不占兜底名额，名额只分给未匹配的会话
             var isLive = live.contains(file.path)
-            if antigravity {
-                isLive = isLive || agySeen < antigravityLive
+            if !isLive && antigravity {
+                isLive = agySeen < antigravityLive
                 agySeen += 1
-            } else {
+            } else if !isLive {
                 let dir = file.deletingLastPathComponent().deletingLastPathComponent().lastPathComponent
                 let idx = dirSeen[dir, default: 0]
                 dirSeen[dir] = idx + 1
-                isLive = isLive || idx < liveByDir[dir, default: 0]
+                isLive = idx < liveByDir[dir, default: 0]
             }
             guard isLive || Date().timeIntervalSince(mtime) < 6 * 3600 else { continue }
             let info = cachedGeminiInfo(of: file, mtime: mtime, antigravity: antigravity)
@@ -368,6 +381,29 @@ final class SessionScanner {
             ))
         }
         return out
+    }
+
+    /// Antigravity 把用户输入包在 `<USER_REQUEST>` 里，取出正文；其余已知的
+    /// 注入块（设置变更、系统消息、附加元数据、会话上下文）不当摘要。真实消息
+    /// 以 `<div>` 等开头时照常显示。
+    /// Antigravity 和 Gemini CLI（bundle 里的 `<..._context>` 等）注入消息的标签
+    private static let injectedGeminiTags = [
+        "<USER_SETTINGS_CHANGE>", "<SYSTEM_MESSAGE>", "<ADDITIONAL_METADATA>",
+        "<session_context>", "<hook_context>", "<project_context>", "<extension_context>",
+        "<global_context>", "<untrusted_context>", "<user_project_memory>", "<activated_skill>",
+    ]
+
+    static func geminiSnippetText(_ text: String) -> String? {
+        var trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let request = "<USER_REQUEST>"
+        if trimmed.hasPrefix(request) {
+            trimmed = String(trimmed.dropFirst(request.count))
+            if let end = trimmed.range(of: "</USER_REQUEST>") { trimmed = String(trimmed[..<end.lowerBound]) }
+            trimmed = trimmed.trimmingCharacters(in: .whitespacesAndNewlines)
+        } else if Self.injectedGeminiTags.contains(where: { trimmed.hasPrefix($0) }) {
+            return nil
+        }
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     private static func geminiText(_ content: Any?) -> String? {
@@ -503,11 +539,9 @@ final class SessionScanner {
             if lastActivity == nil, let ts = (msg["timestamp"] ?? msg["created_at"]) as? String {
                 lastActivity = StatusService.timestamp(ts)
             }
-            // content 可能是字符串，也可能是 [{"text": ...}] 分段；"<" 开头的是
-            // 注入的上下文（<session_context>、<USER_REQUEST> 等），不当摘要
-            if snippet.isEmpty, let text = Self.geminiText(msg["content"]) {
-                let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !trimmed.isEmpty, !trimmed.hasPrefix("<") { snippet = String(trimmed.prefix(120)) }
+            // content 可能是字符串，也可能是 [{"text": ...}] 分段
+            if snippet.isEmpty, let text = Self.geminiText(msg["content"]).flatMap(Self.geminiSnippetText) {
+                snippet = String(text.prefix(120))
             }
             if !model.isEmpty && lastActivity != nil && !snippet.isEmpty { break }
         }
@@ -943,20 +977,30 @@ struct LivenessTracker {
 
     private(set) var missCounts: [String: Int] = [:]
 
-    /// 键为 transcript 路径，或 cwd 回退的 "cwd#<encoded>#<i>"（claude）/
-    /// "gcwd#<cwd>#<i>"（Gemini CLI），或 "agy#<i>"（Antigravity）。
+    /// Gemini CLI 按终端跟踪：同一个会话只保留最新的匹配方式（打开的会话文件，
+    /// 或者没打开时的 cwd），宽限期也按终端算。按键跟踪时，会话在两种方式
+    /// 之间切换会让旧键留在宽限期里，一个会话算成两个存活会话。
+    private enum GeminiMatch { case transcript(String), cwd(String) }
+    private var gemini: [String: (match: GeminiMatch, misses: Int)] = [:]
+
+    /// 键为 transcript 路径，或 cwd 回退的 "cwd#<encoded>#<i>"（claude），
+    /// 或 "agy#<i>"（Antigravity）；Gemini CLI 另按进程跟踪。
     mutating func update(snapshots: [ProcessDiscovery.Snapshot]) -> Result {
         var seen = Set<String>()
         var cwdIndex: [String: Int] = [:]
         var agyIndex = 0
+        var geminiSeen: [String: GeminiMatch] = [:]
         for snap in snapshots {
-            if let path = snap.transcriptPath {
+            if snap.kind == .gemini, !snap.antigravity {
+                if let path = snap.transcriptPath { geminiSeen[snap.tty] = .transcript(path) }
+                else if let cwd = snap.cwd { geminiSeen[snap.tty] = .cwd(cwd) }
+            } else if let path = snap.transcriptPath {
                 seen.insert(path)
             } else if snap.antigravity {
                 seen.insert("agy#\(agyIndex)")
                 agyIndex += 1
-            } else if let cwd = snap.cwd, snap.kind == .claude || snap.kind == .gemini {
-                let key = snap.kind == .claude ? "cwd#\(sanitizedClaudeProjectPath(cwd))" : "gcwd#\(cwd)"
+            } else if let cwd = snap.cwd, snap.kind == .claude {
+                let key = "cwd#\(sanitizedClaudeProjectPath(cwd))"
                 let i = cwdIndex[key, default: 0]
                 cwdIndex[key] = i + 1
                 seen.insert("\(key)#\(i)")
@@ -966,15 +1010,21 @@ struct LivenessTracker {
         for (p, n) in missCounts where !seen.contains(p) {
             if n + 1 >= 2 { missCounts.removeValue(forKey: p) } else { missCounts[p] = n + 1 }
         }
+        for (tty, entry) in gemini where geminiSeen[tty] == nil {
+            if entry.misses + 1 >= 2 { gemini.removeValue(forKey: tty) } else { gemini[tty]?.misses += 1 }
+        }
+        for (tty, match) in geminiSeen { gemini[tty] = (match, 0) }
         var result = Result()
+        for entry in gemini.values {
+            switch entry.match {
+            case let .transcript(path): result.live.insert(path)
+            case let .cwd(cwd): result.geminiCwdCounts[cwd, default: 0] += 1
+            }
+        }
         for key in missCounts.keys {
             if key.hasPrefix("cwd#") {
                 let encoded = String(key.dropFirst(4).split(separator: "#")[0])
                 result.claudeCwdCounts[encoded, default: 0] += 1
-            } else if key.hasPrefix("gcwd#"), let sep = key.lastIndex(of: "#") {
-                // cwd 可能含 "#"，只切掉末尾的序号
-                let cwd = String(key[key.index(key.startIndex, offsetBy: 5)..<sep])
-                result.geminiCwdCounts[cwd, default: 0] += 1
             } else if key.hasPrefix("agy#") {
                 result.antigravityCount += 1
             } else {
@@ -984,7 +1034,10 @@ struct LivenessTracker {
         return result
     }
 
-    mutating func reset() { missCounts = [:] }
+    mutating func reset() {
+        missCounts = [:]
+        gemini = [:]
+    }
 }
 
 // MARK: - 监视器

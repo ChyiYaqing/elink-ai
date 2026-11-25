@@ -571,18 +571,22 @@ def test_needs_input_breaks_the_monitor_dwell_immediately():
     assert decision.reason == "content-switch"
 
 
-def test_any_provider_approval_needs_attention_in_every_mode():
-    """待审批与显示模式无关：Gemini 模式下 Claude 的审批、dashboard 模式下
-    Gemini 的审批都要把屏幕叫回来。"""
-    gemini_waiting = StatusSnapshot(gemini=ProviderStatus(status="idle", needs_input=True))
-    claude_waiting = StatusSnapshot(claude=ProviderStatus(status="idle", needs_input=True))
-    for mode in ("dashboard", "claude", "codex", "gemini"):
+def test_only_providers_the_layout_draws_can_wake_the_screen():
+    """待审批和活动只看当前布局画得出来的 provider：dashboard 只画 Claude 和
+    Codex，单 provider 模式只画所选那家。叫醒屏幕却看不到是谁在等，等于白刷。"""
+    waiting = {name: StatusSnapshot(**{name: ProviderStatus(status="idle", needs_input=True)})
+               for name in ("claude", "codex", "gemini")}
+    working = {name: StatusSnapshot(**{name: ProviderStatus(status="working")})
+               for name in ("claude", "codex", "gemini")}
+    visible = {"dashboard": {"claude", "codex"}, "claude": {"claude"},
+               "codex": {"codex"}, "gemini": {"gemini"}}
+    for mode, shown in visible.items():
         service = _make_service()
         service.runtime.mode = mode
-        for snapshot in (gemini_waiting, claude_waiting):
-            assert service._needs_attention(snapshot), mode
-            assert service._ai_active(snapshot), mode
-    assert _make_service()._ai_active(StatusSnapshot(gemini=ProviderStatus(status="working")))
+        for name in ("claude", "codex", "gemini"):
+            assert service._needs_attention(waiting[name]) == (name in shown), (mode, name)
+            assert service._ai_active(waiting[name]) == (name in shown), (mode, name)
+            assert service._ai_active(working[name]) == (name in shown), (mode, name)
 
 
 def test_the_dwell_clock_starts_when_the_monitor_page_reaches_the_panel():

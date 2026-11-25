@@ -2,6 +2,36 @@ import XCTest
 @testable import ElinkAIBridge
 
 final class GeminiProviderTests: XCTestCase {
+    func testGeminiFallbackOnlyWhenAPIHasNoWindowAndKeepsAPIError() {
+        let now = Date()
+        func window(_ percent: Double) -> UsageWindow {
+            UsageWindow(percent: percent, resetMinutes: 60, resetAt: now.addingTimeInterval(3600))
+        }
+        let stale = ProviderUsage(primary: window(10), weekly: window(40),
+                                  fetchedAt: now.addingTimeInterval(-1800))
+
+        // API 只给了短窗口：不拿旧缓存的周窗口冒充本轮数据
+        let partial = UsageFetcher.mergeGeminiFallback(
+            live: ProviderUsage(primary: window(20), fetchedAt: now), stale: stale)
+        XCTAssertEqual(partial.primary.percent, 20)
+        XCTAssertNil(partial.weekly.percent)
+        XCTAssertFalse(partial.isCached)
+
+        // API 429：旧缓存兜底，标为缓存，错误保留给退避识别
+        let fallback = UsageFetcher.mergeGeminiFallback(
+            live: ProviderUsage(error: "Gemini usage HTTP 429"), stale: stale)
+        XCTAssertTrue(fallback.isCached)
+        XCTAssertEqual(fallback.weekly.percent, 40)
+        XCTAssertEqual(fallback.error, "Gemini usage HTTP 429")
+
+        // 内存里更新的 API 值不被更旧的缓存覆盖
+        let newer = ProviderUsage(primary: window(30), weekly: window(50),
+                                  fetchedAt: now.addingTimeInterval(-60))
+        let kept = UsageFetcher.keepLastGood(old: newer, new: fallback)
+        XCTAssertEqual(kept.primary.percent, 30)
+        XCTAssertEqual(kept.error, "Gemini usage HTTP 429")
+    }
+
     func testParsesGeminiFiveHourAndWeeklyQuotaBuckets() {
         let now = Date(timeIntervalSince1970: 1_783_933_200) // 2026-07-13T09:00:00Z
         let payload: [String: Any] = [

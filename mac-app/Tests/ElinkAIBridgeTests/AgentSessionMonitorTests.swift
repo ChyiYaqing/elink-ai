@@ -392,13 +392,38 @@ final class AgentSessionMonitorTests: XCTestCase {
 
     func testLivenessTrackerGeminiFallbackKeys() {
         var tracker = LivenessTracker()
-        let cli = ProcessDiscovery.Snapshot(kind: .gemini, transcriptPath: nil, cwd: "/Users/me/a#b")
+        func cli(_ tty: String) -> ProcessDiscovery.Snapshot {
+            ProcessDiscovery.Snapshot(kind: .gemini, transcriptPath: nil, cwd: "/Users/me/a#b", tty: tty)
+        }
         let agy = ProcessDiscovery.Snapshot(kind: .gemini, transcriptPath: nil, cwd: "/x", antigravity: true)
-        let result = tracker.update(snapshots: [cli, cli, agy, agy, agy])
+        let result = tracker.update(snapshots: [cli("1"), cli("2"), agy, agy, agy])
         XCTAssertTrue(result.live.isEmpty)
         XCTAssertEqual(result.geminiCwdCounts, ["/Users/me/a#b": 2])
         XCTAssertEqual(result.antigravityCount, 3)
         XCTAssertTrue(result.claudeCwdCounts.isEmpty)
+    }
+
+    func testGeminiLivenessFollowsEachProcessMatch() {
+        var tracker = LivenessTracker()
+        let fallbackA = ProcessDiscovery.Snapshot(kind: .gemini, transcriptPath: nil, cwd: "/p", tty: "s001")
+        let exactA = ProcessDiscovery.Snapshot(kind: .gemini, transcriptPath: "/s.json", cwd: "/p", tty: "s001")
+        let fallbackB = ProcessDiscovery.Snapshot(kind: .gemini, transcriptPath: nil, cwd: "/p", tty: "s002")
+        XCTAssertEqual(tracker.update(snapshots: [fallbackA]).geminiCwdCounts, ["/p": 1])
+        // 同一进程打开了会话文件：只剩精确匹配，不再多占一个回退名额
+        var result = tracker.update(snapshots: [exactA])
+        XCTAssertEqual(result.live, ["/s.json"])
+        XCTAssertTrue(result.geminiCwdCounts.isEmpty)
+        // 反过来关掉会话文件：旧的精确匹配也不留
+        result = tracker.update(snapshots: [fallbackA])
+        XCTAssertTrue(result.live.isEmpty)
+        XCTAssertEqual(result.geminiCwdCounts, ["/p": 1])
+        // 同目录的另一个进程漏探一轮，仍按自己的宽限期保留
+        _ = tracker.update(snapshots: [exactA, fallbackB])
+        result = tracker.update(snapshots: [exactA])
+        XCTAssertEqual(result.live, ["/s.json"])
+        XCTAssertEqual(result.geminiCwdCounts, ["/p": 1])
+        result = tracker.update(snapshots: [exactA])
+        XCTAssertTrue(result.geminiCwdCounts.isEmpty)
     }
 
     func testGeminiCwdFallbackMatchesHashedAndNamedProjectDirectories() throws {
@@ -424,6 +449,43 @@ final class AgentSessionMonitorTests: XCTestCase {
         ])
         let liveIDs = try Set(sessions.filter(\.isLive).map { try canonicalPath(URL(fileURLWithPath: $0.id)) })
         XCTAssertEqual(liveIDs, [try canonicalPath(hashedNewest), try canonicalPath(named)])
+    }
+
+    func testExactlyLiveGeminiSessionDoesNotUseTheCwdFallbackSlot() throws {
+        let line = #"{"sessionId":"s","messages":[{"type":"user","content":"hi"}]}"#
+        let hashed = "d2f01f8f40d3d60692694bafcc7b2ac97bf4dbec581bd35e9407df956fb4a1fa"
+        // 一个进程打开了最新会话，另一个进程只能按 cwd 匹配到次新的那个
+        let older = try write([line], to: "\(hashed)/chats/session-older.json", under: geminiRoot,
+                              mtime: Date().addingTimeInterval(-600))
+        let newest = try write([line], to: "\(hashed)/chats/session-newest.json", under: geminiRoot,
+                               mtime: Date().addingTimeInterval(-60))
+
+        let sessions = scanner().scan(live: [try canonicalPath(newest)], claudeCwdCounts: [:], geminiCwdCounts: [
+            "/Users/chyiyaqing/chyi/github/elink-ai": 1,
+        ])
+        let liveIDs = try Set(sessions.filter(\.isLive).map { try canonicalPath(URL(fileURLWithPath: $0.id)) })
+        XCTAssertEqual(liveIDs, [try canonicalPath(newest), try canonicalPath(older)])
+    }
+
+    func testGeminiProcessMatchesOnlyTheExecutableOrNodeScript() {
+        XCTAssertTrue(ProcessDiscovery.isGemini("gemini"))
+        XCTAssertTrue(ProcessDiscovery.isGemini("/opt/homebrew/bin/gemini --resume"))
+        XCTAssertTrue(ProcessDiscovery.isGemini("node /opt/homebrew/bin/gemini"))
+        XCTAssertTrue(ProcessDiscovery.isGemini("node --inspect --max-old-space-size=4096 /opt/homebrew/bin/gemini"))
+        XCTAssertTrue(ProcessDiscovery.isGemini("node --require node:fs /opt/homebrew/bin/gemini"))
+        XCTAssertTrue(ProcessDiscovery.isGemini("node --diagnostic-dir /tmp /opt/homebrew/bin/gemini"))
+        XCTAssertTrue(ProcessDiscovery.isGemini("node /x/@google/gemini-cli/bundle/gemini.js"))
+        XCTAssertFalse(ProcessDiscovery.isGemini("vim gemini"))
+        XCTAssertFalse(ProcessDiscovery.isGemini("grep -r gemini ."))
+    }
+
+    func testGeminiSnippetUnwrapsUserRequestAndKeepsMarkup() {
+        XCTAssertEqual(SessionScanner.geminiSnippetText("<USER_REQUEST>\n修复问题\n</USER_REQUEST>\n<ADDITIONAL_METADATA>x</ADDITIONAL_METADATA>"),
+                       "修复问题")
+        XCTAssertEqual(SessionScanner.geminiSnippetText("<div>真实回复</div>"), "<div>真实回复</div>")
+        XCTAssertNil(SessionScanner.geminiSnippetText("<USER_SETTINGS_CHANGE>mode</USER_SETTINGS_CHANGE>"))
+        XCTAssertNil(SessionScanner.geminiSnippetText("<session_context>..."))
+        XCTAssertNil(SessionScanner.geminiSnippetText("<hook_context>from SessionStart</hook_context>"))
     }
 
     func testAntigravityTranscriptTitleIDAndActivity() throws {

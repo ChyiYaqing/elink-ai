@@ -258,26 +258,39 @@ class AgentService:
             return "monitor"
         return "ai"
 
-    @staticmethod
-    def _needs_attention(snapshot: StatusSnapshot) -> bool:
+    # 每种布局实际画出来的 provider：dashboard 只有 Claude、Codex 两张卡
+    _VISIBLE_PROVIDERS = {
+        "dashboard": ("claude", "codex"),
+        "claude": ("claude",),
+        "codex": ("codex",),
+        "gemini": ("gemini",),
+    }
+
+    def _visible_providers(self) -> tuple[str, ...]:
+        return self._VISIBLE_PROVIDERS.get(self.runtime.mode, ("claude", "codex"))
+
+    def _needs_attention(self, snapshot: StatusSnapshot) -> bool:
         """有事情在等人处理（待审批）。这是唯一能打断监控页驻留的信号。
 
-        与显示模式无关：哪家在等审批都要把人叫回来，单 provider 模式下也一样。
+        只看当前布局画得出来的 provider：把屏幕叫回来却看不到是谁在等审批，
+        等于白叫一次整屏刷新。
         """
-        return (snapshot.claude.needs_input or snapshot.codex.needs_input
-                or snapshot.gemini.needs_input)
+        return any(getattr(snapshot, name).needs_input for name in self._visible_providers())
 
-    @staticmethod
-    def _ai_active(snapshot: StatusSnapshot) -> bool:
+    def _ai_active(self, snapshot: StatusSnapshot) -> bool:
         """是否正处于需要占用屏幕的 AI 活动（working / 待审批）。
 
         只看当前状态，不看历史事件：recent_events 里的旧 idle 事件如果也算
-        活动，AI 就永远不会进入真正的空闲，监控页也就永远出不来。
+        活动，AI 就永远不会进入真正的空闲，监控页也就永远出不来。和
+        _needs_attention 一样只看当前布局画得出来的 provider。
         """
-        for provider in (snapshot.claude, snapshot.codex, snapshot.gemini):
+        visible = self._visible_providers()
+        for name in visible:
+            provider = getattr(snapshot, name)
             if provider.status == "working" or provider.needs_input:
                 return True
-        return any(session.state == "working" for session in snapshot.current_sessions)
+        return any(session.state == "working" and session.provider in visible
+                   for session in snapshot.current_sessions)
 
     @staticmethod
     def _panel_health(runtime) -> dict[str, Any]:

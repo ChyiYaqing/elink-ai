@@ -903,11 +903,19 @@ final class UsageFetcher {
         // 数据时才退回旧缓存，否则周额度会一直停在旧值。
         let cached = Self.cachedAntigravityGeminiUsage()
         if let cached, cached.fresh { return cached.usage }
-        let live = fetchGeminiFromAPI()
-        if let cached, live.primary.percent == nil, live.weekly.percent == nil {
-            return cached.usage
-        }
-        return live
+        return Self.mergeGeminiFallback(live: fetchGeminiFromAPI(), stale: cached?.usage)
+    }
+
+    /// API 拿到任一窗口就整份用 API 的：两个来源各窗口的采集时间不同，而
+    /// UsageWindow 不带时间，拼起来会把旧窗口当成本轮数据。API 完全没数据时
+    /// 才退回旧缓存，标为缓存（让 keepLastGood 的时间戳检查保住内存里更新的
+    /// 值），并保留 API 的错误，429 退避靠它识别。
+    static func mergeGeminiFallback(live: ProviderUsage, stale: ProviderUsage?) -> ProviderUsage {
+        guard let stale, live.primary.percent == nil, live.weekly.percent == nil else { return live }
+        var usage = stale
+        usage.isCached = true
+        usage.error = live.error
+        return usage
     }
 
     private func fetchGeminiFromAPI() -> ProviderUsage {
