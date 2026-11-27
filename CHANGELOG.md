@@ -6,6 +6,29 @@ and `Removed`.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## 0.1.23
+
+### Changed
+
+- The e-paper `dashboard` layout now displays Claude, Codex, and Gemini
+  together as three equal horizontal telemetry strips, with fixed status badges
+  and session/event rows on the left, primary and weekly quota bars in the
+  center, and today's tokens with a fixed 4-row model breakdown on the right.
+  Gemini labels its primary quota as `PRIMARY WINDOW` rather than hardcoding
+  5 hours, and single-provider modes keep their full-card layout.
+- The e-paper `dashboard` mode now includes Gemini in active-provider wakeups,
+  approval attention interrupts, and refresh signatures; the Mac app's mode
+  selector and device summary rename `Dual` to `Overview` while preserving
+  `dashboard` on the wire.
+
+### Fixed
+
+- Switching between single-provider e-paper modes with identical idle status
+  now refreshes immediately instead of waiting out the throttle interval,
+  transitions between `ERROR` and cached `STALE` states are detected in the
+  refresh signature, and session age suffixes are preserved when long project
+  or model names are truncated on the strip.
+
 ## 0.1.22
 
 ### Added
