@@ -86,30 +86,35 @@ class RefreshPolicy:
             "error": bool(value.error),
         }
 
+    @staticmethod
+    def _visible_providers(mode: str) -> tuple[str, ...]:
+        if mode in {"claude", "codex", "gemini"}:
+            return (mode,)
+        return ("claude", "codex", "gemini")
+
     def _signature(self, snapshot: StatusSnapshot, stale: bool, *, mode: str = "dashboard") -> str:
-        value = {
+        visible = self._visible_providers(mode)
+        value: dict[str, object] = {
             "stale": stale,
-            "claude": self._provider_view(snapshot.claude),
-            "codex": self._provider_view(snapshot.codex),
             "sessions": [
                 (item.id, item.provider, item.project, item.model, item.state, item.updated_at)
                 for item in snapshot.current_sessions
+                if item.provider in visible
             ],
             "events": [
                 (item.id, item.provider, item.kind, item.occurred_at)
                 for item in snapshot.recent_events
+                if item.provider in visible
             ],
         }
-        if mode == "gemini":
-            value["gemini"] = self._provider_view(snapshot.gemini)
+        for name in visible:
+            value[name] = self._provider_view(getattr(snapshot, name))
         raw = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
         return hashlib.sha256(raw).hexdigest()
 
-    @staticmethod
-    def _priority_signature(snapshot: StatusSnapshot, stale: bool, *, mode: str = "dashboard") -> str:
-        if mode == "gemini":
-            value = (stale, snapshot.gemini.status, snapshot.gemini.needs_input)
-        else:
-            value = (stale, snapshot.claude.status, snapshot.codex.status,
-                     snapshot.claude.needs_input, snapshot.codex.needs_input)
-        return repr(value)
+    @classmethod
+    def _priority_signature(cls, snapshot: StatusSnapshot, stale: bool, *, mode: str = "dashboard") -> str:
+        visible = cls._visible_providers(mode)
+        statuses = tuple(getattr(snapshot, name).status for name in visible)
+        inputs = tuple(getattr(snapshot, name).needs_input for name in visible)
+        return repr((stale, *statuses, *inputs))

@@ -346,7 +346,7 @@ struct UsagePanelView: View {
                     get: { model.mode },
                     set: { model.mode = $0; model.onSetMode?($0) }
                 )) {
-                    Text(tr("双栏", "Dual")).tag("dashboard")
+                    Text(tr("总览", "All")).tag("dashboard")
                     Text("Claude").tag("claude")
                     Text("Codex").tag("codex")
                     Text("Gemini").tag("gemini")

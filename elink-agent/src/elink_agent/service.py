@@ -258,16 +258,16 @@ class AgentService:
             return "monitor"
         return "ai"
 
-    # 每种布局实际画出来的 provider：dashboard 只有 Claude、Codex 两张卡
+    # 每种布局实际画出来的 provider：dashboard 展示 Claude、Codex、Gemini 三条仪表带
     _VISIBLE_PROVIDERS = {
-        "dashboard": ("claude", "codex"),
+        "dashboard": ("claude", "codex", "gemini"),
         "claude": ("claude",),
         "codex": ("codex",),
         "gemini": ("gemini",),
     }
 
     def _visible_providers(self) -> tuple[str, ...]:
-        return self._VISIBLE_PROVIDERS.get(self.runtime.mode, ("claude", "codex"))
+        return self._VISIBLE_PROVIDERS.get(self.runtime.mode, ("claude", "codex", "gemini"))
 
     def _needs_attention(self, snapshot: StatusSnapshot) -> bool:
         """有事情在等人处理（待审批）。这是唯一能打断监控页驻留的信号。

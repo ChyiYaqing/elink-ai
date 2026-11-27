@@ -107,3 +107,25 @@ def test_manual_refresh_still_obeys_the_minimum_interval():
     # 请求不会被丢掉：调用方保留 force，窗口一到同一个请求就执行
     later = policy.decide(value, stale=False, now=131, force="full")
     assert later.refresh and later.kind == "full"
+
+
+def test_gemini_changes_trigger_dashboard_refresh_but_not_claude_mode():
+    policy = RefreshPolicy(min_interval_s=30)
+    base = snapshot()
+    base.gemini = ProviderStatus(status="idle", primary_pct=10)
+    policy.record(base, stale=False, kind="full", now=100, mode="dashboard")
+
+    updated_pct = snapshot()
+    updated_pct.gemini = ProviderStatus(status="idle", primary_pct=25)
+    assert policy.decide(updated_pct, stale=False, now=110, mode="dashboard").reason == "throttled"
+    after_window = policy.decide(updated_pct, stale=False, now=135, mode="dashboard")
+    assert after_window.refresh and after_window.reason == "data-change"
+
+    urgent = snapshot()
+    urgent.gemini = ProviderStatus(status="working", primary_pct=25, needs_input=True)
+    priority = policy.decide(urgent, stale=False, now=110, mode="dashboard")
+    assert priority.refresh and priority.reason == "priority-change"
+
+    claude_only = RefreshPolicy(min_interval_s=0)
+    claude_only.record(base, stale=False, kind="full", now=100, mode="claude")
+    assert not claude_only.decide(urgent, stale=False, now=110, mode="claude").refresh

@@ -572,13 +572,13 @@ def test_needs_input_breaks_the_monitor_dwell_immediately():
 
 
 def test_only_providers_the_layout_draws_can_wake_the_screen():
-    """待审批和活动只看当前布局画得出来的 provider：dashboard 只画 Claude 和
-    Codex，单 provider 模式只画所选那家。叫醒屏幕却看不到是谁在等，等于白刷。"""
+    """待审批和活动只看当前布局画得出来的 provider：dashboard 展示三家，
+    单 provider 模式只画所选那家。叫醒屏幕却看不到是谁在等，等于白刷。"""
     waiting = {name: StatusSnapshot(**{name: ProviderStatus(status="idle", needs_input=True)})
                for name in ("claude", "codex", "gemini")}
     working = {name: StatusSnapshot(**{name: ProviderStatus(status="working")})
                for name in ("claude", "codex", "gemini")}
-    visible = {"dashboard": {"claude", "codex"}, "claude": {"claude"},
+    visible = {"dashboard": {"claude", "codex", "gemini"}, "claude": {"claude"},
                "codex": {"codex"}, "gemini": {"gemini"}}
     for mode, shown in visible.items():
         service = _make_service()
