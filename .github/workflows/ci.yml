@@ -17,28 +17,134 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, macOS, ARM64, elink-ci]
-    timeout-minutes: 20
-    env:
-      PYTHON_BIN: /opt/homebrew/bin/python3.13
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+
+      - name: Check shell scripts
+        run: |
+          mapfile -t SCRIPTS < <(git ls-files '*.sh')
+          echo "Checking ${#SCRIPTS[@]} shell script(s): ${SCRIPTS[*]}"
+          for script in "${SCRIPTS[@]}"; do
+            sh -n "$script"
+          done
+          shellcheck -S warning "${SCRIPTS[@]}"
+
+      - name: Check repository metadata, plists, and version parity
+        run: python3 .github/scripts/check_metadata.py
+
+      - name: Check diff whitespace and conflict markers
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          if [ "$EVENT_NAME" = "pull_request" ] && [ -n "$PR_BASE_SHA" ]; then
+            git diff --check "$PR_BASE_SHA...HEAD"
+          elif [ "$EVENT_NAME" = "push" ] && [ -n "$PUSH_BEFORE_SHA" ] && \
+               [ "$PUSH_BEFORE_SHA" != "0000000000000000000000000000000000000000" ] && \
+               git cat-file -e "${PUSH_BEFORE_SHA}^{commit}" 2>/dev/null; then
+            git diff --check "$PUSH_BEFORE_SHA..HEAD"
+          else
+            git diff --check HEAD~1..HEAD
+          fi
+
+  python:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
-      - name: Show toolchain versions
-        run: |
-          "$PYTHON_BIN" --version
-          swift --version
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: pyproject.toml
 
-      - name: Test Python agent
+      - name: Install test dependencies
+        run: python -m pip install -e '.[test]'
+
+      - name: Compile Python sources
         run: |
-          VENV="$RUNNER_TEMP/elink-ai-venv-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          trap 'rm -rf "$VENV"' EXIT
-          "$PYTHON_BIN" -m venv "$VENV"
-          "$VENV/bin/python" -m pip install -e '.[test]'
-          "$VENV/bin/python" -m pytest -q
+          DIRS=(elink-agent hooks)
+          if [ -d mcp ]; then
+            DIRS+=(mcp)
+          fi
+          python -m compileall -q "${DIRS[@]}"
+
+      - name: Test Python packages
+        run: python -m pytest -q
+
+  rust-tui:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: elink-tui
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Show Rust toolchain versions
+        run: |
+          rustup component add rustfmt clippy
+          rustc --version
+          cargo --version
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            elink-tui/target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('elink-tui/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Lint with Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test Rust TUI
+        run: cargo test --locked
+
+  mac-app:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, macOS, ARM64, elink-ci]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Show Swift version
+        run: swift --version
+
+      - name: Lint macOS plists
+        run: plutil -lint mac-app/Info.plist install/*.plist.example
 
       - name: Test macOS app
         run: swift test
+        working-directory: mac-app
+
+      - name: Cross-compile macOS x86_64 release binary
+        run: |
+          SCRATCH="$RUNNER_TEMP/swift-ci-x86_64-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          trap 'rm -rf "$SCRATCH"' EXIT
+          swift build -c release \
+            --triple x86_64-apple-macosx13.0 \
+            --scratch-path "$SCRATCH"
+          BIN_DIR=$(swift build -c release \
+            --triple x86_64-apple-macosx13.0 \
+            --scratch-path "$SCRATCH" \
+            --show-bin-path)
+          lipo "$BIN_DIR/ElinkAIBridge" -verify_arch x86_64
         working-directory: mac-app
