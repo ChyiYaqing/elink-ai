@@ -35,9 +35,10 @@ def _plan(before: StatusSnapshot, after: StatusSnapshot, mode: str = "dashboard"
 
 
 def _model_row_top(index: int) -> int:
-    """Top of the Claude card's model row `index`, mirroring _provider_panel."""
-    token_y = DashboardRenderer.CLAUDE_BOX[3] - 108
-    return token_y + 34 + index * DashboardRenderer._MODEL_ROW_HEIGHT
+    """Top of the Claude strip's model row `index`, mirroring _provider_strip."""
+    return (DashboardRenderer.CLAUDE_BOX[1]
+            + DashboardRenderer._STRIP_MODEL_TOP
+            + index * DashboardRenderer._STRIP_MODEL_ROW_HEIGHT)
 
 
 def _assert_within(regions, box, renderer: DashboardRenderer) -> None:
@@ -97,16 +98,24 @@ def test_dual_panel_overage_percentage_fits_before_usage_label():
 def test_primary_percentage_stays_above_its_progress_bar():
     # 0% 时进度条是空心的：大号数字只要伸到条上，条内和条上方的间隙就会出现黑像素
     renderer = DashboardRenderer()
-    for mode, label_offset in (("claude", 250), ("dashboard", 168)):
-        snapshot = _snapshot(claude=replace(_snapshot().claude, primary_pct=0))
-        image = renderer.render(snapshot, mode=mode, updated_at=FIXED_TIME).convert("L")
-        x0, y0 = DashboardRenderer.CLAUDE_BOX[:2]
-        bar_y = y0 + 156
-        left, right = x0 + 30, x0 + label_offset - 12
-        # 跳过进度条 2px 的上边框，只看条上方的间隙和条内部
-        for top, bottom in ((bar_y - 4, bar_y), (bar_y + 2, bar_y + 16)):
-            region = image.crop((left, top, right, bottom))
-            assert region.getextrema()[0] == 255, f"percentage reaches the bar in {mode} mode"
+    snapshot = _snapshot(claude=replace(_snapshot().claude, primary_pct=0))
+
+    # 单 provider 大卡模式
+    single_img = renderer.render(snapshot, mode="claude", updated_at=FIXED_TIME).convert("L")
+    sx0, sy0 = DashboardRenderer.SINGLE_BOX[:2]
+    sbar_y = sy0 + 156
+    for top, bottom in ((sbar_y - 4, sbar_y), (sbar_y + 2, sbar_y + 16)):
+        region = single_img.crop((sx0 + 30, top, sx0 + 250 - 12, bottom))
+        assert region.getextrema()[0] == 255, "percentage reaches the bar in claude mode"
+
+    # 总览三行横向仪表带模式
+    dash_img = renderer.render(snapshot, mode="dashboard", updated_at=FIXED_TIME).convert("L")
+    dx0, dy0 = DashboardRenderer.CLAUDE_BOX[:2]
+    dbar_y = dy0 + 53
+    mid_left = dx0 + DashboardRenderer._STRIP_DIVIDER_1 + 12
+    for top, bottom in ((dbar_y - 3, dbar_y), (dbar_y + 2, dbar_y + 11)):
+        region = dash_img.crop((mid_left + 10, top, mid_left + 104 - 8, bottom))
+        assert region.getextrema()[0] == 255, "percentage reaches the bar in dashboard mode"
 
 
 def test_overage_percentage_does_not_overfill_progress_bar():
@@ -121,11 +130,13 @@ def test_overage_percentage_does_not_overfill_progress_bar():
 def test_model_labels_drop_redundant_provider_prefix():
     assert DashboardRenderer._model_label("claude-sonnet-4", "Claude") == "sonnet-4"
     assert DashboardRenderer._model_label("gpt-5.6-terra", "Codex") == "5.6-terra"
+    assert DashboardRenderer._model_label("gemini-3.5-pro", "Gemini") == "3.5-pro"
 
 
 def test_top_level_components_do_not_overlap():
     renderer = DashboardRenderer()
-    for mode in ("dashboard", "claude"):
+    assert {"claude", "codex", "gemini"}.issubset(renderer.component_boxes("dashboard"))
+    for mode in ("dashboard", "claude", "codex", "gemini"):
         boxes = [box for name, box in renderer.component_boxes(mode).items()
                  if "." not in name]
         for index, first in enumerate(boxes):
@@ -188,8 +199,10 @@ def test_model_rows_beyond_the_fixed_count_are_reported_not_dropped():
 
     image = DashboardRenderer().render(snapshot, updated_at=FIXED_TIME).convert("L")
 
-    overflow_row = _model_row_top(DashboardRenderer._MODEL_ROWS - 1)
-    band = image.crop((34, overflow_row, 300, overflow_row + DashboardRenderer._MODEL_ROW_HEIGHT))
+    overflow_row = _model_row_top(DashboardRenderer._STRIP_MODEL_ROWS - 1)
+    left = DashboardRenderer.CLAUDE_BOX[0] + DashboardRenderer._STRIP_DIVIDER_2 + 12
+    right = DashboardRenderer.CLAUDE_BOX[2] - 16
+    band = image.crop((left, overflow_row, right, overflow_row + DashboardRenderer._STRIP_MODEL_ROW_HEIGHT))
     assert band.getextrema()[0] == 0, "the hidden-model count should render, not vanish"
 
 
@@ -202,10 +215,7 @@ def test_session_change_stays_inside_its_reserved_row():
     renderer, plan = _plan(before, after)
 
     assert plan.kind == "region"
-    boxes = renderer.component_boxes()
-    allowed = (boxes["claude"][0], boxes["claude.session"][1],
-               boxes["claude"][2], boxes["claude.session"][3])
-    _assert_within(plan.regions, allowed, renderer)
+    _assert_within(plan.regions, renderer.component_boxes()["claude.session"], renderer)
 
 
 def test_recent_event_change_stays_inside_its_reserved_row():
@@ -219,6 +229,48 @@ def test_recent_event_change_stays_inside_its_reserved_row():
 
     assert plan.kind == "region"
     _assert_within(plan.regions, renderer.component_boxes()["codex.event"], renderer)
+
+
+def test_gemini_change_in_dashboard_stays_inside_gemini_strip():
+    before = _snapshot(gemini=ProviderStatus(status="idle", primary_pct=10, tokens_today=1000))
+    after = replace(before, gemini=ProviderStatus(
+        status="idle", primary_pct=45, tokens_today=250_000,
+        model_usage_today=[ModelUsage("gemini-3.5-pro", 250_000)],
+    ))
+
+    renderer, plan = _plan(before, after)
+
+    assert plan.kind == "region"
+    _assert_within(plan.regions, renderer.component_boxes()["gemini"], renderer)
+
+
+def test_gemini_attention_change_in_dashboard_stays_inside_gemini_badge():
+    before = _snapshot(gemini=ProviderStatus(status="working", primary_pct=15))
+    after = replace(before, gemini=replace(before.gemini, needs_input=True))
+
+    renderer, plan = _plan(before, after)
+
+    assert plan.kind == "region"
+    _assert_within(plan.regions, renderer.component_boxes()["gemini.badge"], renderer)
+
+
+def test_primary_window_label_avoids_hardcoding_five_hours_for_gemini():
+    assert DashboardRenderer._primary_window_label("Claude", compact=True) == "5H WINDOW"
+    assert DashboardRenderer._primary_window_label("Codex", compact=False) == "5 HOUR WINDOW"
+    assert DashboardRenderer._primary_window_label("Gemini", compact=True) == "PRIMARY WINDOW"
+    assert DashboardRenderer._primary_window_label("Gemini", compact=False) == "PRIMARY WINDOW"
+
+
+def test_strip_session_row_preserves_age_suffix_when_truncating():
+    renderer = DashboardRenderer()
+    draw = ImageDraw.Draw(Image.new("L", (renderer.width, renderer.height), 255))
+    font = renderer._font(renderer._STRIP_MODEL_FONT_SIZE, bold=True)
+    x0, _, x1, _ = renderer._strip_activity_box(renderer.CLAUDE_BOX, 0)
+    text = renderer._truncate_with_suffix(
+        draw, "NOW WORK elink-ai · sonnet-4-6", " · 2m", font, x1 - x0,
+    )
+    assert text.endswith(" · 2m")
+    assert draw.textbbox((0, 0), text, font=font)[2] <= x1 - x0
 
 
 class TestStaleBadge:

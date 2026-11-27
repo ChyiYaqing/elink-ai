@@ -20,10 +20,22 @@ class DashboardRenderer:
     # 唯一的义务是让每个组件只在自己的框内绘制：任何随数据量变化的重排都会把
     # 一次小改动放大成整块刷新。
     HEADER_BOX = (18, 8, 630, 66)
-    CLAUDE_BOX = (18, 74, 316, 458)
-    CODEX_BOX = (332, 74, 630, 458)
+    CLAUDE_BOX = (18, 74, 630, 195)
+    CODEX_BOX = (18, 205, 630, 326)
+    GEMINI_BOX = (18, 336, 630, 457)
     SINGLE_BOX = (18, 74, 630, 458)
     FOOTER_BOX = (18, 459, 630, 476)
+
+    # 三行横向仪表带的内部网格偏移（相对每条卡片的左上角）
+    _STRIP_DIVIDER_1 = 168
+    _STRIP_DIVIDER_2 = 422
+    _STRIP_MODEL_ROWS = 4
+    _STRIP_MODEL_ROW_HEIGHT = 14
+    _STRIP_MODEL_FONT_SIZE = 10
+    _STRIP_MODEL_TOP = 56
+    _STRIP_ACTIVITY_HEIGHT = 13
+    _STRIP_SESSION_TOP = 82
+    _STRIP_EVENT_TOP = 97
 
     # 即时反馈提示条。左右边界必须 8 对齐——区域刷新按字节打包像素列。
     # 高度取到 66 与页眉齐平：矮一点会把「Updated hh:mm」拦腰切断。
@@ -80,18 +92,17 @@ class DashboardRenderer:
                 updated_at=updated_at, large=True,
             )
         else:
-            self._provider_panel(
-                draw, self.CLAUDE_BOX, "Claude", snapshot.claude,
-                sessions=self._for_provider(snapshot.current_sessions, "claude"),
-                events=self._for_provider(snapshot.recent_events, "claude"),
-                updated_at=updated_at,
-            )
-            self._provider_panel(
-                draw, self.CODEX_BOX, "Codex", snapshot.codex,
-                sessions=self._for_provider(snapshot.current_sessions, "codex"),
-                events=self._for_provider(snapshot.recent_events, "codex"),
-                updated_at=updated_at,
-            )
+            for name, key, box, provider in (
+                ("Claude", "claude", self.CLAUDE_BOX, snapshot.claude),
+                ("Codex", "codex", self.CODEX_BOX, snapshot.codex),
+                ("Gemini", "gemini", self.GEMINI_BOX, snapshot.gemini),
+            ):
+                self._provider_strip(
+                    draw, box, name, provider,
+                    sessions=self._for_provider(snapshot.current_sessions, key),
+                    events=self._for_provider(snapshot.recent_events, key),
+                    updated_at=updated_at,
+                )
         self._footer(draw)
         return image.convert("1", dither=Image.Dither.NONE)
 
@@ -107,16 +118,16 @@ class DashboardRenderer:
                       f"{mode}.session": self._activity_box(self.SINGLE_BOX, 2),
                       f"{mode}.event": self._activity_box(self.SINGLE_BOX, 3)}
         else:
-            panels = {
-                "claude": self.CLAUDE_BOX,
-                "claude.badge": self._badge_box(self.CLAUDE_BOX, large=False),
-                "claude.session": self._activity_box(self.CLAUDE_BOX, 2),
-                "claude.event": self._activity_box(self.CLAUDE_BOX, 3),
-                "codex": self.CODEX_BOX,
-                "codex.badge": self._badge_box(self.CODEX_BOX, large=False),
-                "codex.session": self._activity_box(self.CODEX_BOX, 2),
-                "codex.event": self._activity_box(self.CODEX_BOX, 3),
-            }
+            panels = {}
+            for name, box in (
+                ("claude", self.CLAUDE_BOX),
+                ("codex", self.CODEX_BOX),
+                ("gemini", self.GEMINI_BOX),
+            ):
+                panels[name] = box
+                panels[f"{name}.badge"] = self._strip_badge_box(box)
+                panels[f"{name}.session"] = self._strip_activity_box(box, 0)
+                panels[f"{name}.event"] = self._strip_activity_box(box, 1)
         boxes = {"header": self.HEADER_BOX, **panels, "footer": self.FOOTER_BOX}
         return {name: (box[0], box[1], box[2] + 1, box[3] + 1) for name, box in boxes.items()}
 
@@ -172,7 +183,7 @@ class DashboardRenderer:
 
         pct = self._percentage(provider.primary_pct)
         label_x = x0 + (250 if large else 168)
-        draw.text((x0 + 16, y0 + 67), "5 HOUR WINDOW",
+        draw.text((x0 + 16, y0 + 67), self._primary_window_label(name, compact=False),
                   font=self._font(12, bold=True), fill=0)
         bar_y = y0 + 156
         # 字号同时受宽度和高度约束，大号数字的底边要停在进度条上方
@@ -214,6 +225,115 @@ class DashboardRenderer:
         if has_activity:
             self._activity_rows(draw, box, sessions, events, updated_at)
 
+    def _provider_strip(self, draw: ImageDraw.ImageDraw, box: tuple[int, int, int, int],
+                        name: str, provider: ProviderStatus, *,
+                        sessions: list[SessionSummary], events: list[RecentEvent],
+                        updated_at: datetime) -> None:
+        """总览模式下的横向仪表带：左区身份/状态/活跃行，中区双配额进度，右区今日用量。"""
+        x0, y0, x1, y1 = box
+        draw.rounded_rectangle((x0 + 3, y0 + 3, x1, y1), radius=10, fill=0)
+        draw.rounded_rectangle((x0, y0, x1 - 3, y1 - 3), radius=10,
+                               fill=255, outline=0, width=2)
+
+        div1 = x0 + self._STRIP_DIVIDER_1
+        div2 = x0 + self._STRIP_DIVIDER_2
+        draw.line((div1, y0 + 11, div1, y1 - 14), fill=0, width=1)
+        draw.line((div2, y0 + 11, div2, y1 - 14), fill=0, width=1)
+
+        # 左区：身份、固定状态徽章、独立会话/事件行
+        left = x0 + 14
+        provider_index = (
+            "PROVIDER 01" if name.lower() == "claude"
+            else "PROVIDER 03" if name.lower() == "gemini"
+            else "PROVIDER 02"
+        )
+        draw.text((left, y0 + 8), provider_index, font=self._font(9, bold=True), fill=0)
+        draw.text((left, y0 + 21), name.upper(), font=self._font(22, bold=True), fill=0)
+        self._draw_badge(draw, self._strip_badge_box(box), provider,
+                         preferred_size=13, min_size=10)
+        self._strip_activity_rows(draw, box, sessions, events, updated_at)
+
+        # 中区：主窗口 + 周限额（Gemini 的主窗口可能是日配额，不写死 5 小时）
+        mid_left = div1 + 12
+        mid_right = div2 - 12
+        draw.text((mid_left, y0 + 8), self._primary_window_label(name, compact=True),
+                  font=self._font(10, bold=True), fill=0)
+        pct = self._percentage(provider.primary_pct)
+        bar_y = y0 + 53
+        label_x = mid_left + 104
+        pct_font = self._fit_font(draw, pct, preferred=32, minimum=20,
+                                  max_width=label_x - mid_left - 8,
+                                  max_height=bar_y - 4 - (y0 + 19), bold=True)
+        draw.text((mid_left, y0 + 19), pct, font=pct_font, fill=0)
+        draw.text((label_x, y0 + 21), "USED", font=self._font(11, bold=True), fill=0)
+        reset = self._reset(provider.primary_reset_min).replace("reset ", "")
+        reset_font = self._font(11)
+        reset_text = self._truncate(draw, f"RESET {reset.upper()}", reset_font,
+                                    mid_right - label_x)
+        draw.text((label_x, y0 + 36), reset_text, font=reset_font, fill=0)
+        self._progress(draw, mid_left, bar_y, mid_right, provider.primary_pct, height=13)
+
+        weekly_y = y0 + 75
+        weekly = self._percentage(provider.weekly_pct)
+        wf = self._font(16, bold=True)
+        ww = draw.textbbox((0, 0), weekly, font=wf)[2]
+        draw.text((mid_right - ww, weekly_y - 4), weekly, font=wf, fill=0)
+        weekly_label = f"WEEKLY · {self._reset(provider.weekly_reset_min).upper()}"
+        wl_font = self._font(10, bold=True)
+        draw.text((mid_left, weekly_y),
+                  self._truncate(draw, weekly_label, wl_font, mid_right - ww - mid_left - 8),
+                  font=wl_font, fill=0)
+        self._progress(draw, mid_left, y0 + 94, mid_right, provider.weekly_pct, height=10)
+
+        # 右区：今日 Tokens + 固定 4 行模型拆分
+        right_left = div2 + 12
+        right_edge = x1 - 16
+        draw.text((right_left, y0 + 8), "TODAY TOKENS", font=self._font(10, bold=True), fill=0)
+        token = self._compact(provider.tokens_today)
+        tf = self._fit_font(draw, token, preferred=24, minimum=16,
+                            max_width=right_edge - right_left, max_height=26, bold=True)
+        draw.text((right_left, y0 + 21), token, font=tf, fill=0)
+        draw.line((right_left, y0 + 50, right_edge, y0 + 50), fill=0, width=1)
+        self._model_usage(
+            draw, right_left, y0 + self._STRIP_MODEL_TOP, right_edge,
+            provider.model_usage_today, name,
+            max_rows=self._STRIP_MODEL_ROWS, show_hidden=True,
+            row_height=self._STRIP_MODEL_ROW_HEIGHT,
+            font_size=self._STRIP_MODEL_FONT_SIZE,
+        )
+
+    def _strip_badge_box(self, box: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+        x0, y0, _, _ = box
+        return (x0 + 14, y0 + 51, x0 + self._STRIP_DIVIDER_1 - 10, y0 + 75)
+
+    def _strip_activity_box(self, box: tuple[int, int, int, int], index: int) -> tuple[int, int, int, int]:
+        x0, y0, _, _ = box
+        top = y0 + (self._STRIP_SESSION_TOP if index == 0 else self._STRIP_EVENT_TOP)
+        return (x0 + 14, top, x0 + self._STRIP_DIVIDER_1 - 10, top + self._STRIP_ACTIVITY_HEIGHT)
+
+    def _strip_activity_rows(self, draw: ImageDraw.ImageDraw, box: tuple[int, int, int, int],
+                             sessions: list[SessionSummary], events: list[RecentEvent],
+                             updated_at: datetime) -> None:
+        font = self._font(self._STRIP_MODEL_FONT_SIZE, bold=True)
+        now = int(updated_at.timestamp())
+        if sessions:
+            item = sessions[0]
+            state = "WORK" if item.state == "working" else "IDLE"
+            detail = " · ".join(part for part in (item.project, item.model) if part)
+            prefix = f"NOW {state} {detail}".rstrip()
+            suffix = f" · {self._age(now, item.updated_at)}" if item.updated_at else ""
+            x0, y0, x1, _ = self._strip_activity_box(box, 0)
+            text = self._truncate_with_suffix(draw, prefix, suffix, font, x1 - x0)
+            draw.text((x0, y0), text, font=font, fill=0)
+        if events:
+            item = events[0]
+            kind = {"needs_input": "ACTION", "working": "WORKING", "idle": "IDLE"}[item.kind]
+            text = f"EVENT {kind}"
+            if item.occurred_at:
+                text += f" · {self._age(now, item.occurred_at)}"
+            x0, y0, x1, _ = self._strip_activity_box(box, 1)
+            draw.text((x0, y0), self._truncate(draw, text, font, x1 - x0), font=font, fill=0)
+
     def _badge_box(self, box: tuple[int, int, int, int],
                    large: bool) -> tuple[int, int, int, int]:
         _, y0, x1, _ = box
@@ -234,7 +354,13 @@ class DashboardRenderer:
         （约屏幕的 37%），刚好越过区域刷新的面积阈值。于是最需要立刻看见的事件
         反而触发了整帧刷新。徽章把同一个信号收进一个固定矩形，代价约 2.5% 屏幕。
         """
-        bx0, by0, bx1, by1 = self._badge_box(box, large)
+        self._draw_badge(draw, self._badge_box(box, large), provider,
+                         preferred_size=18 if large else 15,
+                         min_size=13 if large else 11)
+
+    def _draw_badge(self, draw: ImageDraw.ImageDraw, badge_box: tuple[int, int, int, int],
+                    provider: ProviderStatus, *, preferred_size: int, min_size: int) -> None:
+        bx0, by0, bx1, by1 = badge_box
         # 反白只留给真正要人处理的事。额度停止刷新但数字仍可信时画 STALE 且
         # 不反白，免得它跟 ACTION REQUIRED 抢同一份注意力。
         stale = provider.usage_is_stale
@@ -247,27 +373,32 @@ class DashboardRenderer:
             text = "ERROR"
         else:
             text = provider.status.upper()
-        font = self._font(18 if large else 15, bold=True)
+        font = self._fit_font(draw, text, preferred=preferred_size, minimum=min_size,
+                              max_width=bx1 - bx0 - 12, bold=True)
         radius = (by1 - by0) // 2
         draw.rounded_rectangle((bx0, by0, bx1, by1), radius=radius,
                                fill=0 if attention else 255, outline=0, width=1)
         bounds = draw.textbbox((0, 0), text, font=font)
-        y = by0 + (by1 - by0 - bounds[3]) // 2
-        text_x = bx0 + (bx1 - bx0 - bounds[2]) // 2
+        text_w = bounds[2] - bounds[0]
+        text_h = bounds[3] - bounds[1]
+        y = by0 + (by1 - by0 - text_h) // 2 - bounds[1]
+        text_x = bx0 + (bx1 - bx0 - text_w) // 2 - bounds[0]
         draw.text((text_x, y), text, font=font, fill=255 if attention else 0)
 
     def _model_usage(self, draw: ImageDraw.ImageDraw, x0: int, y0: int, x1: int,
                      usage: list, provider_name: str, *, max_rows: int,
-                     show_hidden: bool) -> None:
+                     show_hidden: bool, row_height: int | None = None,
+                     font_size: int | None = None) -> None:
         # 行高和字号固定：让它们跟随模型数量，会把「多用了一个模型」变成整列重排
         if not usage:
             return
-        font = self._font(self._MODEL_FONT_SIZE, bold=True)
+        step = self._MODEL_ROW_HEIGHT if row_height is None else row_height
+        font = self._font(self._MODEL_FONT_SIZE if font_size is None else font_size, bold=True)
         visible = list(usage[:max_rows])
         if show_hidden and len(usage) > len(visible):
             visible = visible[:max_rows - 1]
         for index, item in enumerate(visible):
-            y = y0 + index * self._MODEL_ROW_HEIGHT
+            y = y0 + index * step
             value = self._compact(item.tokens)
             value_width = draw.textbbox((0, 0), value, font=font)[2]
             label = self._model_label(item.model, provider_name)
@@ -276,7 +407,7 @@ class DashboardRenderer:
             draw.text((x1 - value_width, y), value, font=font, fill=0)
         hidden = len(usage) - len(visible)
         if show_hidden and hidden:
-            y = y0 + len(visible) * self._MODEL_ROW_HEIGHT
+            y = y0 + len(visible) * step
             draw.text((x0, y), f"+{hidden} more", font=font, fill=0)
 
     def _activity_rows(self, draw: ImageDraw.ImageDraw, box: tuple[int, int, int, int],
@@ -344,6 +475,12 @@ class DashboardRenderer:
         return f"reset {minutes}m"
 
     @staticmethod
+    def _primary_window_label(provider_name: str, *, compact: bool) -> str:
+        if provider_name.lower() == "gemini":
+            return "PRIMARY WINDOW"
+        return "5H WINDOW" if compact else "5 HOUR WINDOW"
+
+    @staticmethod
     def _percentage(value: float | None) -> str:
         return "—" if value is None else f"{int(value)}%"
 
@@ -371,6 +508,19 @@ class DashboardRenderer:
                 value = value[len(prefix):]
                 break
         return value or "unknown"
+
+    @classmethod
+    def _truncate_with_suffix(cls, draw: ImageDraw.ImageDraw, prefix: str, suffix: str,
+                              font, max_width: int) -> str:
+        if not suffix:
+            return cls._truncate(draw, prefix, font, max_width)
+        full = prefix + suffix
+        if draw.textbbox((0, 0), full, font=font)[2] <= max_width:
+            return full
+        suffix_w = draw.textbbox((0, 0), suffix, font=font)[2]
+        if suffix_w >= max_width:
+            return cls._truncate(draw, full, font, max_width)
+        return cls._truncate(draw, prefix, font, max_width - suffix_w) + suffix
 
     @staticmethod
     def _truncate(draw: ImageDraw.ImageDraw, text: str, font, max_width: int) -> str:

@@ -551,7 +551,7 @@ final class PreviewPopoverController: NSObject, NSPopoverDelegate {
         // 屏幕停在监控页时报 mode 是错的：那是用量面板的排版，跟屏上正显示的东西无关
         let mode = info.showsMonitor
             ? tr("设备监控", "Device Monitor")
-            : (["dashboard": tr("双栏", "Dual"), "claude": "Claude", "codex": "Codex", "gemini": "Gemini"][info.mode] ?? info.mode)
+            : (["dashboard": tr("总览", "Overview"), "claude": "Claude", "codex": "Codex", "gemini": "Gemini"][info.mode] ?? info.mode)
         let refresh = ["full": tr("完整刷新", "Full refresh"),
                        "partial": tr("局部刷新", "Partial refresh"),
                        "none": tr("尚未刷新", "Not refreshed yet")][info.refreshKind]

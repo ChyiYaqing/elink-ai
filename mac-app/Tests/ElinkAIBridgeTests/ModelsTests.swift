@@ -1165,7 +1165,7 @@ final class ModelsTests: XCTestCase {
 
     func testReportsWhatThePanelIsActuallyShowing() throws {
         // 屏幕停在监控页时报 mode 是错的：mode 只决定用量面板的排版，监控页是空闲
-        // 填充页。图上是监控页、文字写「双栏」，图文就对不上了。
+        // 填充页。图上是监控页、文字写「总览」，图文就对不上了。
         let info = try DeviceInfo(json: [
             "device_type": "elink-agent",
             "mode": "dashboard",
@@ -1179,7 +1179,7 @@ final class ModelsTests: XCTestCase {
         XCTAssertEqual(info.monitorIdleAfter, 60)
         let summary = PreviewPopoverController.deviceSummary(info)
         XCTAssertTrue(summary.contains(tr("设备监控", "Device Monitor")))
-        XCTAssertFalse(summary.contains(tr("双栏", "Dual")))
+        XCTAssertFalse(summary.contains(tr("总览", "Overview")))
     }
 
     func testUsagePageStillReportsItsMode() throws {
@@ -1191,7 +1191,7 @@ final class ModelsTests: XCTestCase {
         ])
 
         XCTAssertFalse(info.showsMonitor)
-        XCTAssertTrue(PreviewPopoverController.deviceSummary(info).contains(tr("双栏", "Dual")))
+        XCTAssertTrue(PreviewPopoverController.deviceSummary(info).contains(tr("总览", "Overview")))
     }
 
     func testAgentWithoutMonitorSupportDefaultsToTheUsagePage() throws {

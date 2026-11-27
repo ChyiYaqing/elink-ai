@@ -107,3 +107,53 @@ def test_manual_refresh_still_obeys_the_minimum_interval():
     # 请求不会被丢掉：调用方保留 force，窗口一到同一个请求就执行
     later = policy.decide(value, stale=False, now=131, force="full")
     assert later.refresh and later.kind == "full"
+
+
+def test_gemini_changes_trigger_dashboard_refresh_but_not_claude_mode():
+    policy = RefreshPolicy(min_interval_s=30)
+    base = snapshot()
+    base.gemini = ProviderStatus(status="idle", primary_pct=10)
+    policy.record(base, stale=False, kind="full", now=100, mode="dashboard")
+
+    updated_pct = snapshot()
+    updated_pct.gemini = ProviderStatus(status="idle", primary_pct=25)
+    assert policy.decide(updated_pct, stale=False, now=110, mode="dashboard").reason == "throttled"
+    after_window = policy.decide(updated_pct, stale=False, now=135, mode="dashboard")
+    assert after_window.refresh and after_window.reason == "data-change"
+
+    urgent = snapshot()
+    urgent.gemini = ProviderStatus(status="working", primary_pct=25, needs_input=True)
+    priority = policy.decide(urgent, stale=False, now=110, mode="dashboard")
+    assert priority.refresh and priority.reason == "priority-change"
+
+    claude_only = RefreshPolicy(min_interval_s=0)
+    claude_only.record(base, stale=False, kind="full", now=100, mode="claude")
+    assert not claude_only.decide(urgent, stale=False, now=110, mode="claude").refresh
+
+
+def test_switching_single_provider_modes_is_not_throttled():
+    policy = RefreshPolicy(min_interval_s=30)
+    idle_all = StatusSnapshot(
+        claude=ProviderStatus(status="idle"),
+        codex=ProviderStatus(status="idle"),
+        gemini=ProviderStatus(status="idle"),
+    )
+    policy.record(idle_all, stale=False, kind="full", now=100, mode="claude")
+    policy.last_signature = ""
+
+    switch = policy.decide(idle_all, stale=False, now=105, mode="gemini")
+    assert switch.refresh and switch.reason == "priority-change"
+
+
+def test_usage_is_stale_transition_triggers_refresh():
+    policy = RefreshPolicy(min_interval_s=0)
+    err_snap = StatusSnapshot(
+        gemini=ProviderStatus(status="idle", primary_pct=20, error="HTTP 429", usage_cached=False),
+    )
+    policy.record(err_snap, stale=False, kind="full", now=100, mode="dashboard")
+
+    stale_snap = StatusSnapshot(
+        gemini=ProviderStatus(status="idle", primary_pct=20, error="HTTP 429", usage_cached=True),
+    )
+    decision = policy.decide(stale_snap, stale=False, now=105, mode="dashboard")
+    assert decision.refresh and decision.reason == "data-change"
