@@ -1179,7 +1179,7 @@ final class ModelsTests: XCTestCase {
         XCTAssertEqual(info.monitorIdleAfter, 60)
         let summary = PreviewPopoverController.deviceSummary(info)
         XCTAssertTrue(summary.contains(tr("设备监控", "Device Monitor")))
-        XCTAssertFalse(summary.contains(tr("总览", "All")))
+        XCTAssertFalse(summary.contains(tr("总览", "Overview")))
     }
 
     func testUsagePageStillReportsItsMode() throws {
@@ -1191,7 +1191,7 @@ final class ModelsTests: XCTestCase {
         ])
 
         XCTAssertFalse(info.showsMonitor)
-        XCTAssertTrue(PreviewPopoverController.deviceSummary(info).contains(tr("总览", "All")))
+        XCTAssertTrue(PreviewPopoverController.deviceSummary(info).contains(tr("总览", "Overview")))
     }
 
     func testAgentWithoutMonitorSupportDefaultsToTheUsagePage() throws {

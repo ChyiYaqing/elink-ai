@@ -143,3 +143,17 @@ def test_switching_single_provider_modes_is_not_throttled():
 
     switch = policy.decide(idle_all, stale=False, now=105, mode="gemini")
     assert switch.refresh and switch.reason == "priority-change"
+
+
+def test_usage_is_stale_transition_triggers_refresh():
+    policy = RefreshPolicy(min_interval_s=0)
+    err_snap = StatusSnapshot(
+        gemini=ProviderStatus(status="idle", primary_pct=20, error="HTTP 429", usage_cached=False),
+    )
+    policy.record(err_snap, stale=False, kind="full", now=100, mode="dashboard")
+
+    stale_snap = StatusSnapshot(
+        gemini=ProviderStatus(status="idle", primary_pct=20, error="HTTP 429", usage_cached=True),
+    )
+    decision = policy.decide(stale_snap, stale=False, now=105, mode="dashboard")
+    assert decision.refresh and decision.reason == "data-change"

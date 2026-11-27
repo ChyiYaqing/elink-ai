@@ -84,6 +84,7 @@ class RefreshPolicy:
             "weekly_reset": None if value.weekly_reset_min is None else value.weekly_reset_min // 5,
             "needs_input": value.needs_input,
             "error": bool(value.error),
+            "usage_is_stale": value.usage_is_stale,
         }
 
     @staticmethod
