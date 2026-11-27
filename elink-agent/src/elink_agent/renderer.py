@@ -183,7 +183,7 @@ class DashboardRenderer:
 
         pct = self._percentage(provider.primary_pct)
         label_x = x0 + (250 if large else 168)
-        draw.text((x0 + 16, y0 + 67), "5 HOUR WINDOW",
+        draw.text((x0 + 16, y0 + 67), self._primary_window_label(name, compact=False),
                   font=self._font(12, bold=True), fill=0)
         bar_y = y0 + 156
         # 字号同时受宽度和高度约束，大号数字的底边要停在进度条上方
@@ -253,10 +253,11 @@ class DashboardRenderer:
                          preferred_size=13, min_size=10)
         self._strip_activity_rows(draw, box, sessions, events, updated_at)
 
-        # 中区：5 小时主窗口 + 周限额
+        # 中区：主窗口 + 周限额（Gemini 的主窗口可能是日配额，不写死 5 小时）
         mid_left = div1 + 12
         mid_right = div2 - 12
-        draw.text((mid_left, y0 + 8), "5H WINDOW", font=self._font(10, bold=True), fill=0)
+        draw.text((mid_left, y0 + 8), self._primary_window_label(name, compact=True),
+                  font=self._font(10, bold=True), fill=0)
         pct = self._percentage(provider.primary_pct)
         bar_y = y0 + 53
         label_x = mid_left + 104
@@ -472,6 +473,12 @@ class DashboardRenderer:
         if minutes >= 60:
             return f"reset {minutes // 60}h {minutes % 60}m"
         return f"reset {minutes}m"
+
+    @staticmethod
+    def _primary_window_label(provider_name: str, *, compact: bool) -> str:
+        if provider_name.lower() == "gemini":
+            return "PRIMARY WINDOW"
+        return "5H WINDOW" if compact else "5 HOUR WINDOW"
 
     @staticmethod
     def _percentage(value: float | None) -> str:

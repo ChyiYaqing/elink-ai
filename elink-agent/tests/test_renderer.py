@@ -254,6 +254,13 @@ def test_gemini_attention_change_in_dashboard_stays_inside_gemini_badge():
     _assert_within(plan.regions, renderer.component_boxes()["gemini.badge"], renderer)
 
 
+def test_primary_window_label_avoids_hardcoding_five_hours_for_gemini():
+    assert DashboardRenderer._primary_window_label("Claude", compact=True) == "5H WINDOW"
+    assert DashboardRenderer._primary_window_label("Codex", compact=False) == "5 HOUR WINDOW"
+    assert DashboardRenderer._primary_window_label("Gemini", compact=True) == "PRIMARY WINDOW"
+    assert DashboardRenderer._primary_window_label("Gemini", compact=False) == "PRIMARY WINDOW"
+
+
 class TestStaleBadge:
     """限流导致的取数失败不该画成 ERROR —— 那会让人以为数字不能信。"""
 
