@@ -213,6 +213,39 @@ are still evolving; the bridge endpoint supports Codex events, but this version
 does not rewrite Codex configuration automatically. Log mtime detection remains
 active for both providers.
 
+### MCP server for coding CLIs
+
+`mcp/elink-mcp.py` is a stdio MCP server (Python standard library only) that
+lets Claude Code, Codex, and the Antigravity/Gemini CLI read the quota the
+bridge already collects. It offers one tool, `get_usage_limits`, with an
+optional `provider` (`claude`, `codex`, or `gemini`). Each provider returns a
+`primary` window (five hours for Claude and Codex; five hours or a day for
+Gemini) and a `weekly` window with `used_pct`, an approximate `resets_at`, and
+`resets_in_min`, plus `scoped_limits`, `extra_usage`, `credit_balance`,
+`data_age_s` (seconds since that provider's quota was fetched), and
+`error`; unknown values are `null`, never zero. With Multi-Host Sync the
+figures may come from another host's account. It returns quota only: no
+token counts, costs, sessions, or project names. Register it with an absolute path:
+
+```bash
+claude mcp add -s user elink-ai -- python3 "$PWD/mcp/elink-mcp.py"
+codex mcp add elink-ai -- python3 "$PWD/mcp/elink-mcp.py"
+agy mcp add elink-ai python3 "$PWD/mcp/elink-mcp.py"
+```
+
+It reads `http://127.0.0.1:8765/v1/status`, so the mac-app (or `elink-tui` in
+local mode) must be running; otherwise the tool call reports the bridge as
+unreachable. Set `ELINK_BRIDGE_URL` to use a bridge on another host, e.g.
+`claude mcp add -s user elink-ai -e ELINK_BRIDGE_URL=http://mac:8765 -- ...`
+(the server name goes before `-e`).
+Models call it when asked about remaining quota; to have an agent route work
+by quota, say so in your `CLAUDE.md` or `AGENTS.md`. Interactive sessions ask
+before the first call. Non-interactive runs deny it unless allowed in advance:
+`--allowedTools mcp__elink-ai__get_usage_limits` for `claude -p`,
+`default_tools_approval_mode = "approve"` under `[mcp_servers.elink-ai]` for
+`codex exec`, and `mcp(elink-ai/get_usage_limits)` in `permissions.allow` for
+`agy -p`.
+
 ## Linux terminal dashboard
 
 `elink-tui/` is a keyboard-driven Rust TUI that mirrors the macOS dashboard in
