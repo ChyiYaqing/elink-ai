@@ -404,6 +404,11 @@ final class ClusterManager: ObservableObject {
             var value = candidate.1
             value.primary = value.primary.discardingIfExpired(at: now)
             value.weekly = value.weekly.discardingIfExpired(at: now)
+            // 模型级限额也要按此刻重算倒计时：远端节点的剩余分钟是它同步那一刻算的，
+            // 不刷新就会随每次快照往后漂，过期的那条也会一直挂着。
+            value.scopedLimits = value.scopedLimits
+                .map { $0.discardingIfExpired(at: now) }
+                .filter { $0.window.percent != nil }
             return (candidate.0, value)
         }
         let withUsage = normalized.filter {

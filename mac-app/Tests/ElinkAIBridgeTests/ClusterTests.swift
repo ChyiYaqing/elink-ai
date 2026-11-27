@@ -702,6 +702,30 @@ final class ClusterTests: XCTestCase {
         XCTAssertNil(preferred.error)
     }
 
+    func testAggregateRefreshesScopedLimitCountdownsAndDropsExpiredOnes() throws {
+        let now = Date(timeIntervalSince1970: 10_000)
+        // 远端节点一小时前同步：那时算的剩余分钟已经过时，Sonnet 的窗口也已过期。
+        let remote = AgentStatus(
+            primary: UsageWindow(percent: 40),
+            scopedLimits: [
+                ScopedLimit(id: "opus", title: "Opus", window: UsageWindow(
+                    percent: 61, resetMinutes: 180, resetAt: now.addingTimeInterval(7_200)
+                )),
+                ScopedLimit(id: "sonnet", title: "Sonnet", window: UsageWindow(
+                    percent: 90, resetMinutes: 30, resetAt: now.addingTimeInterval(-1_800)
+                )),
+            ],
+            usageFetchedAt: now.addingTimeInterval(-3_600)
+        )
+
+        let preferred = try XCTUnwrap(ClusterManager.preferredUsageStatus(
+            [(now, remote)], now: now
+        ))
+
+        XCTAssertEqual(preferred.scopedLimits.map(\.id), ["opus"])
+        XCTAssertEqual(preferred.scopedLimits.first?.window.resetMinutes, 120)
+    }
+
     func testAggregateDoesNotReplaceFreshLimitedUsageWithStaleSuccess() throws {
         let now = Date(timeIntervalSince1970: 10_000)
         let limited = AgentStatus(
