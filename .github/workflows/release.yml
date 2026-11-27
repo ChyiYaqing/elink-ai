@@ -15,6 +15,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
@@ -26,6 +28,7 @@ jobs:
         run: |
           python3 .github/scripts/check_metadata.py \
             --release-version "${GITHUB_REF_NAME#v}" \
+            --check-prev-release \
             --check-changelog \
             --check-readme
 
@@ -124,12 +127,8 @@ jobs:
 
       - name: Verify TUI version
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          TUI_VERSION=$(sed -n 's/^version = "\([^"]*\)"$/\1/p' elink-tui/Cargo.toml)
-          if [ "$VERSION" != "$TUI_VERSION" ]; then
-            echo "Tag version $VERSION does not match TUI version $TUI_VERSION" >&2
-            exit 1
-          fi
+          /opt/homebrew/bin/python3.13 .github/scripts/check_metadata.py \
+            --release-version "${GITHUB_REF_NAME#v}"
 
       - name: Build Linux ${{ matrix.arch }} TUI
         run: |
@@ -213,13 +212,8 @@ jobs:
 
       - name: Package agent
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          AGENT_VERSION=$(sed -n 's/^__version__ = "\([^"]*\)"$/\1/p' elink-agent/src/elink_agent/__init__.py)
-          PROJECT_VERSION=$(sed -n 's/^version = "\([^"]*\)"$/\1/p' pyproject.toml)
-          if [ "$VERSION" != "$AGENT_VERSION" ] || [ "$VERSION" != "$PROJECT_VERSION" ]; then
-            echo "Tag version $VERSION does not match agent $AGENT_VERSION / pyproject $PROJECT_VERSION" >&2
-            exit 1
-          fi
+          /opt/homebrew/bin/python3.13 .github/scripts/check_metadata.py \
+            --release-version "${GITHUB_REF_NAME#v}"
           git archive --format=tar.gz -o "$RUNNER_TEMP/elink-agent-${GITHUB_REF_NAME}.tar.gz" \
             HEAD pyproject.toml elink-agent
 
