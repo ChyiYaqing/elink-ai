@@ -34,26 +34,33 @@ jobs:
         env:
           INPUT_VERSION: ${{ inputs.version }}
         run: |
-          TRIMMED=$(printf '%s' "$INPUT_VERSION" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-          if [ -n "$TRIMMED" ]; then
-            VERSION="${TRIMMED#v}"
-            if [ -z "$VERSION" ]; then
-              echo "ERROR: explicit version input '$INPUT_VERSION' is empty after stripping 'v'." >&2
-              exit 1
-            fi
-          else
-            VERSION=$(python3 -c 'import plistlib; print(plistlib.load(open("mac-app/Info.plist", "rb"))["CFBundleShortVersionString"])')
-          fi
+          VERSION=$(python3 - <<'PY'
+          import os, plistlib, re, sys
+
+          raw = os.environ.get("INPUT_VERSION", "").strip()
+          if raw:
+              ver = raw[1:] if raw.startswith("v") else raw
+          else:
+              ver = plistlib.load(open("mac-app/Info.plist", "rb"))["CFBundleShortVersionString"]
+
+          if not re.fullmatch(r"\d+\.\d+\.\d+(?:-rc\d+)?", ver):
+              print(f"ERROR: invalid target version '{raw or ver}'; expected X.Y.Z or X.Y.Z-rcN (optional single leading 'v').", file=sys.stderr)
+              sys.exit(1)
+          print(ver)
+          PY
+          )
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Preflight target version: $VERSION"
 
       - name: Validate version gates, changelog, README, and update signing keys
         env:
+          GITHUB_TOKEN: ${{ github.token }}
           TARGET_VERSION: ${{ steps.target.outputs.version }}
         run: |
           python3 .github/scripts/check_metadata.py \
             --release-version "$TARGET_VERSION" \
             --check-prev-release \
+            --github-repo "${{ github.repository }}" \
             --check-changelog \
             --check-readme
 

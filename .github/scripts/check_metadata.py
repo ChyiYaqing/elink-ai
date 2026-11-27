@@ -5,11 +5,14 @@ from __future__ import annotations
 
 import argparse
 import base64
+import json
+import os
 import plistlib
 import re
 import subprocess
 import sys
 import tomllib
+import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -30,6 +33,20 @@ def parse_version(text: str) -> tuple[int, int, int, int, int] | None:
     if rc is None:
         return (int(major), int(minor), int(patch), 1, 0)
     return (int(major), int(minor), int(patch), 0, int(rc))
+
+
+def is_stable_version(text: str) -> bool:
+    parsed = parse_version(text)
+    return parsed is not None and parsed[3] == 1
+
+
+def normalize_target_version(raw: str) -> str | None:
+    cleaned = raw.strip()
+    if cleaned.startswith("v"):
+        cleaned = cleaned[1:]
+    if not cleaned or parse_version(cleaned) is None:
+        return None
+    return cleaned
 
 
 def load_plist(path: Path, errors: list[str]) -> dict | None:
@@ -111,10 +128,7 @@ def read_versions(info_plist: dict | None, errors: list[str]) -> tuple[dict[str,
     return versions, bundle_version
 
 
-def find_previous_release_tag(target_version: str, errors: list[str]) -> str | None:
-    target_key = parse_version(target_version)
-    if target_key is None:
-        return None
+def list_git_release_tags(errors: list[str]) -> list[tuple[tuple[int, int, int, int, int], str]]:
     proc = subprocess.run(
         ["git", "tag", "--list", "v*"],
         cwd=ROOT,
@@ -124,21 +138,106 @@ def find_previous_release_tag(target_version: str, errors: list[str]) -> str | N
     )
     if proc.returncode != 0:
         fail(errors, f"git tag --list failed: {proc.stderr.strip()}")
-        return None
+        return []
 
-    candidates: list[tuple[tuple[int, int, int, int, int], str]] = []
+    tags: list[tuple[tuple[int, int, int, int, int], str]] = []
     for tag in proc.stdout.splitlines():
         tag = tag.strip()
         if not tag.startswith("v"):
             continue
         key = parse_version(tag[1:])
-        if key is not None and key < target_key:
-            candidates.append((key, tag))
+        if key is not None:
+            tags.append((key, tag))
+    tags.sort(key=lambda item: item[0])
+    return tags
 
-    if not candidates:
+
+def list_published_release_tags(
+    github_repo: str,
+    errors: list[str],
+) -> list[tuple[tuple[int, int, int, int, int], str, bool]] | None:
+    """Return published GitHub Releases that carry signed update archives."""
+    url = f"https://api.github.com/repos/{github_repo}/releases?per_page=100"
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "elink-ai-metadata-check",
+    }
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            releases = json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        fail(errors, f"Failed to query published GitHub Releases for {github_repo}: {exc}")
         return None
-    candidates.sort(key=lambda item: item[0])
-    return candidates[-1][1]
+
+    published: list[tuple[tuple[int, int, int, int, int], str, bool]] = []
+    for rel in releases:
+        if rel.get("draft"):
+            continue
+        tag = rel.get("tag_name")
+        if not isinstance(tag, str) or not tag.startswith("v"):
+            continue
+        ver = tag[1:]
+        key = parse_version(ver)
+        if key is None:
+            continue
+        asset_names = {
+            asset.get("name", "")
+            for asset in rel.get("assets", [])
+            if isinstance(asset, dict)
+        }
+        has_update_assets = (
+            f"elink-ai-{tag}.zip" in asset_names
+            and f"elink-ai-{tag}.zip.sig" in asset_names
+        ) or (
+            f"elink-agent-{tag}.tar.gz" in asset_names
+            and f"elink-agent-{tag}.tar.gz.sig" in asset_names
+        )
+        if not has_update_assets:
+            continue
+        is_prerelease = bool(rel.get("prerelease")) or not is_stable_version(ver)
+        published.append((key, tag, is_prerelease))
+
+    published.sort(key=lambda item: item[0])
+    return published
+
+
+def select_signing_baseline_tag(
+    target_version: str,
+    git_tags: list[tuple[tuple[int, int, int, int, int], str]],
+    github_repo: str | None,
+    errors: list[str],
+) -> str | None:
+    target_key = parse_version(target_version)
+    if target_key is None:
+        return None
+    target_is_stable = is_stable_version(target_version)
+
+    if github_repo:
+        published = list_published_release_tags(github_repo, errors)
+        if published is None:
+            return None
+        earlier = [item for item in published if item[0] < target_key]
+        if target_is_stable:
+            earlier_stable = [item for item in earlier if not item[2]]
+            if earlier_stable:
+                return earlier_stable[-1][1]
+        if earlier:
+            return earlier[-1][1]
+        return None
+
+    earlier_tags = [item for item in git_tags if item[0] < target_key]
+    if target_is_stable:
+        earlier_stable_tags = [item for item in earlier_tags if item[0][3] == 1]
+        if earlier_stable_tags:
+            return earlier_stable_tags[-1][1]
+    if earlier_tags:
+        return earlier_tags[-1][1]
+    return None
 
 
 def load_plist_from_git(ref: str, rel_path: str, errors: list[str]) -> dict | None:
@@ -199,10 +298,16 @@ def check_previous_release(
     target_version: str,
     bundle_version: int | None,
     signing_key: str | None,
+    github_repo: str | None,
     errors: list[str],
 ) -> None:
-    prev_tag = find_previous_release_tag(target_version, errors)
-    if prev_tag is None:
+    target_key = parse_version(target_version)
+    if target_key is None:
+        return
+
+    git_tags = list_git_release_tags(errors)
+    earlier_tags = [item for item in git_tags if item[0] < target_key]
+    if not earlier_tags:
         fail(
             errors,
             f"No previous release tag found before v{target_version} "
@@ -210,39 +315,50 @@ def check_previous_release(
         )
         return
 
-    prev_plist = load_plist_from_git(prev_tag, "mac-app/Info.plist", errors)
-    if prev_plist is None:
+    prev_build_tag = earlier_tags[-1][1]
+    prev_build_plist = load_plist_from_git(prev_build_tag, "mac-app/Info.plist", errors)
+    if prev_build_plist is not None:
+        prev_bundle_raw = prev_build_plist.get("CFBundleVersion")
+        if isinstance(prev_bundle_raw, str) and prev_bundle_raw.isdigit():
+            prev_bundle = int(prev_bundle_raw)
+            if bundle_version is not None and bundle_version != prev_bundle + 1:
+                fail(
+                    errors,
+                    f"mac-app/Info.plist: CFBundleVersion is {bundle_version}, expected {prev_bundle + 1} "
+                    f"(previous tag {prev_build_tag} had {prev_bundle})",
+                )
+        else:
+            fail(errors, f"{prev_build_tag}:mac-app/Info.plist has non-integer CFBundleVersion {prev_bundle_raw!r}")
+
+    signing_baseline_tag = select_signing_baseline_tag(target_version, git_tags, github_repo, errors)
+    if signing_baseline_tag is None:
         return
 
-    prev_bundle_raw = prev_plist.get("CFBundleVersion")
-    if isinstance(prev_bundle_raw, str) and prev_bundle_raw.isdigit():
-        prev_bundle = int(prev_bundle_raw)
-        if bundle_version is not None and bundle_version != prev_bundle + 1:
-            fail(
-                errors,
-                f"mac-app/Info.plist: CFBundleVersion is {bundle_version}, expected {prev_bundle + 1} "
-                f"(previous release {prev_tag} had {prev_bundle})",
-            )
-    else:
-        fail(errors, f"{prev_tag}:mac-app/Info.plist has non-integer CFBundleVersion {prev_bundle_raw!r}")
+    baseline_plist = (
+        prev_build_plist
+        if signing_baseline_tag == prev_build_tag
+        else load_plist_from_git(signing_baseline_tag, "mac-app/Info.plist", errors)
+    )
+    if baseline_plist is None:
+        return
 
-    prev_embedded_key = prev_plist.get("ElinkUpdatePublicKey")
-    if isinstance(prev_embedded_key, str) and prev_embedded_key and signing_key:
-        if signing_key != prev_embedded_key:
+    baseline_embedded_key = baseline_plist.get("ElinkUpdatePublicKey")
+    if isinstance(baseline_embedded_key, str) and baseline_embedded_key and signing_key:
+        if signing_key != baseline_embedded_key:
             fail(
                 errors,
-                f"mac-app/update-signing-public-key does not match {prev_tag}'s ElinkUpdatePublicKey; "
-                "installed clients trust the previous release's embedded key and would reject this update",
+                f"mac-app/update-signing-public-key does not match {signing_baseline_tag}'s ElinkUpdatePublicKey; "
+                "installed clients on this channel trust that published release's embedded key and would reject this update",
             )
 
 
-def check_changelog(version: str, errors: list[str]) -> None:
+def extract_and_check_changelog(version: str, errors: list[str]) -> str | None:
     lines = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8").splitlines()
     header = f"## {version}"
     header_indices = [idx for idx, line in enumerate(lines) if line == header]
     if len(header_indices) != 1:
         fail(errors, f"CHANGELOG.md: expected exactly one '{header}' heading, found {len(header_indices)}")
-        return
+        return None
 
     start = header_indices[0] + 1
     end = len(lines)
@@ -280,7 +396,7 @@ def check_changelog(version: str, errors: list[str]) -> None:
 
     if not subsections:
         fail(errors, f"CHANGELOG.md ({header}): missing categorized ### subsections")
-        return
+        return None
 
     order_indices = [idx for _, idx in subsections]
     if order_indices != sorted(order_indices):
@@ -294,6 +410,9 @@ def check_changelog(version: str, errors: list[str]) -> None:
     for name, count in bullet_counts.items():
         if count == 0:
             fail(errors, f"CHANGELOG.md ({header}): subsection '### {name}' has no '- ' bullets")
+
+    body = "\n".join(section_lines).strip()
+    return f"{body}\n" if body else None
 
 
 def check_readme(version: str, errors: list[str]) -> None:
@@ -315,6 +434,11 @@ def main() -> int:
         help="Validate that CHANGELOG.md has a properly formatted section for the target version.",
     )
     parser.add_argument(
+        "--write-release-notes",
+        type=Path,
+        help="Write the validated CHANGELOG.md section for the target version to this path (implies --check-changelog).",
+    )
+    parser.add_argument(
         "--check-readme",
         action="store_true",
         help="Validate that README.md references the target version's DMG filename.",
@@ -322,7 +446,11 @@ def main() -> int:
     parser.add_argument(
         "--check-prev-release",
         action="store_true",
-        help="Verify CFBundleVersion incremented by 1 and update-signing-public-key matches the previous release tag.",
+        help="Verify CFBundleVersion incremented by 1 and update-signing-public-key matches the channel's previous release.",
+    )
+    parser.add_argument(
+        "--github-repo",
+        help="Optional owner/repo (e.g. ChyiYaqing/elink-ai) to resolve published GitHub Releases for signing-key baseline checks.",
     )
     args = parser.parse_args()
 
@@ -344,11 +472,9 @@ def main() -> int:
 
     target_version: str | None = None
     if args.release_version is not None:
-        raw_target = args.release_version.strip()
-        target_version = raw_target.removeprefix("v")
-        if not target_version or parse_version(target_version) is None:
-            fail(errors, f"--release-version '{args.release_version}' must match X.Y.Z or X.Y.Z-rcN")
-            target_version = None
+        target_version = normalize_target_version(args.release_version)
+        if target_version is None:
+            fail(errors, f"--release-version '{args.release_version}' must match X.Y.Z, X.Y.Z-rcN, or v-prefixed form")
         else:
             for source, ver in versions.items():
                 if ver != target_version:
@@ -359,10 +485,11 @@ def main() -> int:
     _, signing_key = check_signing_keys(info_plist, errors)
 
     if args.check_prev_release and target_version:
-        check_previous_release(target_version, bundle_version, signing_key, errors)
+        check_previous_release(target_version, bundle_version, signing_key, args.github_repo, errors)
 
-    if args.check_changelog and target_version:
-        check_changelog(target_version, errors)
+    notes_text: str | None = None
+    if (args.check_changelog or args.write_release_notes is not None) and target_version:
+        notes_text = extract_and_check_changelog(target_version, errors)
 
     if args.check_readme and target_version:
         check_readme(target_version, errors)
@@ -371,6 +498,10 @@ def main() -> int:
         for err in errors:
             print(f"ERROR: {err}", file=sys.stderr)
         return 1
+
+    if args.write_release_notes is not None:
+        assert notes_text is not None
+        args.write_release_notes.write_text(notes_text, encoding="utf-8", newline="\n")
 
     print(f"Metadata checks passed (version={target_version}, checked {len(versions)} version locations).")
     return 0
