@@ -129,3 +129,17 @@ def test_gemini_changes_trigger_dashboard_refresh_but_not_claude_mode():
     claude_only = RefreshPolicy(min_interval_s=0)
     claude_only.record(base, stale=False, kind="full", now=100, mode="claude")
     assert not claude_only.decide(urgent, stale=False, now=110, mode="claude").refresh
+
+
+def test_switching_single_provider_modes_is_not_throttled():
+    policy = RefreshPolicy(min_interval_s=30)
+    idle_all = StatusSnapshot(
+        claude=ProviderStatus(status="idle"),
+        codex=ProviderStatus(status="idle"),
+        gemini=ProviderStatus(status="idle"),
+    )
+    policy.record(idle_all, stale=False, kind="full", now=100, mode="claude")
+    policy.last_signature = ""
+
+    switch = policy.decide(idle_all, stale=False, now=105, mode="gemini")
+    assert switch.refresh and switch.reason == "priority-change"

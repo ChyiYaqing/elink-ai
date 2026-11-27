@@ -117,4 +117,4 @@ class RefreshPolicy:
         visible = cls._visible_providers(mode)
         statuses = tuple(getattr(snapshot, name).status for name in visible)
         inputs = tuple(getattr(snapshot, name).needs_input for name in visible)
-        return repr((stale, *statuses, *inputs))
+        return repr((mode, stale, *statuses, *inputs))

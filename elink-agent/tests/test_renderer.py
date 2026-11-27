@@ -261,6 +261,18 @@ def test_primary_window_label_avoids_hardcoding_five_hours_for_gemini():
     assert DashboardRenderer._primary_window_label("Gemini", compact=False) == "PRIMARY WINDOW"
 
 
+def test_strip_session_row_preserves_age_suffix_when_truncating():
+    renderer = DashboardRenderer()
+    draw = ImageDraw.Draw(Image.new("L", (renderer.width, renderer.height), 255))
+    font = renderer._font(renderer._STRIP_MODEL_FONT_SIZE, bold=True)
+    x0, _, x1, _ = renderer._strip_activity_box(renderer.CLAUDE_BOX, 0)
+    text = renderer._truncate_with_suffix(
+        draw, "NOW WORK elink-ai · sonnet-4-6", " · 2m", font, x1 - x0,
+    )
+    assert text.endswith(" · 2m")
+    assert draw.textbbox((0, 0), text, font=font)[2] <= x1 - x0
+
+
 class TestStaleBadge:
     """限流导致的取数失败不该画成 ERROR —— 那会让人以为数字不能信。"""
 

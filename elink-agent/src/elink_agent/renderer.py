@@ -320,11 +320,11 @@ class DashboardRenderer:
             item = sessions[0]
             state = "WORK" if item.state == "working" else "IDLE"
             detail = " · ".join(part for part in (item.project, item.model) if part)
-            text = f"NOW {state} {detail}".rstrip()
-            if item.updated_at:
-                text += f" · {self._age(now, item.updated_at)}"
+            prefix = f"NOW {state} {detail}".rstrip()
+            suffix = f" · {self._age(now, item.updated_at)}" if item.updated_at else ""
             x0, y0, x1, _ = self._strip_activity_box(box, 0)
-            draw.text((x0, y0), self._truncate(draw, text, font, x1 - x0), font=font, fill=0)
+            text = self._truncate_with_suffix(draw, prefix, suffix, font, x1 - x0)
+            draw.text((x0, y0), text, font=font, fill=0)
         if events:
             item = events[0]
             kind = {"needs_input": "ACTION", "working": "WORKING", "idle": "IDLE"}[item.kind]
@@ -508,6 +508,19 @@ class DashboardRenderer:
                 value = value[len(prefix):]
                 break
         return value or "unknown"
+
+    @classmethod
+    def _truncate_with_suffix(cls, draw: ImageDraw.ImageDraw, prefix: str, suffix: str,
+                              font, max_width: int) -> str:
+        if not suffix:
+            return cls._truncate(draw, prefix, font, max_width)
+        full = prefix + suffix
+        if draw.textbbox((0, 0), full, font=font)[2] <= max_width:
+            return full
+        suffix_w = draw.textbbox((0, 0), suffix, font=font)[2]
+        if suffix_w >= max_width:
+            return cls._truncate(draw, full, font, max_width)
+        return cls._truncate(draw, prefix, font, max_width - suffix_w) + suffix
 
     @staticmethod
     def _truncate(draw: ImageDraw.ImageDraw, text: str, font, max_width: int) -> str:
