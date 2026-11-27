@@ -6,6 +6,30 @@ and `Removed`.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## 0.1.22
+
+### Added
+
+- Agent Sessions in the Mac app now displays per-session live metrics (latest
+  context tokens, context window utilization, cache hit rate, and estimated API
+  cost) for Claude Code, Codex, Gemini CLI, and Antigravity sessions, and opens
+  an interactive Session Detail inspector with a 2×2 metric matrix, context
+  progress bar, and scrollable latest-80 By Step call table with anomaly badges
+  (`Low Cache`, `Slow`, and `Compaction`).
+- Usage Statistics in the Mac app now shows host-filtered cache hit rate and
+  net API cache savings (deducting cache-write premiums), plus a 366-day
+  calendar heatmap in the Year view.
+- Added `mcp/elink-mcp.py`, a zero-dependency stdio MCP server exposing the
+  `get_usage_limits` tool so Claude Code, Codex, and the Antigravity CLI can
+  query current provider quotas, reset times, scoped limits, and extra usage
+  from the elink-ai bridge.
+
+### Fixed
+
+- Cluster aggregation in the Mac app now recomputes reset countdowns for remote
+  nodes' model-scoped quota limits and drops expired entries instead of keeping
+  stale minutes from the previous sync.
+
 ## 0.1.21
 
 ### Added
