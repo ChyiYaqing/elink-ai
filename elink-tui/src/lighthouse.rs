@@ -1050,9 +1050,10 @@ mod tests {
         let second = reader.read_new(Duration::from_secs(60)).unwrap();
         assert!(second.is_empty(), "already-read bytes must not repeat");
 
-        // Rotation replaces the file, so the new one has a different inode even
-        // though it is the same length as the bytes already consumed.
-        std::fs::remove_file(&path).unwrap();
+        // Rotation renames the old log aside (keeping its inode allocated) and
+        // creates a fresh file at the original path, guaranteeing a new inode
+        // even on filesystems like Linux ext4 that eagerly reuse unlinked inodes.
+        std::fs::rename(&path, dir.join("nebula.log.1")).unwrap();
         std::fs::write(&path, "certName=B from=\"2.2.2.2:4242\"\n").unwrap();
         let after_rotation = reader.read_new(Duration::from_secs(60)).unwrap();
         assert_eq!(parse_batch(&after_rotation).len(), 1);

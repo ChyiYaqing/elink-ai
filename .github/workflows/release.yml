@@ -8,6 +8,63 @@ on:
 permissions: {}
 
 jobs:
+  test-python:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Validate release metadata
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python3 .github/scripts/check_metadata.py \
+            --release-version "${GITHUB_REF_NAME#v}" \
+            --check-prev-release \
+            --github-repo "${{ github.repository }}" \
+            --check-changelog \
+            --check-readme
+
+      - name: Test Python packages
+        run: |
+          python -m pip install -e '.[test]'
+          python -m pytest -q
+
+  test-tui:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: elink-tui
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            elink-tui/target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('elink-tui/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Test Rust TUI
+        run: cargo test --locked
+
   build:
     permissions:
       contents: read
@@ -73,12 +130,8 @@ jobs:
 
       - name: Verify TUI version
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          TUI_VERSION=$(sed -n 's/^version = "\([^"]*\)"$/\1/p' elink-tui/Cargo.toml)
-          if [ "$VERSION" != "$TUI_VERSION" ]; then
-            echo "Tag version $VERSION does not match TUI version $TUI_VERSION" >&2
-            exit 1
-          fi
+          /opt/homebrew/bin/python3.13 .github/scripts/check_metadata.py \
+            --release-version "${GITHUB_REF_NAME#v}"
 
       - name: Build Linux ${{ matrix.arch }} TUI
         run: |
@@ -114,7 +167,7 @@ jobs:
           retention-days: 1
 
   release:
-    needs: [build, build-tui]
+    needs: [test-python, test-tui, build, build-tui]
     permissions:
       actions: read
       contents: write
@@ -162,13 +215,8 @@ jobs:
 
       - name: Package agent
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          AGENT_VERSION=$(sed -n 's/^__version__ = "\([^"]*\)"$/\1/p' elink-agent/src/elink_agent/__init__.py)
-          PROJECT_VERSION=$(sed -n 's/^version = "\([^"]*\)"$/\1/p' pyproject.toml)
-          if [ "$VERSION" != "$AGENT_VERSION" ] || [ "$VERSION" != "$PROJECT_VERSION" ]; then
-            echo "Tag version $VERSION does not match agent $AGENT_VERSION / pyproject $PROJECT_VERSION" >&2
-            exit 1
-          fi
+          /opt/homebrew/bin/python3.13 .github/scripts/check_metadata.py \
+            --release-version "${GITHUB_REF_NAME#v}"
           git archive --format=tar.gz -o "$RUNNER_TEMP/elink-agent-${GITHUB_REF_NAME}.tar.gz" \
             HEAD pyproject.toml elink-agent
 
@@ -187,22 +235,10 @@ jobs:
 
       - name: Prepare release notes
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          NOTES="$RUNNER_TEMP/release-notes.md"
-          if ! awk -v version="$VERSION" '
-              $0 == "## " version { found = 1; next }
-              found && /^## / { exit }
-              found { print }
-              END { if (!found) exit 1 }
-            ' CHANGELOG.md > "$NOTES"; then
-            echo "CHANGELOG.md has no ## $VERSION section" >&2
-            exit 1
-          fi
-          if ! grep -Eq '^### (Packaging|Added|Changed|Fixed|Removed)$' "$NOTES" || \
-             ! grep -q '^- ' "$NOTES"; then
-            echo "CHANGELOG.md has no categorized release notes for $VERSION" >&2
-            exit 1
-          fi
+          /opt/homebrew/bin/python3.13 .github/scripts/check_metadata.py \
+            --release-version "${GITHUB_REF_NAME#v}" \
+            --check-changelog \
+            --write-release-notes "$RUNNER_TEMP/release-notes.md"
 
       - name: Publish release assets
         env:

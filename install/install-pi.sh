@@ -6,7 +6,7 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
-SOURCE_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+SOURCE_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 apt-get update
 apt-get install -y python3-venv python3-dev python3-setuptools python3-pil fonts-dejavu-core python3-spidev python3-gpiozero python3-cryptography
 

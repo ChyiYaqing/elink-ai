@@ -1,0 +1,90 @@
+name: Release Preflight
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Target release version (e.g. 0.1.22). Leave empty to use Info.plist."
+        required: false
+        type: string
+      allow_existing_tag:
+        description: "Allow running preflight when tag v<version> already exists on origin."
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+
+      - name: Resolve target version
+        id: target
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          VERSION=$(python3 - <<'PY'
+          import os, plistlib, re, sys
+
+          raw = os.environ.get("INPUT_VERSION", "").strip()
+          if raw:
+              ver = raw[1:] if raw.startswith("v") else raw
+          else:
+              ver = plistlib.load(open("mac-app/Info.plist", "rb"))["CFBundleShortVersionString"]
+
+          if not re.fullmatch(r"\d+\.\d+\.\d+(?:-rc\d+)?", ver):
+              print(f"ERROR: invalid target version '{raw or ver}'; expected X.Y.Z or X.Y.Z-rcN (optional single leading 'v').", file=sys.stderr)
+              sys.exit(1)
+          print(ver)
+          PY
+          )
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Preflight target version: $VERSION"
+
+      - name: Validate version gates, changelog, README, and update signing keys
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TARGET_VERSION: ${{ steps.target.outputs.version }}
+        run: |
+          python3 .github/scripts/check_metadata.py \
+            --release-version "$TARGET_VERSION" \
+            --check-prev-release \
+            --github-repo "${{ github.repository }}" \
+            --check-changelog \
+            --check-readme
+
+      - name: Verify release tag availability
+        env:
+          ALLOW_EXISTING_TAG: ${{ inputs.allow_existing_tag }}
+          TAG: v${{ steps.target.outputs.version }}
+        run: |
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            if [ "$ALLOW_EXISTING_TAG" = "true" ]; then
+              echo "Tag $TAG already exists (allowed by input)."
+            else
+              echo "ERROR: Tag $TAG already exists; choose a new version." >&2
+              exit 1
+            fi
+          else
+            echo "Tag $TAG is available."
+          fi
+
+      - name: Verify Rust lockfile consistency
+        run: cargo check --locked --all-targets
+        working-directory: elink-tui
+
+      - name: Run Python test suite
+        run: |
+          python -m pip install -e '.[test]'
+          python -m pytest -q
